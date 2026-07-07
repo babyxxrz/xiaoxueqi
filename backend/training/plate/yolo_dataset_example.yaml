@@ -1,0 +1,10 @@
+# Example YOLO dataset config for sandbox plate detection.
+# prepare_yolo_dataset.py will automatically generate backend/datasets/plate_sandbox_yolo/data.yaml.
+
+path: backend/datasets/plate_sandbox_yolo
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: plate

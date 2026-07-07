@@ -1,34 +1,67 @@
-# Python
-algorithm/.venv/
-.venv/
+﻿**/.venv/
+**/__pycache__/
+*.pyc
+.env
+
+backend/uploads/
+backend/outputs/
+backend/data/
+
+frontend/node_modules/
+frontend/dist/
+node_modules/
+dist/
+
+demo/*.jpg
+demo/*.jpeg
+demo/*.png
+demo/*.mp4
+demo/*.avi
+
+.DS_Store# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.Python
+
+# Virtual environments
+.venv/
+backend/.venv/
 
 # Node
 node_modules/
+frontend/node_modules/
 dist/
+frontend/dist/
 
-# Java
-target/
-*.class
-
-# Media / test files
-*.mp4
-*.avi
-*.mov
-*.mkv
-
-# Env
-.env
-
-# Logs
+# Runtime files
+backend/uploads/
+backend/outputs/
+backend/data/*.db
+backend/data/*.db-*
 *.log
 
-# VS Code
-.vscode/
+# Training datasets and generated datasets
+backend/datasets/plate_sandbox/images/
+backend/datasets/plate_sandbox/annotations/
+backend/datasets/plate_sandbox_labeled/
+backend/datasets/plate_sandbox_yolo/
+backend/datasets/owner_gesture_custom/
+backend/datasets/traffic_gesture/
+backend/datasets/plate_ccpd/
+backend/datasets/owner_gesture_hagrid/
+backend/datasets/owner_gesture_nvg/
 
-# OS
-.DS_Store
-Thumbs.db
+# Training outputs
+runs/
+backend/runs/
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+
+# IDE
+.vscode/
+.idea/
