@@ -115,6 +115,8 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, reactive, ref } from 'vue'
 
+const emit = defineEmits(['recognized'])
+
 const API_BASE = 'http://127.0.0.1:8000'
 
 const videoRef = ref(null)
@@ -325,6 +327,18 @@ function updateResult(data, clientLatency) {
   result.landmarks = payload.landmarks || []
 
   Object.assign(vehicleState, state)
+
+  emit('recognized', {
+    status: 'success',
+    task_type: 'owner_gesture',
+    input_type: data.input_type || 'camera_fast_frame',
+    latency_ms: latency,
+    created_at: new Date().toISOString(),
+    result: {
+      ...payload,
+      vehicle_state: state,
+    },
+  })
 
   drawLandmarks(result.landmarks)
 

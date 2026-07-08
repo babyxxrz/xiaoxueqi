@@ -5431,3 +5431,420 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
         raise
     except Exception as exc:
         raise _OCHTTPException(status_code=500, detail=f"摄像头快速手势识别失败：{exc}")
+
+
+# REALTIME_FUSION_MONITOR_PATCH_V1
+# 实时融合决策监控接口：接收前端当前轮次三路识别证据，立即生成风险分析
+from fastapi import Body as _RFMBody, Query as _RFMQuery, HTTPException as _RFMHTTPException
+from pathlib import Path as _RFMPath
+from datetime import datetime as _RFMDateTime
+import sqlite3 as _rfm_sqlite3
+import json as _rfm_json
+import uuid as _rfm_uuid
+
+
+def _rfm_now_text() -> str:
+    return _RFMDateTime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rfm_db_path() -> _RFMPath:
+    return _RFMPath(__file__).resolve().parent / "data" / "app.db"
+
+
+def _rfm_connect():
+    path = _rfm_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _rfm_sqlite3.connect(str(path))
+    conn.row_factory = _rfm_sqlite3.Row
+    return conn
+
+
+def _rfm_ensure_table():
+    with _rfm_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fusion_monitor_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT,
+                scenario TEXT,
+                risk_level TEXT,
+                risk_score INTEGER,
+                suggestion TEXT,
+                reason TEXT,
+                control_advice TEXT,
+                evidence_json TEXT,
+                decision_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def _rfm_to_dict(value):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _rfm_result_of(channel: dict) -> dict:
+    channel = _rfm_to_dict(channel)
+
+    if isinstance(channel.get("result"), dict):
+        return channel["result"]
+
+    if isinstance(channel.get("summary"), dict):
+        return channel["summary"]
+
+    if isinstance(channel.get("result_summary"), dict):
+        summary = channel["result_summary"]
+        if isinstance(summary.get("result"), dict):
+            return summary["result"]
+        return summary
+
+    return channel
+
+
+def _rfm_extract_plate(plate_channel: dict) -> dict:
+    channel = _rfm_to_dict(plate_channel)
+    result = _rfm_result_of(channel)
+
+    plates = result.get("plates")
+    if plates is None:
+        plates = []
+
+    plate_count = result.get("plate_count")
+    if plate_count is None:
+        try:
+            plate_count = len(plates)
+        except Exception:
+            plate_count = 0
+
+    best_plate = ""
+    best_confidence = None
+
+    if isinstance(plates, list) and plates:
+        first = plates[0]
+        if isinstance(first, dict):
+            best_plate = first.get("plate") or first.get("plate_number") or first.get("text") or ""
+            best_confidence = first.get("confidence")
+        else:
+            best_plate = str(first)
+
+    return {
+        "available": bool(channel),
+        "source_id": channel.get("source_id") or result.get("source_id") or "",
+        "input_type": channel.get("input_type") or result.get("input_type") or "",
+        "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
+        "plate_count": int(plate_count or 0),
+        "best_plate": best_plate,
+        "best_confidence": best_confidence,
+        "plates": plates,
+        "raw": channel,
+    }
+
+
+def _rfm_extract_traffic(traffic_channel: dict) -> dict:
+    channel = _rfm_to_dict(traffic_channel)
+    result = _rfm_result_of(channel)
+
+    return {
+        "available": bool(channel),
+        "source_id": channel.get("source_id") or result.get("source_id") or "",
+        "input_type": channel.get("input_type") or result.get("input_type") or "",
+        "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
+        "gesture": result.get("gesture") or "",
+        "gesture_name": result.get("gesture_name") or "",
+        "traffic_command": result.get("traffic_command") or result.get("command") or "",
+        "confidence": result.get("confidence"),
+        "raw": channel,
+    }
+
+
+def _rfm_extract_owner(owner_channel: dict) -> dict:
+    channel = _rfm_to_dict(owner_channel)
+    result = _rfm_result_of(channel)
+
+    return {
+        "available": bool(channel),
+        "source_id": channel.get("source_id") or result.get("source_id") or "camera",
+        "input_type": channel.get("input_type") or result.get("input_type") or "camera_fast_frame",
+        "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
+        "gesture": result.get("gesture") or "",
+        "gesture_name": result.get("gesture_name") or "",
+        "action": result.get("action") or "",
+        "description": result.get("description") or "",
+        "confidence": result.get("confidence"),
+        "vehicle_state": result.get("vehicle_state") or {},
+        "raw": channel,
+    }
+
+
+def _rfm_level(score: int) -> str:
+    if score >= 75:
+        return "high"
+    if score >= 45:
+        return "medium"
+    return "low"
+
+
+def _rfm_decide(evidence: dict) -> dict:
+    plate = _rfm_extract_plate(evidence.get("plate"))
+    traffic = _rfm_extract_traffic(evidence.get("traffic"))
+    owner = _rfm_extract_owner(evidence.get("owner"))
+
+    score = 10
+    reasons = []
+
+    has_plate = plate["plate_count"] > 0
+    traffic_gesture = traffic["gesture"]
+    owner_gesture = owner["gesture"]
+    owner_action = owner["action"]
+
+    if plate["available"]:
+        if has_plate:
+            score += 20
+            reasons.append(f"视频流检测到车辆/车牌：{plate['best_plate'] or '未解析车牌号'}。")
+        else:
+            score += 5
+            reasons.append("车牌视频流已接入，但当前未检测到有效车牌。")
+    else:
+        reasons.append("车牌视频流暂未提供有效证据。")
+
+    if traffic["available"]:
+        if traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]:
+            score += 45
+            reasons.append("交警手势识别为停止类指令，需要优先服从交通指挥。")
+        elif traffic_gesture in {"lane_change", "turn_left", "turn_right"} or "变道" in traffic["gesture_name"]:
+            score += 28
+            reasons.append("交警手势识别为变道/转向类指令，需要观察周边车辆并谨慎执行。")
+        elif traffic_gesture:
+            score += 15
+            reasons.append(f"交警手势识别为 {traffic['gesture_name'] or traffic_gesture}。")
+        else:
+            reasons.append("交警手势视频流已接入，但暂未识别到明确手势。")
+    else:
+        reasons.append("交警手势视频流暂未提供有效证据。")
+
+    if owner["available"]:
+        if owner_gesture in {"thumb_up", "thumb_down"} or owner_action in {"answer_call", "hang_up_call"}:
+            score += 15
+            reasons.append("车主摄像头识别到电话相关手势，驾驶注意力存在分散风险。")
+        elif owner_gesture in {"open_palm", "wave"}:
+            score += 8
+            reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车载交互。")
+        elif owner_gesture in {"fist", "one", "two", "ok", "circle"}:
+            score += 10
+            reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车辆控制动作。")
+        elif owner_gesture == "no_hand":
+            reasons.append("车主摄像头当前未检测到手部。")
+    else:
+        reasons.append("车主摄像头暂未提供有效证据。")
+
+    if has_plate and (traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]):
+        score += 20
+        scenario = "前方车辆存在且交警发出停止指令"
+        suggestion = "建议立即减速并停车等待交警进一步指挥，禁止继续抢行。"
+        control_advice = "decelerate_and_stop"
+    elif has_plate and (traffic_gesture in {"lane_change", "turn_left", "turn_right"} or "变道" in traffic["gesture_name"]):
+        score += 12
+        scenario = "前方车辆存在且交警发出变道/转向指令"
+        suggestion = "建议降低车速，确认相邻车道安全后按交警指挥变道或转向。"
+        control_advice = "slow_down_and_follow_traffic_police"
+    elif traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]:
+        scenario = "交警停止指令触发"
+        suggestion = "建议立即减速，准备停车并等待交通指挥。"
+        control_advice = "prepare_to_stop"
+    elif owner_action in {"answer_call", "hang_up_call"}:
+        scenario = "车主电话交互手势触发"
+        suggestion = "已执行电话相关车载交互，建议驾驶员保持注意力集中。"
+        control_advice = "keep_attention"
+    elif owner_gesture and owner_gesture not in {"no_hand", "unknown"}:
+        scenario = "车主车载功能控制"
+        suggestion = "已根据车主手势执行车载功能控制，建议继续保持安全驾驶。"
+        control_advice = "maintain_safe_driving"
+    elif plate["available"] or traffic["available"] or owner["available"]:
+        scenario = "多路感知输入正常"
+        suggestion = "当前未检测到显著风险，继续监控车牌、交警手势和车主手势变化。"
+        control_advice = "continue_monitoring"
+    else:
+        scenario = "暂无有效感知输入"
+        suggestion = "请确认视频流和摄像头输入是否正常接入。"
+        control_advice = "check_inputs"
+
+    score = max(0, min(100, int(score)))
+    risk_level = _rfm_level(score)
+
+    created_at = _rfm_now_text()
+
+    return {
+        "decision_id": f"fusion_monitor_{_rfm_uuid.uuid4().hex}",
+        "agent": {
+            "name": "RealtimeFusionMonitorAgent",
+            "mode": "evidence_payload_rule_based",
+            "llm_enabled": False,
+        },
+        "scenario": scenario,
+        "risk_level": risk_level,
+        "risk_score": score,
+        "suggestion": suggestion,
+        "reason": "；".join(reasons),
+        "control_advice": control_advice,
+        "evidence_summary": {
+            "plate": {
+                "available": plate["available"],
+                "plate_count": plate["plate_count"],
+                "best_plate": plate["best_plate"],
+                "latency_ms": plate["latency_ms"],
+            },
+            "traffic": {
+                "available": traffic["available"],
+                "gesture": traffic["gesture"],
+                "gesture_name": traffic["gesture_name"],
+                "traffic_command": traffic["traffic_command"],
+                "latency_ms": traffic["latency_ms"],
+            },
+            "owner": {
+                "available": owner["available"],
+                "gesture": owner["gesture"],
+                "gesture_name": owner["gesture_name"],
+                "action": owner["action"],
+                "latency_ms": owner["latency_ms"],
+            },
+        },
+        "evidence": {
+            "plate": plate,
+            "traffic": traffic,
+            "owner": owner,
+        },
+        "created_at": created_at,
+    }
+
+
+def _rfm_save_decision(decision: dict) -> int:
+    _rfm_ensure_table()
+
+    with _rfm_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO fusion_monitor_decisions (
+                decision_id,
+                scenario,
+                risk_level,
+                risk_score,
+                suggestion,
+                reason,
+                control_advice,
+                evidence_json,
+                decision_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.get("decision_id"),
+                decision.get("scenario"),
+                decision.get("risk_level"),
+                int(decision.get("risk_score") or 0),
+                decision.get("suggestion"),
+                decision.get("reason"),
+                decision.get("control_advice"),
+                _rfm_json.dumps(decision.get("evidence") or {}, ensure_ascii=False),
+                _rfm_json.dumps(decision, ensure_ascii=False),
+                decision.get("created_at") or _rfm_now_text(),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+@app.post("/api/fusion/monitor/decision")
+def realtime_fusion_monitor_decision(payload: dict | None = _RFMBody(default=None)):
+    payload = payload or {}
+
+    evidence = payload.get("evidence") or {
+        "plate": payload.get("plate"),
+        "traffic": payload.get("traffic"),
+        "owner": payload.get("owner"),
+    }
+
+    save = bool(payload.get("save", True))
+
+    try:
+        decision = _rfm_decide(_rfm_to_dict(evidence))
+        saved_id = _rfm_save_decision(decision) if save else None
+
+        return {
+            "status": "success",
+            "saved_id": saved_id,
+            "decision": decision,
+        }
+
+    except Exception as exc:
+        raise _RFMHTTPException(status_code=500, detail=f"实时融合决策失败：{exc}")
+
+
+@app.get("/api/fusion/monitor/latest")
+def realtime_fusion_monitor_latest():
+    _rfm_ensure_table()
+
+    with _rfm_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM fusion_monitor_decisions
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if not row:
+        return {
+            "status": "success",
+            "latest": None,
+        }
+
+    item = dict(row)
+    try:
+        item["decision"] = _rfm_json.loads(item.get("decision_json") or "{}")
+    except Exception:
+        item["decision"] = {}
+
+    return {
+        "status": "success",
+        "latest": item,
+    }
+
+
+@app.get("/api/fusion/monitor/history")
+def realtime_fusion_monitor_history(limit: int = _RFMQuery(default=20, ge=1, le=100)):
+    _rfm_ensure_table()
+
+    with _rfm_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM fusion_monitor_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+    items = []
+
+    for row in rows:
+        item = dict(row)
+        try:
+            item["decision"] = _rfm_json.loads(item.get("decision_json") or "{}")
+        except Exception:
+            item["decision"] = {}
+        items.append(item)
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
