@@ -5848,3 +5848,701 @@ def realtime_fusion_monitor_history(limit: int = _RFMQuery(default=20, ge=1, le=
         "total": len(items),
         "items": items,
     }
+
+
+# FUSION_MONITOR_CHANNEL_RECOGNIZE_PATCH_V1
+# 融合监控页：按前端配置识别单个输入通道
+from fastapi import Body as _RMCBody, HTTPException as _RMCHTTPException
+from pathlib import Path as _RMCPath
+import time as _rmc_time
+import cv2 as _rmc_cv2
+
+
+def _rmc_project_root() -> _RMCPath:
+    return _RMCPath(__file__).resolve().parent.parent
+
+
+def _rmc_demo_path(filename: str) -> _RMCPath:
+    return _rmc_project_root() / "demo" / filename
+
+
+def _rmc_read_stream_frame(source_url: str, warmup_frames: int = 3) -> bytes:
+    cap = _rmc_cv2.VideoCapture(source_url)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频流：{source_url}")
+
+    frame = None
+
+    try:
+        for _ in range(max(0, int(warmup_frames))):
+            cap.read()
+
+        ok, frame = cap.read()
+
+        if not ok or frame is None:
+            raise RuntimeError(f"无法从视频流读取有效帧：{source_url}")
+
+        ok, buffer = _rmc_cv2.imencode(".jpg", frame)
+
+        if not ok:
+            raise RuntimeError("视频流帧编码为 JPG 失败")
+
+        return buffer.tobytes()
+
+    finally:
+        cap.release()
+
+
+def _rmc_post_image_to_endpoint(endpoint: str, filename: str, content: bytes) -> dict:
+    try:
+        from fastapi.testclient import TestClient as _RMCTestClient
+    except Exception as exc:
+        raise RuntimeError(f"缺少 fastapi.testclient/httpx2 支持：{repr(exc)}")
+
+    client = _RMCTestClient(app)
+
+    response = client.post(
+        endpoint,
+        files={
+            "file": (filename, content, "image/jpeg")
+        },
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    data["_status_code"] = response.status_code
+
+    if response.status_code >= 400:
+        raise RuntimeError(data.get("detail") or data.get("message") or response.text)
+
+    return data
+
+
+def _rmc_post_json_to_endpoint(endpoint: str, body: dict) -> dict:
+    try:
+        from fastapi.testclient import TestClient as _RMCTestClient
+    except Exception as exc:
+        raise RuntimeError(f"缺少 fastapi.testclient/httpx2 支持：{repr(exc)}")
+
+    client = _RMCTestClient(app)
+    response = client.post(endpoint, json=body)
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    data["_status_code"] = response.status_code
+
+    if response.status_code >= 400:
+        raise RuntimeError(data.get("detail") or data.get("message") or response.text)
+
+    return data
+
+
+@app.post("/api/fusion/monitor/channel/recognize")
+def fusion_monitor_channel_recognize(payload: dict | None = _RMCBody(default=None)):
+    """
+    融合监控页专用：识别单个输入通道。
+
+    支持：
+    - task_type=plate
+    - task_type=traffic_gesture
+
+    输入来源：
+    - use_mock_frame=true：使用 mock / demo
+    - source_url 非空：读取 RTSP / 视频流一帧后识别
+    - source_id 非空：调用已有 /api/stream/recognize
+    """
+    payload = payload or {}
+
+    task_type = str(payload.get("task_type") or "").strip()
+    source_id = str(payload.get("source_id") or "").strip()
+    source_url = str(payload.get("source_url") or "").strip()
+    use_mock_frame = bool(payload.get("use_mock_frame", True))
+    demo_file = str(payload.get("demo_file") or "traffic.png").strip()
+    frame_count = int(payload.get("frame_count") or 20)
+    sample_interval = int(payload.get("sample_interval") or 5)
+    warmup_frames = int(payload.get("warmup_frames") or 3)
+
+    started = _rmc_time.perf_counter()
+
+    try:
+        if task_type == "plate":
+            if source_url and not use_mock_frame:
+                content = _rmc_read_stream_frame(source_url, warmup_frames=warmup_frames)
+                data = _rmc_post_image_to_endpoint(
+                    "/api/plate/image",
+                    "fusion_plate_stream_frame.jpg",
+                    content,
+                )
+                input_type = "rtsp_frame"
+            else:
+                body = {
+                    "source_id": source_id or "live12",
+                    "task_type": "plate",
+                    "frame_count": frame_count,
+                    "sample_interval": sample_interval,
+                    "use_mock_frame": use_mock_frame,
+                }
+                data = _rmc_post_json_to_endpoint("/api/stream/recognize", body)
+                input_type = "mock_stream" if use_mock_frame else "rtsp_stream"
+
+        elif task_type == "traffic_gesture":
+            if source_url and not use_mock_frame:
+                content = _rmc_read_stream_frame(source_url, warmup_frames=warmup_frames)
+                data = _rmc_post_image_to_endpoint(
+                    "/api/gesture/traffic/image",
+                    "fusion_traffic_stream_frame.jpg",
+                    content,
+                )
+                input_type = "rtsp_frame"
+            else:
+                path = _rmc_demo_path(demo_file)
+
+                if not path.exists():
+                    raise RuntimeError(f"找不到交警手势 demo 文件：{path}")
+
+                content = path.read_bytes()
+                data = _rmc_post_image_to_endpoint(
+                    "/api/gesture/traffic/image",
+                    path.name,
+                    content,
+                )
+                input_type = "mock_frame"
+
+        else:
+            raise _RMCHTTPException(
+                status_code=400,
+                detail="task_type 只支持 plate 或 traffic_gesture",
+            )
+
+        latency_ms = round((_rmc_time.perf_counter() - started) * 1000, 2)
+
+        return {
+            "status": "success",
+            "task_type": task_type,
+            "source_id": source_id,
+            "source_url": source_url,
+            "input_type": input_type,
+            "use_mock_frame": use_mock_frame,
+            "latency_ms": latency_ms,
+            "result": data.get("result") or data,
+            "raw_response": data,
+        }
+
+    except _RMCHTTPException:
+        raise
+    except Exception as exc:
+        raise _RMCHTTPException(
+            status_code=500,
+            detail=f"融合监控通道识别失败：{exc}",
+        )
+
+
+# VIDEO_SOURCE_MANAGEMENT_PATCH_V1
+# 视频源管理：新增、保存、选择、检测 RTSP / MediaMTX / demo 源
+from fastapi import Body as _VSMBody, Query as _VSMQuery, HTTPException as _VSMHTTPException
+from pathlib import Path as _VSMPath
+from datetime import datetime as _VSMDateTime
+import sqlite3 as _vsm_sqlite3
+import cv2 as _vsm_cv2
+
+
+def _vsm_now_text() -> str:
+    return _VSMDateTime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _vsm_db_path() -> _VSMPath:
+    return _VSMPath(__file__).resolve().parent / "data" / "app.db"
+
+
+def _vsm_project_root() -> _VSMPath:
+    return _VSMPath(__file__).resolve().parent.parent
+
+
+def _vsm_connect():
+    path = _vsm_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _vsm_sqlite3.connect(str(path))
+    conn.row_factory = _vsm_sqlite3.Row
+    return conn
+
+
+def _vsm_ensure_table():
+    with _vsm_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT UNIQUE,
+                name TEXT,
+                source_type TEXT,
+                source_id TEXT,
+                source_url TEXT,
+                protocol TEXT,
+                use_mock_frame INTEGER DEFAULT 0,
+                demo_file TEXT,
+                frame_count INTEGER DEFAULT 20,
+                sample_interval INTEGER DEFAULT 5,
+                warmup_frames INTEGER DEFAULT 3,
+                enabled INTEGER DEFAULT 1,
+                description TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def _vsm_row_to_dict(row) -> dict:
+    item = dict(row)
+    item["use_mock_frame"] = bool(item.get("use_mock_frame"))
+    item["enabled"] = bool(item.get("enabled"))
+    return item
+
+
+def _vsm_count_sources() -> int:
+    _vsm_ensure_table()
+
+    with _vsm_connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM video_sources").fetchone()
+        return int(row["c"] or 0)
+
+
+def _vsm_insert_default_sources():
+    if _vsm_count_sources() > 0:
+        return
+
+    now = _vsm_now_text()
+
+    defaults = [
+        {
+            "source_key": "plate_mock_live12",
+            "name": "沙盘 / Mock 测试源 live12",
+            "source_type": "plate",
+            "source_id": "live12",
+            "source_url": "",
+            "protocol": "mock",
+            "use_mock_frame": 1,
+            "demo_file": "",
+            "frame_count": 20,
+            "sample_interval": 5,
+            "warmup_frames": 3,
+            "enabled": 1,
+            "description": "本地演示用车牌 mock 视频流，适合没有真实 RTSP 时测试融合链路。",
+        },
+        {
+            "source_key": "plate_rtsp_live12",
+            "name": "沙盘 RTSP 源 live12",
+            "source_type": "plate",
+            "source_id": "live12",
+            "source_url": "",
+            "protocol": "rtsp",
+            "use_mock_frame": 0,
+            "demo_file": "",
+            "frame_count": 20,
+            "sample_interval": 5,
+            "warmup_frames": 3,
+            "enabled": 1,
+            "description": "使用后端已配置的 live12 RTSP 源。",
+        },
+        {
+            "source_key": "plate_mediamtx",
+            "name": "MediaMTX 车牌流 plate",
+            "source_type": "plate",
+            "source_id": "plate_rtsp",
+            "source_url": "rtsp://127.0.0.1:8554/plate",
+            "protocol": "rtsp",
+            "use_mock_frame": 0,
+            "demo_file": "",
+            "frame_count": 20,
+            "sample_interval": 5,
+            "warmup_frames": 3,
+            "enabled": 1,
+            "description": "通过 MediaMTX 接入车牌视频流，对应 path=plate。",
+        },
+        {
+            "source_key": "traffic_demo_file",
+            "name": "Demo 测试图 traffic.png",
+            "source_type": "traffic_gesture",
+            "source_id": "traffic_demo",
+            "source_url": "",
+            "protocol": "demo",
+            "use_mock_frame": 1,
+            "demo_file": "traffic.png",
+            "frame_count": 20,
+            "sample_interval": 5,
+            "warmup_frames": 3,
+            "enabled": 1,
+            "description": "使用 demo/traffic.png 测试交警手势识别。",
+        },
+        {
+            "source_key": "traffic_mediamtx",
+            "name": "MediaMTX 交警手势流 traffic",
+            "source_type": "traffic_gesture",
+            "source_id": "traffic_rtsp",
+            "source_url": "rtsp://127.0.0.1:8554/traffic",
+            "protocol": "rtsp",
+            "use_mock_frame": 0,
+            "demo_file": "traffic.png",
+            "frame_count": 20,
+            "sample_interval": 5,
+            "warmup_frames": 3,
+            "enabled": 1,
+            "description": "通过 MediaMTX 接入交警手势视频流，对应 path=traffic。",
+        },
+    ]
+
+    with _vsm_connect() as conn:
+        for item in defaults:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO video_sources (
+                    source_key,
+                    name,
+                    source_type,
+                    source_id,
+                    source_url,
+                    protocol,
+                    use_mock_frame,
+                    demo_file,
+                    frame_count,
+                    sample_interval,
+                    warmup_frames,
+                    enabled,
+                    description,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["source_key"],
+                    item["name"],
+                    item["source_type"],
+                    item["source_id"],
+                    item["source_url"],
+                    item["protocol"],
+                    item["use_mock_frame"],
+                    item["demo_file"],
+                    item["frame_count"],
+                    item["sample_interval"],
+                    item["warmup_frames"],
+                    item["enabled"],
+                    item["description"],
+                    now,
+                    now,
+                ),
+            )
+        conn.commit()
+
+
+def _vsm_normalize_payload(payload: dict, existing: dict | None = None) -> dict:
+    payload = payload or {}
+    existing = existing or {}
+
+    name = str(payload.get("name", existing.get("name", ""))).strip()
+    source_type = str(payload.get("source_type", existing.get("source_type", "plate"))).strip()
+    source_id = str(payload.get("source_id", existing.get("source_id", ""))).strip()
+    source_url = str(payload.get("source_url", existing.get("source_url", ""))).strip()
+    protocol = str(payload.get("protocol", existing.get("protocol", "rtsp"))).strip()
+    demo_file = str(payload.get("demo_file", existing.get("demo_file", ""))).strip()
+    description = str(payload.get("description", existing.get("description", ""))).strip()
+
+    if not name:
+        raise _VSMHTTPException(status_code=400, detail="视频源名称不能为空。")
+
+    if source_type not in {"plate", "traffic_gesture", "owner_gesture", "general"}:
+        raise _VSMHTTPException(status_code=400, detail="source_type 只支持 plate、traffic_gesture、owner_gesture、general。")
+
+    if not source_id and not source_url and not demo_file:
+        raise _VSMHTTPException(status_code=400, detail="source_id、source_url、demo_file 至少填写一个。")
+
+    source_key = str(payload.get("source_key", existing.get("source_key", ""))).strip()
+
+    if not source_key:
+        base = f"{source_type}_{source_id or protocol or 'source'}_{abs(hash(name)) % 100000}"
+        source_key = base.replace(" ", "_")
+
+    return {
+        "source_key": source_key,
+        "name": name,
+        "source_type": source_type,
+        "source_id": source_id,
+        "source_url": source_url,
+        "protocol": protocol,
+        "use_mock_frame": 1 if bool(payload.get("use_mock_frame", existing.get("use_mock_frame", False))) else 0,
+        "demo_file": demo_file,
+        "frame_count": int(payload.get("frame_count", existing.get("frame_count", 20)) or 20),
+        "sample_interval": int(payload.get("sample_interval", existing.get("sample_interval", 5)) or 5),
+        "warmup_frames": int(payload.get("warmup_frames", existing.get("warmup_frames", 3)) or 3),
+        "enabled": 1 if bool(payload.get("enabled", existing.get("enabled", True))) else 0,
+        "description": description,
+    }
+
+
+def _vsm_get_source_or_404(source_id: int) -> dict:
+    _vsm_ensure_table()
+
+    with _vsm_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM video_sources WHERE id = ?",
+            (int(source_id),),
+        ).fetchone()
+
+    if not row:
+        raise _VSMHTTPException(status_code=404, detail="视频源不存在。")
+
+    return _vsm_row_to_dict(row)
+
+
+@app.get("/api/video-sources")
+def list_video_sources(
+    source_type: str | None = _VSMQuery(default=None),
+    enabled_only: bool = _VSMQuery(default=False),
+):
+    _vsm_ensure_table()
+    _vsm_insert_default_sources()
+
+    sql = "SELECT * FROM video_sources WHERE 1 = 1"
+    params = []
+
+    if source_type:
+        sql += " AND source_type = ?"
+        params.append(source_type)
+
+    if enabled_only:
+        sql += " AND enabled = 1"
+
+    sql += " ORDER BY source_type, id"
+
+    with _vsm_connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    items = [_vsm_row_to_dict(row) for row in rows]
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
+
+
+@app.post("/api/video-sources")
+def create_video_source(payload: dict | None = _VSMBody(default=None)):
+    _vsm_ensure_table()
+    item = _vsm_normalize_payload(payload or {})
+    now = _vsm_now_text()
+
+    try:
+        with _vsm_connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO video_sources (
+                    source_key,
+                    name,
+                    source_type,
+                    source_id,
+                    source_url,
+                    protocol,
+                    use_mock_frame,
+                    demo_file,
+                    frame_count,
+                    sample_interval,
+                    warmup_frames,
+                    enabled,
+                    description,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["source_key"],
+                    item["name"],
+                    item["source_type"],
+                    item["source_id"],
+                    item["source_url"],
+                    item["protocol"],
+                    item["use_mock_frame"],
+                    item["demo_file"],
+                    item["frame_count"],
+                    item["sample_interval"],
+                    item["warmup_frames"],
+                    item["enabled"],
+                    item["description"],
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            new_id = int(cursor.lastrowid)
+    except _vsm_sqlite3.IntegrityError:
+        raise _VSMHTTPException(status_code=400, detail="source_key 已存在，请换一个名称或 key。")
+
+    return {
+        "status": "success",
+        "message": "视频源已创建",
+        "id": new_id,
+        "item": _vsm_get_source_or_404(new_id),
+    }
+
+
+@app.put("/api/video-sources/{source_id}")
+def update_video_source(source_id: int, payload: dict | None = _VSMBody(default=None)):
+    old = _vsm_get_source_or_404(source_id)
+    item = _vsm_normalize_payload(payload or {}, existing=old)
+    now = _vsm_now_text()
+
+    try:
+        with _vsm_connect() as conn:
+            conn.execute(
+                """
+                UPDATE video_sources
+                SET source_key = ?,
+                    name = ?,
+                    source_type = ?,
+                    source_id = ?,
+                    source_url = ?,
+                    protocol = ?,
+                    use_mock_frame = ?,
+                    demo_file = ?,
+                    frame_count = ?,
+                    sample_interval = ?,
+                    warmup_frames = ?,
+                    enabled = ?,
+                    description = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    item["source_key"],
+                    item["name"],
+                    item["source_type"],
+                    item["source_id"],
+                    item["source_url"],
+                    item["protocol"],
+                    item["use_mock_frame"],
+                    item["demo_file"],
+                    item["frame_count"],
+                    item["sample_interval"],
+                    item["warmup_frames"],
+                    item["enabled"],
+                    item["description"],
+                    now,
+                    int(source_id),
+                ),
+            )
+            conn.commit()
+    except _vsm_sqlite3.IntegrityError:
+        raise _VSMHTTPException(status_code=400, detail="source_key 已存在，请换一个名称或 key。")
+
+    return {
+        "status": "success",
+        "message": "视频源已更新",
+        "item": _vsm_get_source_or_404(source_id),
+    }
+
+
+@app.delete("/api/video-sources/{source_id}")
+def delete_video_source(source_id: int):
+    _vsm_get_source_or_404(source_id)
+
+    with _vsm_connect() as conn:
+        conn.execute(
+            "DELETE FROM video_sources WHERE id = ?",
+            (int(source_id),),
+        )
+        conn.commit()
+
+    return {
+        "status": "success",
+        "message": "视频源已删除",
+        "id": int(source_id),
+    }
+
+
+@app.post("/api/video-sources/{source_id}/check")
+def check_video_source(source_id: int):
+    item = _vsm_get_source_or_404(source_id)
+
+    if item.get("use_mock_frame"):
+        demo_file = item.get("demo_file") or ""
+
+        if demo_file:
+            demo_path = _vsm_project_root() / "demo" / demo_file
+            ok = demo_path.exists()
+            return {
+                "status": "success",
+                "online": ok,
+                "mode": "demo_file",
+                "message": "demo 文件存在" if ok else f"demo 文件不存在：{demo_path}",
+                "item": item,
+            }
+
+        return {
+            "status": "success",
+            "online": True,
+            "mode": "mock_stream",
+            "message": "mock 视频源可用",
+            "item": item,
+        }
+
+    source_url = item.get("source_url") or ""
+
+    if not source_url:
+        return {
+            "status": "success",
+            "online": True,
+            "mode": "backend_source_id",
+            "message": "未填写 source_url，将使用后端 source_id 配置读取。",
+            "item": item,
+        }
+
+    cap = None
+
+    try:
+        cap = _vsm_cv2.VideoCapture(source_url)
+
+        if not cap.isOpened():
+            return {
+                "status": "success",
+                "online": False,
+                "mode": "rtsp",
+                "message": f"无法打开视频源：{source_url}",
+                "item": item,
+            }
+
+        warmup_frames = int(item.get("warmup_frames") or 3)
+
+        for _ in range(max(0, warmup_frames)):
+            cap.read()
+
+        ok, frame = cap.read()
+
+        if not ok or frame is None:
+            return {
+                "status": "success",
+                "online": False,
+                "mode": "rtsp",
+                "message": "视频源已打开，但无法读取有效帧。",
+                "item": item,
+            }
+
+        return {
+            "status": "success",
+            "online": True,
+            "mode": "rtsp",
+            "message": "视频源在线，已成功读取一帧。",
+            "item": item,
+        }
+
+    finally:
+        if cap is not None:
+            cap.release()

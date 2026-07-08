@@ -38,6 +38,29 @@ const latencyRecords = ref([])
 const multistreamStatus = ref(null)
 const multistreamLatest = ref([])
 
+const videoSources = ref([])
+const selectedFusionPlateSourceId = ref('')
+const selectedFusionTrafficSourceId = ref('')
+const videoSourceCheckResults = reactive({})
+
+const videoSourceForm = reactive({
+  id: null,
+  source_key: '',
+  name: '',
+  source_type: 'plate',
+  source_id: '',
+  source_url: '',
+  protocol: 'rtsp',
+  use_mock_frame: false,
+  demo_file: '',
+  frame_count: 20,
+  sample_interval: 5,
+  warmup_frames: 3,
+  enabled: true,
+  description: '',
+})
+
+
 const realtimeFusionMonitor = reactive({
   running: false,
   interval_seconds: 5,
@@ -52,6 +75,121 @@ const realtimeFusionEvidence = reactive({
   traffic: null,
   owner: null,
 })
+
+const realtimeFusionConfig = reactive({
+  plate: {
+    source_id: 'live12',
+    source_url: '',
+    use_mock_frame: true,
+    frame_count: 20,
+    sample_interval: 5,
+  },
+  traffic: {
+    source_id: 'traffic_demo',
+    source_url: '',
+    use_mock_frame: true,
+    demo_file: 'traffic.png',
+    frame_count: 20,
+    sample_interval: 5,
+  },
+})
+
+const selectedFusionPlateSourceKey = ref('plate_mock_live12')
+const selectedFusionTrafficSourceKey = ref('traffic_demo_file')
+
+const fusionPlateSourceOptions = [
+  {
+    key: 'plate_mock_live12',
+    label: '沙盘 / Mock 测试源 live12',
+    description: '使用后端 mock stream 测试车牌视频流链路，适合本地演示。',
+    config: {
+      source_id: 'live12',
+      source_url: '',
+      use_mock_frame: true,
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'plate_rtsp_live12',
+    label: '后端 RTSP 源 live12',
+    description: '使用后端配置的视频源 live12，适合沙盘 RTSP 测试。',
+    config: {
+      source_id: 'live12',
+      source_url: '',
+      use_mock_frame: false,
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'plate_rtsp_live3',
+    label: '后端 RTSP 源 live3',
+    description: '使用后端配置的视频源 live3。',
+    config: {
+      source_id: 'live3',
+      source_url: '',
+      use_mock_frame: false,
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'plate_mediamtx',
+    label: 'MediaMTX 车牌流 plate',
+    description: '通过 rtsp://127.0.0.1:8554/plate 接入车牌视频流。',
+    config: {
+      source_id: 'plate_rtsp',
+      source_url: 'rtsp://127.0.0.1:8554/plate',
+      use_mock_frame: false,
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'plate_custom',
+    label: '自定义车牌视频流',
+    description: '手动填写 source_id 或 RTSP 地址。',
+    config: null,
+  },
+]
+
+const fusionTrafficSourceOptions = [
+  {
+    key: 'traffic_demo_file',
+    label: 'Demo 测试图 traffic.png',
+    description: '使用 demo/traffic.png 作为交警手势测试输入，适合本地演示。',
+    config: {
+      source_id: 'traffic_demo',
+      source_url: '',
+      use_mock_frame: true,
+      demo_file: 'traffic.png',
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'traffic_mediamtx',
+    label: 'MediaMTX 交警手势流 traffic',
+    description: '通过 rtsp://127.0.0.1:8554/traffic 接入交警手势视频流。',
+    config: {
+      source_id: 'traffic_rtsp',
+      source_url: 'rtsp://127.0.0.1:8554/traffic',
+      use_mock_frame: false,
+      demo_file: 'traffic.png',
+      frame_count: 20,
+      sample_interval: 5,
+    },
+  },
+  {
+    key: 'traffic_custom',
+    label: '自定义交警手势视频流',
+    description: '手动填写 source_id、RTSP 地址或 demo 文件。',
+    config: null,
+  },
+]
+
+
 
 const realtimeFusionDecision = ref(null)
 const realtimeFusionTimeline = ref([])
@@ -68,6 +206,7 @@ const loading = reactive({
   fusion: false,
   performance: false,
   multistream: false,
+  videoSource: false,
 })
 
 const errors = reactive({
@@ -79,6 +218,7 @@ const errors = reactive({
   fusion: '',
   performance: '',
   multistream: '',
+  videoSource: '',
 })
 
 const ownerImageFile = ref(null)
@@ -151,6 +291,23 @@ const ownerKeyLandmarks = computed(() => {
 const multistreamWorkers = computed(() => {
   return Object.values(multistreamStatus.value?.workers || {})
 })
+
+const plateVideoSources = computed(() => {
+  return videoSources.value.filter((item) => item.enabled !== false && item.source_type === 'plate')
+})
+
+const trafficVideoSources = computed(() => {
+  return videoSources.value.filter((item) => item.enabled !== false && item.source_type === 'traffic_gesture')
+})
+
+const selectedPlateVideoSource = computed(() => {
+  return videoSources.value.find((item) => String(item.id) === String(selectedFusionPlateSourceId.value)) || null
+})
+
+const selectedTrafficVideoSource = computed(() => {
+  return videoSources.value.find((item) => String(item.id) === String(selectedFusionTrafficSourceId.value)) || null
+})
+
 
 const latestFusionDecision = computed(() => {
   return fusionDecision.value?.decision || fusionDecision.value || fusionLatest.value?.latest || fusionLatest.value || null
@@ -233,6 +390,199 @@ function pickFile(event, targetName) {
   if (targetName === 'ownerImage' || targetName === 'ownerVideo') errors.owner = ''
   if (targetName === 'plateImage') errors.plate = ''
   if (targetName === 'trafficImage') errors.traffic = ''
+}
+
+
+function videoSourceToFusionConfig(item) {
+  return {
+    source_id: item?.source_id || '',
+    source_url: item?.source_url || '',
+    use_mock_frame: Boolean(item?.use_mock_frame),
+    demo_file: item?.demo_file || '',
+    frame_count: Number(item?.frame_count || 20),
+    sample_interval: Number(item?.sample_interval || 5),
+    warmup_frames: Number(item?.warmup_frames || 3),
+  }
+}
+
+async function loadVideoSources() {
+  try {
+    const data = await requestJson('/api/video-sources?enabled_only=false')
+    videoSources.value = data.items || []
+
+    if (!selectedFusionPlateSourceId.value) {
+      const defaultPlate =
+        videoSources.value.find((item) => item.source_key === 'plate_mock_live12') ||
+        videoSources.value.find((item) => item.source_type === 'plate')
+
+      if (defaultPlate) {
+        selectedFusionPlateSourceId.value = defaultPlate.id
+        applySelectedFusionVideoSource('plate')
+      }
+    }
+
+    if (!selectedFusionTrafficSourceId.value) {
+      const defaultTraffic =
+        videoSources.value.find((item) => item.source_key === 'traffic_demo_file') ||
+        videoSources.value.find((item) => item.source_type === 'traffic_gesture')
+
+      if (defaultTraffic) {
+        selectedFusionTrafficSourceId.value = defaultTraffic.id
+        applySelectedFusionVideoSource('traffic')
+      }
+    }
+  } catch (error) {
+    errors.videoSource = error.message
+  }
+}
+
+function applySelectedFusionVideoSource(kind) {
+  if (kind === 'plate') {
+    const item = selectedPlateVideoSource.value
+    if (!item) return
+    Object.assign(realtimeFusionConfig.plate, videoSourceToFusionConfig(item))
+    return
+  }
+
+  if (kind === 'traffic') {
+    const item = selectedTrafficVideoSource.value
+    if (!item) return
+    Object.assign(realtimeFusionConfig.traffic, videoSourceToFusionConfig(item))
+  }
+}
+
+function resetVideoSourceForm() {
+  Object.assign(videoSourceForm, {
+    id: null,
+    source_key: '',
+    name: '',
+    source_type: 'plate',
+    source_id: '',
+    source_url: '',
+    protocol: 'rtsp',
+    use_mock_frame: false,
+    demo_file: '',
+    frame_count: 20,
+    sample_interval: 5,
+    warmup_frames: 3,
+    enabled: true,
+    description: '',
+  })
+}
+
+function editVideoSource(item) {
+  Object.assign(videoSourceForm, {
+    id: item.id,
+    source_key: item.source_key || '',
+    name: item.name || '',
+    source_type: item.source_type || 'plate',
+    source_id: item.source_id || '',
+    source_url: item.source_url || '',
+    protocol: item.protocol || 'rtsp',
+    use_mock_frame: Boolean(item.use_mock_frame),
+    demo_file: item.demo_file || '',
+    frame_count: Number(item.frame_count || 20),
+    sample_interval: Number(item.sample_interval || 5),
+    warmup_frames: Number(item.warmup_frames || 3),
+    enabled: item.enabled !== false,
+    description: item.description || '',
+  })
+
+  activeTab.value = 'sources'
+}
+
+async function saveVideoSource() {
+  loading.videoSource = true
+  errors.videoSource = ''
+
+  try {
+    const body = {
+      source_key: videoSourceForm.source_key,
+      name: videoSourceForm.name,
+      source_type: videoSourceForm.source_type,
+      source_id: videoSourceForm.source_id,
+      source_url: videoSourceForm.source_url,
+      protocol: videoSourceForm.protocol,
+      use_mock_frame: videoSourceForm.use_mock_frame,
+      demo_file: videoSourceForm.demo_file,
+      frame_count: Number(videoSourceForm.frame_count || 20),
+      sample_interval: Number(videoSourceForm.sample_interval || 5),
+      warmup_frames: Number(videoSourceForm.warmup_frames || 3),
+      enabled: videoSourceForm.enabled,
+      description: videoSourceForm.description,
+    }
+
+    if (videoSourceForm.id) {
+      await requestJson(`/api/video-sources/${videoSourceForm.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    } else {
+      await requestJson('/api/video-sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    }
+
+    resetVideoSourceForm()
+    await loadVideoSources()
+  } catch (error) {
+    errors.videoSource = error.message
+  } finally {
+    loading.videoSource = false
+  }
+}
+
+async function deleteVideoSource(item) {
+  if (!window.confirm(`确定删除视频源“${item.name}”吗？`)) {
+    return
+  }
+
+  loading.videoSource = true
+  errors.videoSource = ''
+
+  try {
+    await requestJson(`/api/video-sources/${item.id}`, {
+      method: 'DELETE',
+    })
+
+    if (String(selectedFusionPlateSourceId.value) === String(item.id)) {
+      selectedFusionPlateSourceId.value = ''
+    }
+
+    if (String(selectedFusionTrafficSourceId.value) === String(item.id)) {
+      selectedFusionTrafficSourceId.value = ''
+    }
+
+    await loadVideoSources()
+  } catch (error) {
+    errors.videoSource = error.message
+  } finally {
+    loading.videoSource = false
+  }
+}
+
+async function checkVideoSource(item) {
+  loading.videoSource = true
+  errors.videoSource = ''
+
+  try {
+    const result = await requestJson(`/api/video-sources/${item.id}/check`, {
+      method: 'POST',
+    })
+
+    videoSourceCheckResults[item.id] = result
+  } catch (error) {
+    videoSourceCheckResults[item.id] = {
+      status: 'error',
+      online: false,
+      message: error.message,
+    }
+  } finally {
+    loading.videoSource = false
+  }
 }
 
 async function refreshAll() {
@@ -481,6 +831,34 @@ async function stopMonitor() {
 }
 
 
+function currentPlateSourceOption() {
+  return fusionPlateSourceOptions.find((item) => item.key === selectedFusionPlateSourceKey.value)
+}
+
+function currentTrafficSourceOption() {
+  return fusionTrafficSourceOptions.find((item) => item.key === selectedFusionTrafficSourceKey.value)
+}
+
+function applyRealtimeFusionPlatePreset() {
+  const option = currentPlateSourceOption()
+
+  if (!option || !option.config) {
+    return
+  }
+
+  Object.assign(realtimeFusionConfig.plate, option.config)
+}
+
+function applyRealtimeFusionTrafficPreset() {
+  const option = currentTrafficSourceOption()
+
+  if (!option || !option.config) {
+    return
+  }
+
+  Object.assign(realtimeFusionConfig.traffic, option.config)
+}
+
 function pushRealtimeFusionLog(type, message, payload = null) {
   realtimeFusionTimeline.value.unshift({
     id: `${Date.now()}_${Math.random()}`,
@@ -536,64 +914,57 @@ function handleOwnerCameraRecognized(payload) {
 
 async function recognizeRealtimePlate() {
   const body = {
-    source_id: 'live12',
+    source_id: realtimeFusionConfig.plate.source_id || 'live12',
+    source_url: realtimeFusionConfig.plate.source_url || '',
     task_type: 'plate',
-    frame_count: 20,
-    sample_interval: 5,
-    use_mock_frame: true,
+    frame_count: Number(realtimeFusionConfig.plate.frame_count || 20),
+    sample_interval: Number(realtimeFusionConfig.plate.sample_interval || 5),
+    use_mock_frame: Boolean(realtimeFusionConfig.plate.use_mock_frame),
   }
 
-  const started = performance.now()
-
-  const data = await requestJson('/api/stream/recognize', {
+  const data = await requestJson('/api/fusion/monitor/channel/recognize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
 
-  const latency = Math.round(performance.now() - started)
-  realtimeFusionEvidence.plate = summarizePlateChannel(data, latency)
+  realtimeFusionEvidence.plate = summarizePlateChannel(data, data.latency_ms)
 
-  const count = realtimeFusionEvidence.plate.result?.plate_count ?? 0
-  pushRealtimeFusionLog('plate', `车牌视频流识别完成，车牌数量：${count}，延迟：${latency}ms`, realtimeFusionEvidence.plate)
+  const result = realtimeFusionEvidence.plate.result || {}
+  const count = result.plate_count ?? result.result?.plate_count ?? 0
+  pushRealtimeFusionLog(
+    'plate',
+    `车牌视频流识别完成，source=${body.source_id || body.source_url || '-'}，车牌数量：${count}，延迟：${data.latency_ms}ms`,
+    realtimeFusionEvidence.plate
+  )
 }
 
 async function recognizeRealtimeTraffic() {
   const body = {
-    source_id: 'traffic_demo',
+    source_id: realtimeFusionConfig.traffic.source_id || 'traffic_demo',
+    source_url: realtimeFusionConfig.traffic.source_url || '',
     task_type: 'traffic_gesture',
-    frame_count: 20,
-    sample_interval: 5,
-    use_mock_frame: true,
+    frame_count: Number(realtimeFusionConfig.traffic.frame_count || 20),
+    sample_interval: Number(realtimeFusionConfig.traffic.sample_interval || 5),
+    use_mock_frame: Boolean(realtimeFusionConfig.traffic.use_mock_frame),
+    demo_file: realtimeFusionConfig.traffic.demo_file || 'traffic.png',
   }
 
-  const started = performance.now()
+  const data = await requestJson('/api/fusion/monitor/channel/recognize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 
-  let data
+  realtimeFusionEvidence.traffic = summarizeTrafficChannel(data, data.latency_ms)
 
-  try {
-    data = await requestJson('/api/stream/recognize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-  } catch {
-    const formData = new FormData()
-    const response = await fetch('/demo/traffic.png')
-    const blob = await response.blob()
-    formData.append('file', blob, 'traffic.png')
-
-    data = await requestJson('/api/gesture/traffic/image', {
-      method: 'POST',
-      body: formData,
-    })
-  }
-
-  const latency = Math.round(performance.now() - started)
-  realtimeFusionEvidence.traffic = summarizeTrafficChannel(data, latency)
-
-  const gesture = realtimeFusionEvidence.traffic.result?.gesture_name || realtimeFusionEvidence.traffic.result?.gesture || '-'
-  pushRealtimeFusionLog('traffic', `交警手势识别完成：${gesture}，延迟：${latency}ms`, realtimeFusionEvidence.traffic)
+  const result = realtimeFusionEvidence.traffic.result || {}
+  const gesture = result.gesture_name || result.gesture || '-'
+  pushRealtimeFusionLog(
+    'traffic',
+    `交警手势视频流识别完成，source=${body.source_id || body.source_url || '-'}，结果：${gesture}，延迟：${data.latency_ms}ms`,
+    realtimeFusionEvidence.traffic
+  )
 }
 
 async function runRealtimeFusionDecision() {
@@ -785,6 +1156,7 @@ async function stopMultistream() {
 }
 
 onMounted(() => {
+  loadVideoSources()
   refreshAll()
 })
 
@@ -938,6 +1310,79 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="source-config-grid">
+            <div class="source-config-card">
+              <h3>车牌视频流输入</h3>
+
+              <label>
+                选择车牌视频源
+                <select v-model="selectedFusionPlateSourceId" @change="applySelectedFusionVideoSource('plate')">
+                  <option value="">请选择车牌视频源</option>
+                  <option
+                    v-for="item in plateVideoSources"
+                    :key="item.id"
+                    :value="item.id"
+                  >
+                    {{ item.name }}
+                  </option>
+                </select>
+              </label>
+
+              <div class="selected-source-summary">
+                <strong>当前选择：</strong>
+                <span>{{ selectedPlateVideoSource?.name || '未选择' }}</span>
+                <p>{{ selectedPlateVideoSource?.description || '可在视频源管理中新增车牌视频流。' }}</p>
+                <p v-if="selectedPlateVideoSource?.source_url">
+                  地址：{{ selectedPlateVideoSource.source_url }}
+                </p>
+                <p v-else>
+                  源 ID：{{ selectedPlateVideoSource?.source_id || '-' }}
+                </p>
+              </div>
+
+              <details class="advanced-source" :open="!selectedFusionPlateSourceId">
+                <summary>当前应用参数</summary>
+                <pre class="json-box">{{ prettyJson(realtimeFusionConfig.plate) }}</pre>
+              </details>
+            </div>
+
+            <div class="source-config-card">
+              <h3>交警手势视频流输入</h3>
+
+              <label>
+                选择交警手势视频源
+                <select v-model="selectedFusionTrafficSourceId" @change="applySelectedFusionVideoSource('traffic')">
+                  <option value="">请选择交警手势视频源</option>
+                  <option
+                    v-for="item in trafficVideoSources"
+                    :key="item.id"
+                    :value="item.id"
+                  >
+                    {{ item.name }}
+                  </option>
+                </select>
+              </label>
+
+              <div class="selected-source-summary">
+                <strong>当前选择：</strong>
+                <span>{{ selectedTrafficVideoSource?.name || '未选择' }}</span>
+                <p>{{ selectedTrafficVideoSource?.description || '可在视频源管理中新增交警手势视频流。' }}</p>
+                <p v-if="selectedTrafficVideoSource?.source_url">
+                  地址：{{ selectedTrafficVideoSource.source_url }}
+                </p>
+                <p v-else>
+                  源 ID：{{ selectedTrafficVideoSource?.source_id || '-' }}；
+                  Demo：{{ selectedTrafficVideoSource?.demo_file || '-' }}
+                </p>
+              </div>
+
+              <details class="advanced-source" :open="!selectedFusionTrafficSourceId">
+                <summary>当前应用参数</summary>
+                <pre class="json-box">{{ prettyJson(realtimeFusionConfig.traffic) }}</pre>
+              </details>
+            </div>
+          </div>
+
           <div class="metric-grid">
             <div class="metric-card">
               <span>车牌视频流</span>
@@ -1083,6 +1528,152 @@ onBeforeUnmount(() => {
             <span>Worker 并发</span>
           </div>
         </div>
+
+        <div class="panel span-12">
+          <div class="panel-header">
+            <div>
+              <h2>新增 / 编辑视频源</h2>
+              <p>保存车牌、交警手势、MediaMTX、自定义 RTSP 等视频源，供融合决策监控页直接选择。</p>
+            </div>
+            <button class="ghost-btn" @click="resetVideoSourceForm">清空表单</button>
+          </div>
+
+          <p v-if="errors.videoSource" class="error-line">{{ errors.videoSource }}</p>
+
+          <div class="form-grid">
+            <label>
+              视频源名称
+              <input v-model="videoSourceForm.name" placeholder="例如：行车记录仪车牌流" />
+            </label>
+
+            <label>
+              视频源类型
+              <select v-model="videoSourceForm.source_type">
+                <option value="plate">车牌识别</option>
+                <option value="traffic_gesture">交警手势识别</option>
+                <option value="owner_gesture">车主手势识别</option>
+                <option value="general">通用视频源</option>
+              </select>
+            </label>
+
+            <label>
+              Source Key
+              <input v-model="videoSourceForm.source_key" placeholder="可留空，后端自动生成" />
+            </label>
+
+            <label>
+              协议
+              <select v-model="videoSourceForm.protocol">
+                <option value="rtsp">RTSP</option>
+                <option value="mediamtx">MediaMTX</option>
+                <option value="mock">Mock</option>
+                <option value="demo">Demo</option>
+                <option value="file">File</option>
+              </select>
+            </label>
+
+            <label>
+              源 ID
+              <input v-model="videoSourceForm.source_id" placeholder="live12 / plate_rtsp / traffic_rtsp" />
+            </label>
+
+            <label>
+              RTSP / 视频流地址
+              <input v-model="videoSourceForm.source_url" placeholder="rtsp://127.0.0.1:8554/plate" />
+            </label>
+
+            <label>
+              Demo 文件
+              <input v-model="videoSourceForm.demo_file" placeholder="traffic.png，可选" />
+            </label>
+
+            <label>
+              读取帧数
+              <input v-model.number="videoSourceForm.frame_count" type="number" min="1" />
+            </label>
+
+            <label>
+              抽样间隔
+              <input v-model.number="videoSourceForm.sample_interval" type="number" min="1" />
+            </label>
+
+            <label>
+              预热帧数
+              <input v-model.number="videoSourceForm.warmup_frames" type="number" min="0" />
+            </label>
+
+            <label class="checkbox-line">
+              <input v-model="videoSourceForm.use_mock_frame" type="checkbox" />
+              使用 mock / demo
+            </label>
+
+            <label class="checkbox-line">
+              <input v-model="videoSourceForm.enabled" type="checkbox" />
+              启用
+            </label>
+          </div>
+
+          <label>
+            描述
+            <input v-model="videoSourceForm.description" placeholder="说明这个视频源用于什么场景" />
+          </label>
+
+          <div class="button-row source-form-buttons">
+            <button :disabled="loading.videoSource" @click="saveVideoSource">
+              {{ videoSourceForm.id ? '保存修改' : '新增视频源' }}
+            </button>
+            <button class="ghost-btn" @click="loadVideoSources">刷新视频源列表</button>
+          </div>
+        </div>
+
+        <div class="panel span-12">
+          <div class="panel-header">
+            <h2>已保存视频源列表</h2>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>名称</th>
+                  <th>类型</th>
+                  <th>源 ID</th>
+                  <th>地址 / Demo</th>
+                  <th>Mock</th>
+                  <th>检测</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in videoSources" :key="item.id">
+                  <td>{{ item.id }}</td>
+                  <td>{{ item.name }}</td>
+                  <td>{{ item.source_type }}</td>
+                  <td>{{ item.source_id || '-' }}</td>
+                  <td>{{ shortText(item.source_url || item.demo_file || '-', 60) }}</td>
+                  <td>{{ item.use_mock_frame ? '是' : '否' }}</td>
+                  <td>
+                    <button class="small-btn" :disabled="loading.videoSource" @click="checkVideoSource(item)">
+                      检测
+                    </button>
+                    <p class="source-check-text" v-if="videoSourceCheckResults[item.id]">
+                      {{ videoSourceCheckResults[item.id].online ? '在线' : '不可用' }}：
+                      {{ videoSourceCheckResults[item.id].message }}
+                    </p>
+                  </td>
+                  <td>
+                    <div class="button-row">
+                      <button class="small-btn" @click="editVideoSource(item)">编辑</button>
+                      <button class="small-btn ghost-btn" @click="deleteVideoSource(item)">删除</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
 
         <div class="panel span-6">
           <div class="panel-header">
@@ -1749,6 +2340,58 @@ button:disabled {
   color: #64748b;
 }
 
+
+.source-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.source-config-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+
+.selected-source-summary {
+  margin: 10px 0 12px;
+  padding: 10px;
+  border-radius: 12px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+
+.selected-source-summary strong,
+.selected-source-summary span {
+  display: inline;
+}
+
+.selected-source-summary p {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.advanced-source {
+  margin-top: 10px;
+}
+
+.advanced-source summary {
+  cursor: pointer;
+  color: #2563eb;
+  font-weight: 800;
+  margin-bottom: 10px;
+}
+
+.source-config-card h3 {
+  margin-bottom: 12px;
+  font-size: 17px;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1990,6 +2633,18 @@ select {
   line-height: 1.6;
 }
 
+
+.source-form-buttons {
+  margin-top: 14px;
+}
+
+.source-check-text {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .table-wrap {
   overflow: auto;
 }
@@ -2028,6 +2683,7 @@ th {
   }
 
   .metric-grid,
+  .source-config-grid,
   .gesture-grid,
   .worker-grid,
   .landmark-strip {
@@ -2045,6 +2701,7 @@ th {
   }
 
   .metric-grid,
+  .source-config-grid,
   .gesture-grid,
   .worker-grid,
   .landmark-strip,
