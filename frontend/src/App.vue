@@ -2,6 +2,7 @@
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import OwnerCameraPanel from './components/OwnerCameraPanel.vue'
+import AlertDashboard from './components/AlertDashboard.vue'
 import NavBar from './components/NavBar.vue'
 import { useAuth } from './useAuth'
 
@@ -589,6 +590,23 @@ async function checkVideoSource(item) {
   } finally {
     loading.videoSource = false
   }
+}
+
+const testAlertResult = ref('')
+
+async function testAlertAgent() {
+  testAlertResult.value = '评估中...'
+  try {
+    const resp = await requestJson('/api/alerts/agent/evaluate', { method: 'POST' })
+    if (resp.status === 'success') {
+      testAlertResult.value = `✅ 评估完成：触发 ${resp.triggered_count} 条告警，历史累计 ${resp.stats.total} 条`
+    } else {
+      testAlertResult.value = `⚠️ ${resp.detail || '未知错误'}`
+    }
+  } catch (e) {
+    testAlertResult.value = `❌ 请求失败：${e.message || e}`
+  }
+  setTimeout(() => { testAlertResult.value = '' }, 5000)
 }
 
 async function refreshAll() {
@@ -2101,17 +2119,13 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div class="panel span-6">
+        <div class="panel span-12">
           <div class="panel-header">
-            <h2>告警记录</h2>
+            <h2>告警中心</h2>
+            <button class="small-btn" @click="testAlertAgent">触发评估</button>
+            <span v-if="testAlertResult" class="test-alert-result">{{ testAlertResult }}</span>
           </div>
-
-          <div class="simple-list">
-            <div v-for="item in alerts" :key="item.id || item.alert_id" class="list-item">
-              <strong>#{{ item.id || item.alert_id }} {{ item.alert_type || item.event_type || item.type || 'alert' }}</strong>
-              <span>{{ shortText(item.description || item.summary || item.detail || item.message, 120) }}</span>
-            </div>
-          </div>
+          <AlertDashboard />
         </div>
 
         <div class="panel span-6">

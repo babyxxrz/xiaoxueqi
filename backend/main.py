@@ -2,7 +2,9 @@ from pathlib import Path
 from collections import Counter
 from uuid import uuid4
 from datetime import datetime
+import asyncio
 import json
+import queue
 import shutil
 import sqlite3
 import threading
@@ -10,14 +12,31 @@ import time
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from algorithm.plate_recognizer import recognize_plate_real
 from algorithm.owner_gesture_recognizer import recognize_owner_gesture_image
 from algorithm.traffic_gesture_recognizer import recognize_traffic_gesture_image
+from algorithm.alert_agent import (
+    AlertAgent,
+    Alert,
+    AlertStats,
+    AnomalyDetector,
+    AlertLevelClassifier,
+    AlertSuppressor,
+    LLMSummaryGenerator,
+    get_alert_agent,
+    reset_alert_agent,
+)
 from auth import auth_router, init_auth
+
+# --- AlertAgent 全局实例 ---
+_ALERT_AGENT = get_alert_agent()
+_ALERT_SSE_QUEUES: list[queue.Queue] = []
+_ALERT_SSE_LOCK = threading.Lock()
 
 
 app = FastAPI(title="智能车载视觉感知与告警系统")
@@ -1658,6 +1677,30 @@ def monitor_worker(config: dict):
             MONITOR_STATE["rounds_completed"] += 1
             MONITOR_STATE["next_round_after"] = f"{config['interval_seconds']} 秒后"
 
+        # --- AlertAgent 每轮评估 ---
+        try:
+            snapshot = get_monitor_state_snapshot()
+            alerts = _ALERT_AGENT.evaluate(snapshot)
+            for alert in alerts:
+                try:
+                    db_id = insert_alert_event(
+                        level=alert.level,
+                        event_type=alert.event_type,
+                        summary=alert.summary,
+                        reason=alert.reason,
+                        suggestion=alert.suggestion,
+                        related_record_id=alert.related_record_id,
+                    )
+                    alert_dict = _ALERT_AGENT.to_dict(alert)
+                    alert_dict["db_id"] = db_id
+                    _broadcast_alert_sse(alert_dict)
+                    with MONITOR_LOCK:
+                        MONITOR_STATE["total_alerts_created"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if MONITOR_STOP_EVENT.wait(config["interval_seconds"]):
             break
 
@@ -2633,6 +2676,283 @@ def resolve_alert(alert_id: int):
         "alert_id": alert_id,
         "message": "告警已标记为已处理",
     }
+
+
+# ---------------------------------------------------------------------------
+# AlertAgent 集成端点
+# ---------------------------------------------------------------------------
+
+def _alert_agent_evaluate_from_snapshot(snapshot: dict) -> list[dict]:
+    """使用 AlertAgent 评估系统快照，返回告警列表，并写入数据库。"""
+    alerts: list[Alert] = _ALERT_AGENT.evaluate(snapshot)
+    result: list[dict] = []
+    for alert in alerts:
+        db_id = insert_alert_event(
+            level=alert.level,
+            event_type=alert.event_type,
+            summary=alert.summary,
+            reason=alert.reason,
+            suggestion=alert.suggestion,
+            related_record_id=alert.related_record_id,
+        )
+        d = _ALERT_AGENT.to_dict(alert)
+        d["db_id"] = db_id
+        result.append(d)
+    return result
+
+
+def _broadcast_alert_sse(alert_data: dict) -> None:
+    """向所有 SSE 客户端广播新告警。"""
+    with _ALERT_SSE_LOCK:
+        for q in _ALERT_SSE_QUEUES[:]:
+            try:
+                q.put_nowait(alert_data)
+            except Exception:
+                pass
+
+
+@app.post("/api/alerts/agent/evaluate")
+def alert_agent_evaluate(payload: dict | None = Body(None)):
+    """
+    手动触发 AlertAgent 评估。
+
+    两种用法：
+    1. 不传 body → 自动从 DB 识别记录 + 监控状态构建快照
+    2. 传 JSON body → 直接用你提供的数据评估（不写 DB，只返回结果）
+
+    Body 字段（全部可选，按需填）：
+    {
+      "performance": {"latency_ms": 150},
+      "plate": {
+        "available": true, "input_type": "rtsp_stream",
+        "plate_count": 0, "plates": [],
+        "consecutive_empty_count": 12
+      },
+      "traffic_gesture": {
+        "available": true, "gesture": "stop",
+        "gesture_name": "停止", "confidence": 0.92
+      },
+      "owner_gesture": {
+        "available": true, "gesture": "go_straight",
+        "gesture_name": "直行", "confidence": 0.88
+      }
+    }
+    """
+    try:
+        snapshot: dict = {}
+
+        if payload:
+            # 用户自定义测试数据
+            snapshot = {
+                "performance": payload.get("performance", {}),
+                "plate": payload.get("plate", {}),
+                "traffic_gesture": payload.get("traffic_gesture", {}),
+                "owner_gesture": payload.get("owner_gesture", {}),
+            }
+        else:
+            # 自动采集真实数据
+            snapshot = get_monitor_state_snapshot()
+            snapshot.setdefault("plate", {})
+            snapshot.setdefault("traffic_gesture", {})
+            snapshot.setdefault("owner_gesture", {})
+            snapshot.setdefault("performance", {})
+
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT task_type, input_type, result_json, created_at "
+                    "FROM recognition_records ORDER BY id DESC LIMIT 50"
+                )
+                rows = cursor.fetchall()
+                empty_count = 0
+                latest_perf = {}
+                for row in rows:
+                    try:
+                        result = json.loads(row["result_json"]) if row["result_json"] else {}
+                    except Exception:
+                        result = {}
+                    task = row["task_type"] or ""
+                    if "plate" in task and not snapshot["plate"].get("plates"):
+                        plates = result.get("plates") or []
+                        plate_count = result.get("plate_count", len(plates))
+                        if plate_count == 0:
+                            empty_count += 1
+                        snapshot["plate"] = {
+                            "available": True,
+                            "input_type": row["input_type"] or "",
+                            "plate_count": plate_count,
+                            "plates": plates,
+                            "consecutive_empty_count": empty_count if plate_count == 0 else 0,
+                        }
+                        latest_perf["plate_latency"] = result.get("latency_ms")
+                    elif "traffic" in task and not snapshot["traffic_gesture"].get("gesture"):
+                        snapshot["traffic_gesture"] = {
+                            "available": True,
+                            "gesture": result.get("gesture", ""),
+                            "gesture_name": result.get("gesture_name", ""),
+                            "confidence": result.get("confidence", 0),
+                        }
+                        latest_perf["traffic_latency"] = result.get("latency_ms")
+                    elif "owner" in task and not snapshot["owner_gesture"].get("gesture"):
+                        snapshot["owner_gesture"] = {
+                            "available": True,
+                            "gesture": result.get("gesture", ""),
+                            "gesture_name": result.get("gesture_name", ""),
+                            "confidence": result.get("confidence", 0),
+                        }
+                        latest_perf["owner_latency"] = result.get("latency_ms")
+                snapshot.setdefault("performance", latest_perf)
+            finally:
+                conn.close()
+
+            if isinstance(snapshot, dict):
+                last_round = snapshot.get("last_round_at")
+                if last_round:
+                    from datetime import datetime as _dt
+                    try:
+                        last_dt = _dt.strptime(last_round, "%Y-%m-%d %H:%M:%S")
+                        idle_sec = (_dt.now() - last_dt).total_seconds()
+                        snapshot["monitor_stats"] = {"seconds_since_last_recognition": idle_sec}
+                    except Exception:
+                        pass
+
+        # 用户自定义数据：使用临时 AlertAgent，不写入 DB、不广播 SSE、不共享抑制器
+        save_to_db = not bool(payload)
+
+        if save_to_db:
+            triggered = _alert_agent_evaluate_from_snapshot(snapshot)
+            for alert_dict in triggered:
+                _broadcast_alert_sse(alert_dict)
+        else:
+            temp_agent = AlertAgent(cooldown_seconds=0)  # 无冷却，每次测试独立
+            triggered = [temp_agent.to_dict(a) for a in temp_agent.evaluate(snapshot)]
+
+        for alert_dict in triggered:
+            _broadcast_alert_sse(alert_dict)
+
+        stats = _ALERT_AGENT.get_statistics()
+        return {
+            "status": "success",
+            "triggered_count": len(triggered),
+            "triggered": triggered,
+            "stats": {
+                "total": stats.total,
+                "critical": stats.critical,
+                "high": stats.high,
+                "medium": stats.medium,
+                "low": stats.low,
+                "info": stats.info,
+                "open": stats.open,
+                "resolved": stats.resolved,
+                "avg_per_minute": stats.avg_per_minute,
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AlertAgent 评估失败：{exc}")
+
+
+@app.get("/api/alerts/agent/stats")
+def alert_agent_stats():
+    """获取 AlertAgent 告警统计。"""
+    stats = _ALERT_AGENT.get_statistics()
+    return {
+        "status": "success",
+        "stats": {
+            "total": stats.total,
+            "critical": stats.critical,
+            "high": stats.high,
+            "medium": stats.medium,
+            "low": stats.low,
+            "info": stats.info,
+            "open": stats.open,
+            "resolved": stats.resolved,
+            "by_type": stats.by_type,
+            "avg_per_minute": stats.avg_per_minute,
+            "recent": _ALERT_AGENT.from_alert_list(stats.recent[-10:]),
+        },
+    }
+
+
+class LlmConfigRequest(BaseModel):
+    enabled: bool | None = None
+    api_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
+@app.post("/api/alerts/agent/llm-config")
+def alert_agent_llm_config(request: LlmConfigRequest):
+    """配置 AlertAgent 的 LLM 摘要生成选项。"""
+    config = _ALERT_AGENT.configure_llm(
+        enabled=request.enabled,
+        api_url=request.api_url,
+        api_key=request.api_key,
+        model=request.model,
+    )
+    return {
+        "status": "success",
+        "message": "LLM 配置已更新",
+        "config": config,
+    }
+
+
+@app.get("/api/alerts/agent/llm-config")
+def alert_agent_get_llm_config():
+    """查看当前 LLM 摘要配置。"""
+    config = _ALERT_AGENT.configure_llm()
+    return {
+        "status": "success",
+        "config": config,
+    }
+
+
+@app.get("/api/alerts/stream")
+async def alert_sse_stream():
+    """
+    SSE 实时告警推送。
+
+    前端通过 EventSource 连接此端点，
+    当 AlertAgent 检测到新告警时自动推送。
+    """
+    async def event_generator():
+        q: queue.Queue = queue.Queue()
+        with _ALERT_SSE_LOCK:
+            _ALERT_SSE_QUEUES.append(q)
+
+        try:
+            # 发送初始连接确认
+            yield f"data: {json.dumps({'type': 'connected', 'message': 'SSE 连接成功'})}\n\n"
+
+            while True:
+                try:
+                    alert_data = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: q.get(timeout=30)
+                    )
+                    payload = json.dumps({
+                        "type": "alert",
+                        "data": alert_data,
+                    }, ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+                except Exception:
+                    # 30 秒超时发送心跳
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            with _ALERT_SSE_LOCK:
+                if q in _ALERT_SSE_QUEUES:
+                    _ALERT_SSE_QUEUES.remove(q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/logs")
