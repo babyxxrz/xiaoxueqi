@@ -63,7 +63,7 @@
       </form>
 
       <div class="login-footer">
-        <span>默认管理员：admin / Admin123!</span>
+        <span>还没有账号？<router-link to="/register">立即注册</router-link></span>
       </div>
     </div>
   </div>

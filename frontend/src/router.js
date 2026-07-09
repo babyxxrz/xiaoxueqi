@@ -7,6 +7,7 @@ import { useAuth } from './useAuth'
 
 // 懒加载页面组件
 const LoginPage = () => import('./views/Login.vue')
+const RegisterPage = () => import('./views/Register.vue')
 const AdminPage = () => import('./views/Admin.vue')
 const ForbiddenPage = () => import('./views/Forbidden.vue')
 const MainApp = () => import('./App.vue')
@@ -17,6 +18,12 @@ const routes = [
     name: 'Login',
     component: LoginPage,
     meta: { guest: true, title: '登录' },
+  },
+  {
+    path: '/register',
+    name: 'Register',
+    component: RegisterPage,
+    meta: { guest: true, title: '注册' },
   },
   {
     path: '/',

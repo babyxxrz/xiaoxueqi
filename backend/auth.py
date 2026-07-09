@@ -281,48 +281,55 @@ def require_admin(
 
 def init_auth():
     """创建认证相关表并插入种子数据"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            email TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user', 'admin')),
-            created_at TEXT NOT NULL
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user', 'admin')),
+                created_at TEXT NOT NULL
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS refresh_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT NOT NULL UNIQUE,
-            user_id INTEGER NOT NULL,
-            expires_at TEXT NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
 
-    conn.commit()
-
-    # 种子数据：创建默认管理员（仅当不存在时）
-    existing = cursor.execute(
-        "SELECT id FROM users WHERE username = ?", ("admin",)
-    ).fetchone()
-
-    if existing is None:
-        hashed = hash_password("Admin123!")
-        cursor.execute(
-            "INSERT INTO users (username, email, password, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("admin", "admin@xiaoxueqi.local", hashed, "admin", now_text()),
-        )
         conn.commit()
 
-    conn.close()
+        # 种子数据：创建默认管理员（仅当不存在时）
+        existing = cursor.execute(
+            "SELECT id FROM users WHERE username = ?", ("admin",)
+        ).fetchone()
+
+        if existing is None:
+            hashed = hash_password("Admin123!")
+            cursor.execute(
+                "INSERT INTO users (username, email, password, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("admin", "admin@xiaoxueqi.local", hashed, "admin", now_text()),
+            )
+            conn.commit()
+            print("[auth] 默认管理员已创建: admin / Admin123!")
+
+        conn.close()
+        print("[auth] 认证模块初始化完成")
+    except Exception as e:
+        print(f"[auth] 初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # ---------- API 端点 ----------
@@ -371,15 +378,6 @@ def register(request: RegisterRequest):
 @auth_router.post("/login")
 async def login(request: LoginRequest, req: Request):
     """用户登录（限流：每分钟最多 5 次）"""
-    # 手动限流检查
-    client_ip = get_remote_address(req)
-    rate_key = f"login:{client_ip}"
-
-    # 校验密码强度（提前拦截弱密码，避免不必要的数据库查询）
-    strength_error = validate_password_strength(request.password)
-    if strength_error:
-        raise HTTPException(status_code=400, detail=strength_error)
-
     # 查找用户
     user_row = None
     conn = get_db_connection()
@@ -478,3 +476,40 @@ def get_me(current_user: dict = Depends(get_current_user)):
         "status": "success",
         "user": current_user,
     }
+
+
+@auth_router.get("/check")
+def check_auth_setup():
+    """检查认证模块是否正常初始化（诊断用）"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 检查 users 表是否存在
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        has_users_table = cursor.fetchone() is not None
+
+        # 检查 admin 用户是否存在
+        admin_count = 0
+        total_users = 0
+        if has_users_table:
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            admin_count = cursor.fetchone()[0]
+
+        conn.close()
+
+        return {
+            "status": "success",
+            "auth_ready": has_users_table and total_users > 0,
+            "has_users_table": has_users_table,
+            "total_users": total_users,
+            "admin_count": admin_count,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "auth_ready": False,
+            "detail": str(e),
+        }
