@@ -1,6 +1,12 @@
 <script setup>
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import OwnerCameraPanel from './components/OwnerCameraPanel.vue'
+import NavBar from './components/NavBar.vue'
+import { useAuth } from './useAuth'
+
+const router = useRouter()
+const { isAuthenticated, init: initAuth } = useAuth()
 
 const API_BASE = 'http://127.0.0.1:8000'
 
@@ -1167,29 +1173,19 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-shell">
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">AI Intelligent Traffic Recognition System</p>
-        <h1>智能交通识别与车载视觉感知系统</h1>
-        <p class="subtitle">
-          集成车牌识别、交警手势识别、车主手势控车、多路视频流并发、融合决策与端到端延迟测试。
-        </p>
-      </div>
+    <NavBar />
 
-      <div class="status-card">
-        <span
-          class="status-dot"
-          :class="{ ok: backendStatus.status === 'ok' || backendStatus.status === 'success' }"
-        ></span>
-        <div>
-          <strong>{{ backendStatus.status || 'unknown' }}</strong>
-          <p>{{ backendStatus.message || '后端状态未知' }}</p>
-        </div>
-        <button class="small-btn" :disabled="loading.refresh" @click="refreshAll">
-          {{ loading.refresh ? '刷新中...' : '刷新' }}
-        </button>
-      </div>
-    </header>
+    <!-- 后端状态条 -->
+    <div class="status-bar">
+      <span
+        class="status-dot"
+        :class="{ ok: backendStatus.status === 'ok' || backendStatus.status === 'success' }"
+      ></span>
+      <span class="status-text">{{ backendStatus.message || '后端状态未知' }}</span>
+      <button class="small-btn" :disabled="loading.refresh" @click="refreshAll">
+        {{ loading.refresh ? '刷新中...' : '刷新' }}
+      </button>
+    </div>
 
     <nav class="nav-tabs">
       <button
@@ -2149,6 +2145,42 @@ onBeforeUnmount(() => {
   gap: 20px;
   align-items: flex-start;
   margin-bottom: 18px;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  margin-bottom: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(211, 222, 235, 0.9);
+  border-radius: 12px;
+  font-size: 13px;
+  color: #506177;
+}
+
+.status-bar .status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f97316;
+  box-shadow: 0 0 0 4px rgba(249, 115, 22, 0.10);
+}
+
+.status-bar .status-dot.ok {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.12);
+}
+
+.status-bar .status-text {
+  flex: 1;
+}
+
+.status-bar .small-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
 }
 
 .eyebrow {

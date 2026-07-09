@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from algorithm.plate_recognizer import recognize_plate_real
 from algorithm.owner_gesture_recognizer import recognize_owner_gesture_image
 from algorithm.traffic_gesture_recognizer import recognize_traffic_gesture_image
+from auth import auth_router, init_auth
 
 
 app = FastAPI(title="智能车载视觉感知与告警系统")
@@ -29,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -233,6 +236,9 @@ def init_db():
     )
 
     conn.close()
+
+    # 初始化认证相关表及种子数据
+    init_auth()
 
 
 def insert_operation_log(action: str, detail: dict | str | None = None) -> int:
