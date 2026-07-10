@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="login-page">
     <div class="login-card">
       <div class="login-header">
@@ -7,7 +7,28 @@
         <p class="login-subtitle">请登录以继续操作</p>
       </div>
 
-      <form class="login-form" @submit.prevent="handleLogin">
+      <!-- 登录方式切换 -->
+      <div class="login-tabs">
+        <button
+          type="button"
+          class="login-tab"
+          :class="{ active: loginMode === 'password' }"
+          @click="loginMode = 'password'"
+        >
+          密码登录
+        </button>
+        <button
+          type="button"
+          class="login-tab"
+          :class="{ active: loginMode === 'code' }"
+          @click="loginMode = 'code'"
+        >
+          验证码登录
+        </button>
+      </div>
+
+      <!-- 密码登录表单 -->
+      <form v-if="loginMode === 'password'" class="login-form" @submit.prevent="handleLogin">
         <!-- 账号 -->
         <label class="login-field">
           <span>用户名 / 邮箱</span>
@@ -62,22 +83,81 @@
         </button>
       </form>
 
+      <!-- 验证码登录表单 -->
+      <form v-else class="login-form" @submit.prevent="handleCodeLogin">
+        <!-- 邮箱 -->
+        <label class="login-field">
+          <span>邮箱</span>
+          <input
+            v-model="codeForm.email"
+            type="email"
+            placeholder="请输入注册时使用的邮箱"
+            autocomplete="email"
+            :disabled="submitting"
+            @input="clearCodeFieldError('email')"
+          />
+          <p v-if="codeFieldErrors.email" class="login-field-error">{{ codeFieldErrors.email }}</p>
+        </label>
+
+        <!-- 验证码 -->
+        <label class="login-field">
+          <span>验证码</span>
+          <div class="login-code-wrap">
+            <input
+              v-model="codeForm.code"
+              type="text"
+              maxlength="6"
+              placeholder="请输入6位验证码"
+              autocomplete="one-time-code"
+              :disabled="submitting"
+              @input="clearCodeFieldError('code')"
+            />
+            <button
+              type="button"
+              class="login-send-code-btn"
+              :disabled="sendingCode || codeCountdown > 0 || !codeForm.email.includes('@')"
+              @click="handleSendCode"
+            >
+              <span v-if="sendingCode" class="login-spinner small-spinner"></span>
+              {{ codeCountdown > 0 ? `${codeCountdown}s` : '发送验证码' }}
+            </button>
+          </div>
+          <p v-if="codeFieldErrors.code" class="login-field-error">{{ codeFieldErrors.code }}</p>
+        </label>
+
+        <!-- 成功提示 -->
+        <div v-if="codeSuccessMessage" class="login-success">{{ codeSuccessMessage }}</div>
+
+        <!-- 错误提示 -->
+        <div v-if="errorMessage" class="login-error">{{ errorMessage }}</div>
+
+        <!-- 提交按钮 -->
+        <button type="submit" class="login-submit-btn" :disabled="submitting || !codeForm.code">
+          <span v-if="submitting" class="login-spinner"></span>
+          {{ submitting ? '登录中...' : '登录' }}
+        </button>
+      </form>
+
       <div class="login-footer">
         <span>还没有账号？<router-link to="/register">立即注册</router-link></span>
       </div>
     </div>
   </div>
 </template>
-
 <script setup>
-import { reactive, ref } from 'vue'
+import { reactive, ref, onBeforeUnmount } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuth } from '../useAuth'
+import { apiPost, setTokens } from '../api'
 
 const router = useRouter()
 const route = useRoute()
-const { login } = useAuth()
+const { login, currentUser } = useAuth()
 
+// 登录方式：'password' | 'code'
+const loginMode = ref('password')
+
+// ---- 密码登录表单 ----
 const form = reactive({
   account: '',
   password: '',
@@ -136,8 +216,125 @@ async function handleLogin() {
 
   submitting.value = false
 }
-</script>
 
+// ---- 验证码登录表单 ----
+const codeForm = reactive({
+  email: '',
+  code: '',
+})
+
+const codeFieldErrors = reactive({
+  email: '',
+  code: '',
+})
+
+const codeSuccessMessage = ref('')
+const sendingCode = ref(false)
+const codeCountdown = ref(0)
+let countdownTimer = null
+
+function clearCodeFieldError(field) {
+  codeFieldErrors[field] = ''
+  errorMessage.value = ''
+  codeSuccessMessage.value = ''
+}
+
+function validateCodeForm() {
+  let valid = true
+  codeFieldErrors.email = ''
+  codeFieldErrors.code = ''
+
+  if (!codeForm.email.trim() || !codeForm.email.includes('@')) {
+    codeFieldErrors.email = '请输入有效的邮箱地址'
+    valid = false
+  }
+
+  if (!codeForm.code) {
+    codeFieldErrors.code = '请输入验证码'
+    valid = false
+  } else if (codeForm.code.length !== 6) {
+    codeFieldErrors.code = '验证码为 6 位数字'
+    valid = false
+  }
+
+  return valid
+}
+
+async function handleSendCode() {
+  if (sendingCode.value || codeCountdown.value > 0) return
+  if (!codeForm.email.trim() || !codeForm.email.includes('@')) {
+    codeFieldErrors.email = '请输入有效的邮箱地址'
+    return
+  }
+
+  sendingCode.value = true
+  codeSuccessMessage.value = ''
+  errorMessage.value = ''
+
+  try {
+    const data = await apiPost('/api/auth/send-code', {
+      email: codeForm.email.trim(),
+    })
+
+    if (data.status === 'success') {
+      codeSuccessMessage.value = data.message || '验证码已发送，请查收邮件'
+      // 开始倒计时
+      codeCountdown.value = 60
+      countdownTimer = setInterval(() => {
+        codeCountdown.value--
+        if (codeCountdown.value <= 0) {
+          clearInterval(countdownTimer)
+          countdownTimer = null
+        }
+      }, 1000)
+    }
+  } catch (error) {
+    errorMessage.value = error.message || '验证码发送失败，请重试'
+  } finally {
+    sendingCode.value = false
+  }
+}
+
+async function handleCodeLogin() {
+  if (submitting.value) return
+  if (!validateCodeForm()) return
+
+  submitting.value = true
+  errorMessage.value = ''
+  codeSuccessMessage.value = ''
+
+  try {
+    const data = await apiPost('/api/auth/login-by-code', {
+      email: codeForm.email.trim(),
+      code: codeForm.code,
+    })
+
+    if (data.status === 'success') {
+      // 保存 token 和用户信息
+      setTokens(data.access_token, data.refresh_token)
+      localStorage.setItem('user', JSON.stringify(data.user))
+
+      // 更新 useAuth 的响应式状态，让路由守卫立即识别已登录
+      currentUser.value = data.user
+
+      const redirect = route.query.redirect || '/'
+      router.push(redirect)
+    }
+  } catch (error) {
+    errorMessage.value = error.message || '登录失败，请重试'
+  } finally {
+    submitting.value = false
+  }
+}
+
+// 组件卸载时清除定时器
+onBeforeUnmount(() => {
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
+  }
+})
+</script>
 <style scoped>
 .login-page {
   display: flex;
@@ -183,6 +380,38 @@ async function handleLogin() {
   margin: 0;
 }
 
+/* ---- 登录方式切换标签 ---- */
+.login-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 24px;
+  border: 1px solid #d7e0ea;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.login-tab {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.login-tab.active {
+  background: #2563eb;
+  color: white;
+}
+
+.login-tab:not(.active):hover {
+  background: #eef2f6;
+}
+
+/* ---- 表单 ---- */
 .login-form {
   display: grid;
   gap: 18px;
@@ -200,7 +429,8 @@ async function handleLogin() {
 }
 
 .login-field input[type="text"],
-.login-field input[type="password"] {
+.login-field input[type="password"],
+.login-field input[type="email"] {
   border: 1px solid #d7e0ea;
   border-radius: 10px;
   padding: 11px 12px;
@@ -264,6 +494,16 @@ async function handleLogin() {
   font-weight: 600;
 }
 
+.login-success {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: #15803d;
+  font-size: 14px;
+  font-weight: 600;
+}
+
 .login-submit-btn {
   width: 100%;
   padding: 13px;
@@ -302,14 +542,71 @@ async function handleLogin() {
   animation: login-spin 0.6s linear infinite;
 }
 
+.small-spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+}
+
 @keyframes login-spin {
   to { transform: rotate(360deg); }
 }
 
+/* ---- 验证码输入行 ---- */
+.login-code-wrap {
+  display: flex;
+  gap: 8px;
+}
+
+.login-code-wrap input {
+  flex: 1;
+}
+
+.login-send-code-btn {
+  white-space: nowrap;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: #2563eb;
+  color: white;
+  box-shadow: none;
+  border: none;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 100px;
+  justify-content: center;
+}
+
+.login-send-code-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.login-send-code-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ---- 页脚 ---- */
 .login-footer {
   margin-top: 24px;
   text-align: center;
   font-size: 12px;
   color: #94a3b8;
 }
+
+.login-footer a {
+  color: #2563eb;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.login-footer a:hover {
+  text-decoration: underline;
+}
 </style>
+
+

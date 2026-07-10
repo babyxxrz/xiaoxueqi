@@ -1,7 +1,11 @@
-"""
+﻿"""
 认证与权限管理模块
-提供用户注册、登录、Token 刷新、退出、权限中间件等功能。
+提供用户注册、登录、Token 刷新、退出、权限中间件、邮箱验证码登录等功能。
 """
+import random
+import smtplib
+from email.mime.text import MIMEText
+
 import re
 import secrets
 import uuid
@@ -35,6 +39,18 @@ auth_scheme = HTTPBearer()
 limiter = Limiter(key_func=get_remote_address)
 
 DATA_DIR.mkdir(exist_ok=True)
+# ---------- 邮箱配置 ----------
+SMTP_HOST = "smtp.qq.com"
+SMTP_PORT = 465
+SMTP_USER = "3514037381@qq.com"
+SMTP_PASS = "bycisjsahhxgdbij"
+SMTP_FROM = "3514037381@qq.com"
+
+# 验证码配置
+VERIFY_CODE_EXPIRE_MINUTES = 5  # 验证码有效期
+VERIFY_CODE_LENGTH = 6          # 验证码长度
+
+
 
 
 # ---------- 数据库连接 ----------
@@ -70,6 +86,109 @@ class RefreshRequest(BaseModel):
 
 class LogoutRequest(BaseModel):
     refresh_token: str
+
+
+class SendCodeRequest(BaseModel):
+    email: str
+
+
+class LoginByCodeRequest(BaseModel):
+    email: str
+    code: str
+    remember: bool = False
+
+
+# ---------- 邮箱工具 ----------
+
+def send_verify_code_email(to_email: str, code: str) -> bool:
+    """向指定邮箱发送验证码邮件，成功返回 True"""
+    subject = "智能车载视觉感知与告警系统 - 验证码"
+    body = f"""<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e0e0e0; border-radius: 12px;">
+    <h2 style="color: #2563eb; margin-top: 0;">智能车载视觉感知与告警系统</h2>
+    <p>您好！</p>
+    <p>您的登录验证码为：</p>
+    <div style="font-size: 36px; font-weight: bold; color: #2563eb; text-align: center; padding: 24px; margin: 16px 0; background: #f0f7ff; border-radius: 8px; letter-spacing: 8px;">
+        {code}
+    </div>
+    <p style="color: #64748b;">验证码有效期为 <strong>{VERIFY_CODE_EXPIRE_MINUTES} 分钟</strong>，请勿泄露给他人。</p>
+    <p style="color: #94a3b8; font-size: 12px; margin-top: 24px;">此邮件由系统自动发送，请勿回复。</p>
+</div>"""
+
+    msg = MIMEText(body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[EMAIL ERROR] 发送验证码到 {to_email} 失败: {e}")
+        return False
+
+
+def generate_verify_code(length: int = VERIFY_CODE_LENGTH) -> str:
+    """生成指定长度的数字验证码"""
+    return "".join(str(random.randint(0, 9)) for _ in range(length))
+
+
+def save_verify_code(email: str, code: str) -> None:
+    """保存验证码到数据库（先删除该邮箱旧验证码再插入）"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 删除该邮箱旧的未过期验证码
+    cursor.execute(
+        "DELETE FROM verification_codes WHERE email = ?",
+        (email,),
+    )
+    expires_at = (datetime.now() + timedelta(minutes=VERIFY_CODE_EXPIRE_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "INSERT INTO verification_codes (email, code, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)",
+        (email, code, expires_at, now_text()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def verify_code(email: str, code: str) -> tuple[bool, int | None]:
+    """验证邮箱验证码是否有效（匹配且未过期、未使用），返回 (是否有效, 验证码记录ID)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM verification_codes WHERE email = ? AND code = ? AND used = 0 AND expires_at > ?",
+        (email, code, now_text()),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return False, None
+    return True, row["id"]
+
+
+def consume_verify_code(code_id: int) -> None:
+    """登录成功后标记验证码为已使用"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE verification_codes SET used = 1 WHERE id = ? AND used = 0",
+        (code_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_by_email(email: str) -> dict | None:
+    """通过邮箱查找用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    conn.close()
+    return _user_row_to_dict(row)
+
+
 
 
 # ---------- 密码工具 ----------
@@ -309,8 +428,23 @@ def init_auth():
         """)
 
         conn.commit()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS verification_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                code TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+
 
         # 种子数据：创建默认管理员（仅当不存在时）
+        conn.commit()
+
+        
         existing = cursor.execute(
             "SELECT id FROM users WHERE username = ?", ("admin",)
         ).fetchone()
@@ -418,6 +552,108 @@ async def login(request: LoginRequest, req: Request):
     }
 
 
+@auth_router.post("/send-code")
+def send_code(request: SendCodeRequest):
+    """发送邮箱验证码"""
+    email = request.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
+
+    # 检查邮箱是否已被注册
+    user = get_user_by_email(email)
+    if user is None:
+        raise HTTPException(status_code=400, detail="该邮箱未注册，请先注册账号")
+
+    # 生成验证码
+    code = generate_verify_code()
+
+    # 保存到数据库
+    save_verify_code(email, code)
+
+    # 发送邮件
+    success = send_verify_code_email(email, code)
+    if not success:
+        raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
+
+    return {
+        "status": "success",
+        "message": f"验证码已发送到 {email}，请查收",
+    }
+
+
+@auth_router.post("/debug-send-code")
+def debug_send_code(request: SendCodeRequest):
+    """【调试用】发送邮箱验证码并直接返回验证码（不依赖真实邮箱）"""
+    email = request.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
+
+    # 如果邮箱未注册，自动创建一个测试用户
+    user = get_user_by_email(email)
+    if user is None:
+        create_user(email.split("@")[0], email, "Test1234", "user")
+        print(f"[DEBUG] 自动创建测试用户: {email}")
+
+    # 生成并保存验证码
+    code = generate_verify_code()
+    save_verify_code(email, code)
+
+    # 直接返回验证码（不发送邮件）
+    print(f"[DEBUG] 验证码 for {email}: {code}")
+
+    return {
+        "status": "success",
+        "message": f"验证码已生成（调试模式）",
+        "debug_code": code,
+        "expire_minutes": VERIFY_CODE_EXPIRE_MINUTES,
+    }
+
+
+
+@auth_router.post("/login-by-code")
+def login_by_code(request: LoginByCodeRequest):
+    """邮箱验证码登录"""
+    email = request.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
+    if not request.code or len(request.code) != VERIFY_CODE_LENGTH:
+        raise HTTPException(status_code=400, detail=f"请输入{VERIFY_CODE_LENGTH}位验证码")
+
+    # 验证验证码（仅校验，不消耗）
+    is_valid, code_id = verify_code(email, request.code)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail="验证码无效或已过期，请重新获取")
+
+    # 查找用户
+    user = get_user_by_email(email)
+    if user is None:
+        raise HTTPException(status_code=400, detail="该邮箱未注册，请先注册账号")
+
+    # 生成 token
+    access_token = create_access_token(user["id"], user["username"], user["role"])
+    refresh_token, expires_at = create_refresh_token(user["id"], request.remember)
+
+    # 保存 refresh token
+    save_refresh_token(refresh_token, user["id"], expires_at)
+
+    # 清理过期 token
+    cleanup_expired_tokens()
+
+    # 所有操作成功后，标记验证码为已使用（防止中间失败导致验证码被吞）
+    if code_id is not None:
+        consume_verify_code(code_id)
+
+    return {
+        "status": "success",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": user,
+    }
+
+
+
 @auth_router.post("/refresh")
 def refresh_token(request: RefreshRequest):
     """用 refresh token 换取新的 access token（token 旋转）"""
@@ -513,3 +749,5 @@ def check_auth_setup():
             "auth_ready": False,
             "detail": str(e),
         }
+
+
