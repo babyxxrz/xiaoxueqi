@@ -1,111 +1,81 @@
 <template>
-  <section class="owner-camera-panel">
-    <div class="owner-camera-header">
+  <section class="camera-panel">
+    <div class="camera-heading">
       <div>
-        <h3>电脑摄像头实时识别</h3>
-        <p>
-          低分辨率快速抽帧上传至后端 MediaPipe Hands 接口，前端本地绘制手部关键点骨架，优先保证实时性。
-        </p>
+        <p class="section-kicker">DRIVER GESTURE</p>
+        <h3>车主摄像头实时识别</h3>
+        <p>采集手部关键点并映射车辆控制操作。</p>
       </div>
-      <div class="owner-camera-tags">
-        <span :class="['camera-tag', cameraRunning ? 'ok' : 'warn']">
-          {{ cameraRunning ? '摄像头已启动' : '摄像头未启动' }}
+
+      <div class="status-row">
+        <span :class="['status-pill', cameraRunning && 'online']">
+          {{ cameraRunning ? '摄像头在线' : '摄像头未启动' }}
         </span>
-        <span :class="['camera-tag', loopRunning ? 'ok' : 'warn']">
-          {{ loopRunning ? '实时识别中' : '实时识别未开始' }}
+        <span :class="['status-pill', loopRunning && 'online']">
+          {{ loopRunning ? '正在识别' : '识别未开始' }}
         </span>
-        <span class="camera-tag ok" v-if="fastMode">快速模式</span>
       </div>
     </div>
 
-    <div class="owner-camera-grid">
-      <div class="owner-camera-card">
-        <div class="owner-video-stage">
+    <div class="camera-grid">
+      <div class="video-card">
+        <div class="video-stage">
           <video ref="videoRef" autoplay muted playsinline></video>
-          <canvas ref="overlayCanvasRef" class="owner-overlay-canvas"></canvas>
-          <canvas ref="captureCanvasRef" class="owner-hidden-canvas"></canvas>
+          <canvas ref="overlayCanvasRef"></canvas>
+          <canvas ref="captureCanvasRef" class="hidden-canvas"></canvas>
+          <div v-if="!cameraRunning" class="video-placeholder">等待打开摄像头</div>
         </div>
 
-        <div class="owner-camera-controls">
-          <button type="button" @click="startCamera" :disabled="cameraRunning">
-            打开摄像头
-          </button>
-          <button type="button" class="secondary" @click="stopCamera" :disabled="!cameraRunning">
-            关闭摄像头
-          </button>
-          <button type="button" class="secondary" @click="captureAndRecognize" :disabled="!cameraRunning || requesting">
+        <div class="control-row">
+          <button v-if="!cameraRunning" @click="startCamera">打开摄像头</button>
+          <button v-else class="secondary" @click="stopCamera">关闭摄像头</button>
+          <button :disabled="!cameraRunning || loopRunning" @click="startLoop">开始实时识别</button>
+          <button class="danger" :disabled="!loopRunning" @click="stopLoop">停止识别</button>
+          <button class="secondary" :disabled="!cameraRunning || requesting" @click="captureAndRecognize">
             单次识别
           </button>
-          <button type="button" @click="startLoop" :disabled="!cameraRunning || loopRunning">
-            开始实时识别
-          </button>
-          <button type="button" class="danger" @click="stopLoop" :disabled="!loopRunning">
-            停止实时识别
-          </button>
-
-          <label class="camera-inline-field">
-            间隔 ms
-            <input v-model.number="intervalMs" type="number" min="250" step="50" />
-          </label>
-
-          <label class="camera-inline-field">
-            帧宽
-            <select v-model.number="frameWidth">
-              <option :value="240">240</option>
-              <option :value="320">320</option>
-              <option :value="400">400</option>
-            </select>
-          </label>
         </div>
 
-        <p v-if="errorMessage" class="owner-camera-error">{{ errorMessage }}</p>
+        <p v-if="errorMessage" class="error-text">{{ errorMessage }}</p>
       </div>
 
-      <div class="owner-camera-card">
-        <div class="owner-result-main">
+      <div class="result-card">
+        <div class="gesture-result">
           <span>当前手势</span>
-          <strong>{{ result.gesture_name || '暂无结果' }}</strong>
+          <strong>{{ result.gesture_name || '等待识别' }}</strong>
+          <small>{{ result.gesture || '-' }}</small>
         </div>
 
-        <div class="owner-camera-metrics">
-          <div>
-            <span>手势代码</span>
-            <strong>{{ result.gesture || '-' }}</strong>
-          </div>
+        <div class="metric-grid">
           <div>
             <span>置信度</span>
             <strong>{{ confidenceText }}</strong>
+          </div>
+          <div>
+            <span>识别延迟</span>
+            <strong>{{ latencyText }}</strong>
           </div>
           <div>
             <span>车辆动作</span>
             <strong>{{ result.description || result.action || '-' }}</strong>
           </div>
           <div>
-            <span>接口延迟</span>
-            <strong>{{ latencyText }}</strong>
-          </div>
-          <div>
-            <span>系统唤醒</span>
-            <strong>{{ vehicleState.system_awake ? '已唤醒' : '未唤醒' }}</strong>
-          </div>
-          <div>
             <span>当前功能</span>
-            <strong>{{ vehicleState.current_function || '-' }}</strong>
+            <strong>{{ vehicleState.current_function || 'home' }}</strong>
           </div>
           <div>
             <span>音量</span>
-            <strong>{{ vehicleState.volume ?? '-' }}</strong>
+            <strong>{{ vehicleState.volume ?? 50 }}</strong>
           </div>
           <div>
             <span>电话状态</span>
-            <strong>{{ vehicleState.phone_status || '-' }}</strong>
+            <strong>{{ vehicleState.phone_status || '空闲' }}</strong>
           </div>
         </div>
 
-        <div class="owner-camera-log">
-          <div v-for="item in logs" :key="item.id">
-            {{ item.text }}
-          </div>
+        <div class="vehicle-state">
+          <span>车辆交互系统</span>
+          <strong>{{ vehicleState.system_awake ? '已唤醒' : '待机' }}</strong>
         </div>
       </div>
     </div>
@@ -114,31 +84,20 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, reactive, ref } from 'vue'
+import { API_BASE, authHeaders } from '../api'
 
 const emit = defineEmits(['recognized'])
-
-const API_BASE = 'http://127.0.0.1:8000'
 
 const videoRef = ref(null)
 const overlayCanvasRef = ref(null)
 const captureCanvasRef = ref(null)
-
 const streamRef = ref(null)
+const timerRef = ref(null)
+
 const cameraRunning = ref(false)
 const loopRunning = ref(false)
 const requesting = ref(false)
-const fastMode = ref(true)
-
-const intervalMs = ref(350)
-const frameWidth = ref(320)
-
-const loopTimer = ref(null)
-const frameCount = ref(0)
-const successCount = ref(0)
-const totalLatency = ref(0)
-
 const errorMessage = ref('')
-const logs = ref([])
 
 const result = reactive({
   gesture: '',
@@ -154,31 +113,20 @@ const vehicleState = reactive({
   system_awake: false,
   current_function: 'home',
   volume: 50,
-  temperature: 24,
   phone_status: '空闲',
 })
 
-const confidenceText = computed(() => {
-  if (result.confidence === null || result.confidence === undefined) return '-'
-  return Number(result.confidence).toFixed(2)
-})
+const confidenceText = computed(() =>
+  result.confidence === null || result.confidence === undefined
+    ? '-'
+    : `${Math.round(Number(result.confidence) * 100)}%`,
+)
 
-const latencyText = computed(() => {
-  if (result.latency_ms === null || result.latency_ms === undefined) return '-'
-  return `${Math.round(result.latency_ms)} ms`
-})
-
-function addLog(text) {
-  const now = new Date().toLocaleTimeString()
-  logs.value.unshift({
-    id: `${Date.now()}_${Math.random()}`,
-    text: `[${now}] ${text}`,
-  })
-
-  if (logs.value.length > 8) {
-    logs.value = logs.value.slice(0, 8)
-  }
-}
+const latencyText = computed(() =>
+  result.latency_ms === null || result.latency_ms === undefined
+    ? '-'
+    : `${Math.round(result.latency_ms)} ms`,
+)
 
 async function startCamera() {
   errorMessage.value = ''
@@ -186,8 +134,8 @@ async function startCamera() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width: { ideal: 320 },
-        height: { ideal: 240 },
+        width: { ideal: 640 },
+        height: { ideal: 480 },
         facingMode: 'user',
       },
       audio: false,
@@ -195,26 +143,20 @@ async function startCamera() {
 
     streamRef.value = stream
     videoRef.value.srcObject = stream
-
     cameraRunning.value = true
 
     await nextTick()
-    resizeOverlayCanvas()
-
-    addLog('摄像头已启动')
+    resizeOverlay()
   } catch (error) {
     errorMessage.value = `摄像头启动失败：${error.message}`
-    addLog(`摄像头启动失败：${error.message}`)
   }
 }
 
 function stopCamera() {
   stopLoop()
 
-  if (streamRef.value) {
-    streamRef.value.getTracks().forEach((track) => track.stop())
-    streamRef.value = null
-  }
+  streamRef.value?.getTracks().forEach((track) => track.stop())
+  streamRef.value = null
 
   if (videoRef.value) {
     videoRef.value.srcObject = null
@@ -222,39 +164,27 @@ function stopCamera() {
 
   cameraRunning.value = false
   clearOverlay()
-  addLog('摄像头已关闭')
 }
 
 function startLoop() {
-  if (!cameraRunning.value) {
-    errorMessage.value = '请先打开摄像头。'
-    return
-  }
-
+  if (!cameraRunning.value) return
   stopLoop()
-
-  const delay = Math.max(250, Number(intervalMs.value || 350))
-  intervalMs.value = delay
-
   loopRunning.value = true
   captureAndRecognize()
-  loopTimer.value = window.setInterval(captureAndRecognize, delay)
-
-  addLog(`实时识别已开始，间隔 ${delay}ms`)
+  timerRef.value = window.setInterval(captureAndRecognize, 400)
 }
 
 function stopLoop() {
-  if (loopTimer.value) {
-    window.clearInterval(loopTimer.value)
-    loopTimer.value = null
+  if (timerRef.value) {
+    window.clearInterval(timerRef.value)
+    timerRef.value = null
   }
-
   loopRunning.value = false
 }
 
 function canvasToBlob(canvas) {
   return new Promise((resolve) => {
-    canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.5)
+    canvas.toBlob(resolve, 'image/jpeg', 0.55)
   })
 }
 
@@ -262,96 +192,78 @@ async function captureAndRecognize() {
   if (!cameraRunning.value || requesting.value) return
 
   const video = videoRef.value
-  const captureCanvas = captureCanvasRef.value
+  const canvas = captureCanvasRef.value
 
-  if (!video || !captureCanvas || !video.videoWidth || !video.videoHeight) return
+  if (!video?.videoWidth || !video?.videoHeight || !canvas) return
 
   requesting.value = true
   errorMessage.value = ''
 
   try {
-    const maxWidth = Math.max(160, Number(frameWidth.value || 320))
-    const scale = Math.min(1, maxWidth / video.videoWidth)
+    const scale = Math.min(1, 320 / video.videoWidth)
+    canvas.width = Math.round(video.videoWidth * scale)
+    canvas.height = Math.round(video.videoHeight * scale)
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height)
 
-    captureCanvas.width = Math.round(video.videoWidth * scale)
-    captureCanvas.height = Math.round(video.videoHeight * scale)
-
-    const ctx = captureCanvas.getContext('2d')
-    ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height)
-
-    const blob = await canvasToBlob(captureCanvas)
-    if (!blob) throw new Error('摄像头画面转图片失败')
+    const blob = await canvasToBlob(canvas)
+    if (!blob) throw new Error('摄像头帧生成失败')
 
     const formData = new FormData()
     formData.append('file', blob, `owner_camera_${Date.now()}.jpg`)
 
-    const clientStart = performance.now()
-
+    const started = performance.now()
     const response = await fetch(`${API_BASE}/api/gesture/owner/camera-fast-frame`, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     })
 
     const data = await response.json()
-    const clientLatency = performance.now() - clientStart
+    const clientLatency = performance.now() - started
 
-    if (!response.ok || data.status !== 'success') {
-      throw new Error(JSON.stringify(data))
+    if (!response.ok || data.status === 'error') {
+      throw new Error(data?.detail || data?.message || '识别失败')
     }
 
     updateResult(data, clientLatency)
   } catch (error) {
     errorMessage.value = `识别失败：${error.message}`
-    addLog(`识别失败：${error.message}`)
   } finally {
     requesting.value = false
   }
 }
 
 function updateResult(data, clientLatency) {
-  const payload = data.result || {}
+  const payload = data.result || data
   const state = payload.vehicle_state || {}
-
-  frameCount.value += 1
-  successCount.value += 1
-
-  const latency = data.latency_ms ?? clientLatency
-  totalLatency.value += latency
 
   result.gesture = payload.gesture || ''
   result.gesture_name = payload.gesture_name || ''
   result.confidence = payload.confidence
   result.action = payload.action || ''
   result.description = payload.description || ''
-  result.latency_ms = latency
+  result.latency_ms = data.latency_ms ?? clientLatency
   result.landmarks = payload.landmarks || []
 
   Object.assign(vehicleState, state)
+  drawLandmarks(result.landmarks)
 
   emit('recognized', {
     status: 'success',
     task_type: 'owner_gesture',
     input_type: data.input_type || 'camera_fast_frame',
-    latency_ms: latency,
+    latency_ms: result.latency_ms,
     created_at: new Date().toISOString(),
     result: {
       ...payload,
-      vehicle_state: state,
+      vehicle_state: { ...vehicleState },
     },
   })
-
-  drawLandmarks(result.landmarks)
-
-  const avg = successCount.value > 0 ? Math.round(totalLatency.value / successCount.value) : 0
-  addLog(
-    `第 ${frameCount.value} 帧：${result.gesture_name || '-'} / ${result.gesture || '-'}，延迟 ${Math.round(latency)}ms，平均 ${avg}ms`
-  )
 }
 
-function resizeOverlayCanvas() {
+function resizeOverlay() {
   const video = videoRef.value
   const canvas = overlayCanvasRef.value
-
   if (!video || !canvas) return
 
   const rect = video.getBoundingClientRect()
@@ -362,21 +274,19 @@ function resizeOverlayCanvas() {
 function clearOverlay() {
   const canvas = overlayCanvasRef.value
   if (!canvas) return
-
-  const ctx = canvas.getContext('2d')
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height)
 }
 
 function drawLandmarks(landmarks) {
-  resizeOverlayCanvas()
+  resizeOverlay()
 
   const canvas = overlayCanvasRef.value
   if (!canvas) return
 
-  const ctx = canvas.getContext('2d')
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  const context = canvas.getContext('2d')
+  context.clearRect(0, 0, canvas.width, canvas.height)
 
-  if (!landmarks || landmarks.length === 0) return
+  if (!Array.isArray(landmarks) || !landmarks.length) return
 
   const connections = [
     [0, 1], [1, 2], [2, 3], [3, 4],
@@ -387,130 +297,135 @@ function drawLandmarks(landmarks) {
     [0, 17],
   ]
 
-  const getPoint = (idx) => {
-    const item = landmarks.find((lm) => lm.index === idx)
+  const point = (index) => {
+    const item = landmarks.find((landmark) => landmark.index === index)
     if (!item) return null
-
     return {
       x: item.x * canvas.width,
       y: item.y * canvas.height,
     }
   }
 
-  ctx.lineWidth = 3
-  ctx.strokeStyle = '#38bdf8'
-  ctx.fillStyle = '#f97316'
+  context.lineWidth = 3
+  context.strokeStyle = '#22d3ee'
+  context.fillStyle = '#fb923c'
 
-  for (const [a, b] of connections) {
-    const p1 = getPoint(a)
-    const p2 = getPoint(b)
-    if (!p1 || !p2) continue
+  connections.forEach(([from, to]) => {
+    const start = point(from)
+    const end = point(to)
+    if (!start || !end) return
 
-    ctx.beginPath()
-    ctx.moveTo(p1.x, p1.y)
-    ctx.lineTo(p2.x, p2.y)
-    ctx.stroke()
-  }
+    context.beginPath()
+    context.moveTo(start.x, start.y)
+    context.lineTo(end.x, end.y)
+    context.stroke()
+  })
 
-  for (const lm of landmarks) {
-    ctx.beginPath()
-    ctx.arc(lm.x * canvas.width, lm.y * canvas.height, 4, 0, Math.PI * 2)
-    ctx.fill()
-  }
+  landmarks.forEach((landmark) => {
+    context.beginPath()
+    context.arc(
+      landmark.x * canvas.width,
+      landmark.y * canvas.height,
+      4,
+      0,
+      Math.PI * 2,
+    )
+    context.fill()
+  })
 }
 
 onBeforeUnmount(() => {
   stopCamera()
+  window.removeEventListener('resize', resizeOverlay)
 })
 
-window.addEventListener('resize', resizeOverlayCanvas)
+window.addEventListener('resize', resizeOverlay)
 </script>
 
 <style scoped>
-.owner-camera-panel {
-  margin-top: 18px;
-  padding: 18px;
-  border: 1px solid rgba(148, 163, 184, 0.28);
+.camera-panel {
+  padding: 20px;
+  border: 1px solid rgba(34, 211, 238, 0.18);
   border-radius: 18px;
-  background: rgba(15, 23, 42, 0.05);
+  background: rgba(8, 20, 38, 0.88);
 }
 
-.owner-camera-header {
+.camera-heading {
   display: flex;
   justify-content: space-between;
   gap: 16px;
-  align-items: flex-start;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
-.owner-camera-header h3 {
-  margin: 0 0 6px;
-  font-size: 20px;
+.camera-heading h3 {
+  margin: 3px 0 6px;
+  color: #f8fafc;
+  font-size: 21px;
 }
 
-.owner-camera-header p {
+.camera-heading p {
   margin: 0;
-  color: #64748b;
-  line-height: 1.6;
+  color: #94a3b8;
 }
 
-.owner-camera-tags {
+.section-kicker {
+  color: #22d3ee !important;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+}
+
+.status-row,
+.control-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  justify-content: flex-end;
+  gap: 9px;
 }
 
-.camera-tag {
-  display: inline-flex;
-  align-items: center;
-  padding: 5px 9px;
+.status-pill {
+  height: fit-content;
+  padding: 6px 10px;
   border-radius: 999px;
+  background: #273449;
+  color: #94a3b8;
   font-size: 12px;
-  background: #e2e8f0;
-  color: #334155;
 }
 
-.camera-tag.ok {
-  background: #dcfce7;
-  color: #166534;
+.status-pill.online {
+  background: rgba(16, 185, 129, 0.16);
+  color: #6ee7b7;
 }
 
-.camera-tag.warn {
-  background: #fef3c7;
-  color: #92400e;
-}
-
-.owner-camera-grid {
+.camera-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 1.2fr) minmax(300px, 1fr);
+  grid-template-columns: minmax(340px, 1.25fr) minmax(300px, 0.75fr);
   gap: 16px;
 }
 
-.owner-camera-card {
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-radius: 16px;
+.video-card,
+.result-card {
   padding: 14px;
-  background: rgba(255, 255, 255, 0.74);
+  border: 1px solid #26354d;
+  border-radius: 16px;
+  background: #0a1628;
 }
 
-.owner-video-stage {
+.video-stage {
   position: relative;
-  width: 100%;
+  min-height: 330px;
   overflow: hidden;
-  border-radius: 14px;
+  border-radius: 13px;
   background: #020617;
-  border: 1px solid #cbd5e1;
 }
 
-.owner-video-stage video {
+.video-stage video {
   display: block;
   width: 100%;
-  min-height: 260px;
+  min-height: 330px;
   object-fit: cover;
 }
 
-.owner-overlay-canvas {
+.video-stage canvas {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -518,131 +433,109 @@ window.addEventListener('resize', resizeOverlayCanvas)
   pointer-events: none;
 }
 
-.owner-hidden-canvas {
+.video-stage .hidden-canvas {
   display: none;
 }
 
-.owner-camera-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+.video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #64748b;
+}
+
+.control-row {
   margin-top: 12px;
-  align-items: center;
 }
 
-.owner-camera-controls button {
-  border: none;
-  border-radius: 10px;
+.control-row button {
   padding: 9px 12px;
-  background: #2563eb;
+  border: 0;
+  border-radius: 10px;
+  background: #0891b2;
   color: #ffffff;
-  font-weight: 700;
-  cursor: pointer;
+  font-weight: 800;
 }
 
-.owner-camera-controls button.secondary {
-  background: #475569;
+.control-row button.secondary {
+  background: #334155;
 }
 
-.owner-camera-controls button.danger {
-  background: #dc2626;
+.control-row button.danger {
+  background: #b91c1c;
 }
 
-.owner-camera-controls button:disabled {
-  opacity: 0.5;
+.control-row button:disabled {
+  opacity: 0.48;
   cursor: not-allowed;
 }
 
-.camera-inline-field {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #475569;
-  font-size: 13px;
-}
-
-.camera-inline-field input,
-.camera-inline-field select {
-  width: 82px;
-  border: 1px solid #cbd5e1;
-  border-radius: 9px;
-  padding: 8px;
-  background: #ffffff;
-}
-
-.owner-camera-error {
-  margin: 10px 0 0;
-  color: #dc2626;
-  white-space: pre-wrap;
-}
-
-.owner-result-main {
+.gesture-result {
   display: grid;
   gap: 6px;
-  margin-bottom: 12px;
+  padding: 16px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.18), rgba(37, 99, 235, 0.1));
 }
 
-.owner-result-main span {
-  color: #64748b;
-  font-size: 13px;
+.gesture-result span,
+.metric-grid span,
+.vehicle-state span {
+  color: #94a3b8;
+  font-size: 12px;
 }
 
-.owner-result-main strong {
-  font-size: 26px;
+.gesture-result strong {
+  color: #f8fafc;
+  font-size: 28px;
 }
 
-.owner-camera-metrics {
+.gesture-result small {
+  color: #67e8f9;
+}
+
+.metric-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
-}
-
-.owner-camera-metrics div {
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-radius: 12px;
-  padding: 10px;
-  background: #f8fafc;
-}
-
-.owner-camera-metrics span {
-  display: block;
-  color: #64748b;
-  font-size: 12px;
-  margin-bottom: 5px;
-}
-
-.owner-camera-metrics strong {
-  display: block;
-  color: #0f172a;
-  font-size: 15px;
-  word-break: break-all;
-}
-
-.owner-camera-log {
   margin-top: 12px;
-  height: 150px;
-  overflow: auto;
+}
+
+.metric-grid div,
+.vehicle-state {
+  padding: 11px;
+  border: 1px solid #26354d;
   border-radius: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  background: #0f172a;
-  color: #dbeafe;
-  padding: 10px;
-  font-family: Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.6;
+  background: #0d1b30;
+}
+
+.metric-grid strong,
+.vehicle-state strong {
+  display: block;
+  margin-top: 5px;
+  color: #e2e8f0;
+  word-break: break-word;
+}
+
+.vehicle-state {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.error-text {
+  color: #fca5a5;
 }
 
 @media (max-width: 980px) {
-  .owner-camera-header {
-    flex-direction: column;
-  }
-
-  .owner-camera-tags {
-    justify-content: flex-start;
-  }
-
-  .owner-camera-grid {
+  .camera-heading,
+  .camera-grid {
     grid-template-columns: 1fr;
+  }
+
+  .camera-heading {
+    flex-direction: column;
   }
 }
 </style>

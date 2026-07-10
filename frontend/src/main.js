@@ -1,5 +1,18 @@
-import { createApp } from 'vue'
+import { createApp, h } from 'vue'
+import { RouterView } from 'vue-router'
 import './style.css'
-import App from './App.vue'
+import router from './router'
+import { useAuth } from './useAuth'
 
-createApp(App).mount('#app')
+const app = createApp({
+  render() {
+    return h(RouterView)
+  },
+})
+
+app.use(router)
+
+const { init } = useAuth()
+init()
+
+app.mount('#app')
