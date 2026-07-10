@@ -1,11 +1,10 @@
 /**
  * 路由配置
- * 使用 hash 模式避免开发环境下刷新 404
+ * 使用 hash 模式避免开发环境和静态部署刷新 404。
  */
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuth } from './useAuth'
 
-// 懒加载页面组件
 const LoginPage = () => import('./views/Login.vue')
 const RegisterPage = () => import('./views/Register.vue')
 const AdminPage = () => import('./views/Admin.vue')
@@ -29,7 +28,7 @@ const routes = [
     path: '/',
     name: 'Home',
     component: MainApp,
-    meta: { requiresAuth: true, title: '智能车载视觉感知与告警系统' },
+    meta: { requiresAuth: true, title: '智能交通识别系统' },
   },
   {
     path: '/admin',
@@ -41,7 +40,7 @@ const routes = [
     path: '/403',
     name: 'Forbidden',
     component: ForbiddenPage,
-    meta: { title: '403 无权限' },
+    meta: { requiresAuth: true, title: '403 无权限' },
   },
   {
     path: '/:pathMatch(.*)*',
@@ -54,31 +53,27 @@ const router = createRouter({
   routes,
 })
 
-router.beforeEach((to, from) => {
-  // 更新页面标题
-  document.title = to.meta.title || '智能车载视觉感知与告警系统'
+router.beforeEach(async (to) => {
+  document.title = to.meta.title || '智能交通识别系统'
 
-  const { isAuthenticated, isAdmin } = useAuth()
+  const auth = useAuth()
+  await auth.init()
 
-  // 已登录用户访问登录页 → 跳转首页
-  if (to.meta.guest && isAuthenticated.value) {
-    return '/'
+  if (to.meta.guest && auth.isAuthenticated.value) {
+    return auth.isAdmin.value ? '/admin' : '/'
   }
 
-  // 需要登录的页面 → 未登录跳转登录页
-  if (to.meta.requiresAuth && !isAuthenticated.value) {
+  if (to.meta.requiresAuth && !auth.isAuthenticated.value) {
     return {
       path: '/login',
       query: { redirect: to.fullPath },
     }
   }
 
-  // 需要 admin 权限 → 非 admin 跳转 403
-  if (to.meta.requiresAdmin && !isAdmin.value) {
+  if (to.meta.requiresAdmin && !auth.isAdmin.value) {
     return '/403'
   }
 
-  // 允许通过
   return true
 })
 

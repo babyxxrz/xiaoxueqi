@@ -3,9 +3,8 @@
  * 自动附加 Authorization 头，支持 401 自动刷新 token 并重试。
  */
 
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 
-// 刷新锁：防止多个并发请求同时刷新 token
 let isRefreshing = false
 let refreshQueue = []
 
@@ -30,10 +29,39 @@ function clearTokens() {
   localStorage.removeItem('user')
 }
 
-/**
- * 尝试用 refresh token 换取新的 access token
- * 返回 true 表示刷新成功，false 表示失败
- */
+function authHeaders(extra = {}) {
+  const token = getAccessToken()
+  return {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...extra,
+  }
+}
+
+function formatErrorDetail(data, text, status) {
+  const detail = data?.detail ?? data?.message ?? text ?? `HTTP ${status}`
+  return typeof detail === 'string' ? detail : JSON.stringify(detail)
+}
+
+async function parseResponse(response) {
+  const text = await response.text()
+  let data = {}
+
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    data = { raw: text }
+  }
+
+  if (!response.ok) {
+    const error = new Error(formatErrorDetail(data, text, response.status))
+    error.status = response.status
+    error.data = data
+    throw error
+  }
+
+  return data
+}
+
 async function tryRefreshToken() {
   const refreshToken = getRefreshToken()
   if (!refreshToken) return false
@@ -55,18 +83,15 @@ async function tryRefreshToken() {
       }
       return true
     }
+
     return false
   } catch {
     return false
   }
 }
 
-/**
- * 执行刷新 token（带锁，确保多个并发请求只刷新一次）
- */
 async function doRefresh() {
   if (isRefreshing) {
-    // 已有刷新正在进行，等待其结果
     return new Promise((resolve) => {
       refreshQueue.push(resolve)
     })
@@ -76,93 +101,58 @@ async function doRefresh() {
   const success = await tryRefreshToken()
   isRefreshing = false
 
-  // 通知等待队列
   refreshQueue.forEach((resolve) => resolve(success))
   refreshQueue = []
 
   return success
 }
 
-/**
- * 核心请求函数
- */
 async function requestJson(path, options = {}) {
   const token = getAccessToken()
+  const headers = authHeaders(options.headers || {})
 
-  const headers = {
-    ...(options.headers || {}),
+  if (!(options.body instanceof FormData) && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json'
   }
 
-  // 自动附加 token
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-
-  // 非 FormData 请求自动设置 Content-Type
-  if (!(options.body instanceof FormData)) {
-    if (!headers['Content-Type']) {
-      headers['Content-Type'] = 'application/json'
-    }
-  }
-
-  const response = await fetch(`${API_BASE}${path}`, {
+  let response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers,
   })
 
-  // 401 时尝试刷新 token 并重试一次
   if (response.status === 401 && token) {
     const refreshed = await doRefresh()
+
     if (refreshed) {
-      const newHeaders = { ...headers }
-      newHeaders['Authorization'] = `Bearer ${getAccessToken()}`
-      const retryResponse = await fetch(`${API_BASE}${path}`, {
+      response = await fetch(`${API_BASE}${path}`, {
         ...options,
-        headers: newHeaders,
+        headers: authHeaders(options.headers || {}),
       })
-      if (retryResponse.ok) {
-        const text = await retryResponse.text()
-        try {
-          return text ? JSON.parse(text) : {}
-        } catch {
-          return { raw: text }
-        }
-      }
-      if (retryResponse.status === 401) {
-        clearTokens()
-        window.dispatchEvent(new CustomEvent('auth:logout'))
-        throw new Error('登录已过期，请重新登录')
-      }
+    } else {
+      clearTokens()
+      window.dispatchEvent(new CustomEvent('auth:logout'))
+      const error = new Error('登录已过期，请重新登录')
+      error.status = 401
+      throw error
     }
-    // 刷新失败
-    clearTokens()
-    window.dispatchEvent(new CustomEvent('auth:logout'))
-    throw new Error('登录已过期，请重新登录')
   }
 
-  // 解析响应
-  const text = await response.text()
-  let data = {}
   try {
-    data = text ? JSON.parse(text) : {}
-  } catch {
-    data = { raw: text }
+    return await parseResponse(response)
+  } catch (error) {
+    if (error.status === 401) {
+      clearTokens()
+      window.dispatchEvent(new CustomEvent('auth:logout'))
+    }
+    throw error
   }
-
-  if (!response.ok) {
-    const detail = data?.detail || data?.message || text || `HTTP ${response.status}`
-    throw new Error(detail)
-  }
-
-  return data
 }
 
-// 便捷方法
 function apiGet(path) {
   return requestJson(path, { method: 'GET' })
 }
 
-function apiPost(path, body) {
+function apiPost(path, body = {}) {
   return requestJson(path, {
     method: 'POST',
     body: body instanceof FormData ? body : JSON.stringify(body),
@@ -170,7 +160,7 @@ function apiPost(path, body) {
   })
 }
 
-function apiPut(path, body) {
+function apiPut(path, body = {}) {
   return requestJson(path, {
     method: 'PUT',
     body: JSON.stringify(body),
@@ -182,6 +172,12 @@ function apiDelete(path) {
   return requestJson(path, { method: 'DELETE' })
 }
 
+function uploadFile(path, file, fieldName = 'file') {
+  const formData = new FormData()
+  formData.append(fieldName, file)
+  return apiPost(path, formData)
+}
+
 export {
   API_BASE,
   requestJson,
@@ -189,6 +185,8 @@ export {
   apiPost,
   apiPut,
   apiDelete,
+  uploadFile,
+  authHeaders,
   getAccessToken,
   getRefreshToken,
   setTokens,

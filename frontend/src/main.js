@@ -4,7 +4,6 @@ import './style.css'
 import router from './router'
 import { useAuth } from './useAuth'
 
-// 根组件仅包含 <router-view />，路由决定渲染哪个页面
 const app = createApp({
   render() {
     return h(RouterView)
@@ -13,7 +12,6 @@ const app = createApp({
 
 app.use(router)
 
-// 初始化认证状态（从 localStorage 恢复会话）
 const { init } = useAuth()
 init()
 

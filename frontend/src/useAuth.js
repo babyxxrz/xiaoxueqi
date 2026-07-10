@@ -1,59 +1,105 @@
 /**
  * 认证状态管理 - Vue 3 Composable（模块级单例）
- * 所有组件共享同一份认证状态
+ * 同时保留：
+ * 1. 用户名/邮箱 + 密码登录
+ * 2. 邮箱验证码登录
+ * 3. access token 自动刷新
  */
-import { ref, computed } from 'vue'
-import { apiPost, apiGet, setTokens, clearTokens, getRefreshToken } from './api'
-
-// ---- 模块级响应式状态（单例）----
+import { computed, ref } from 'vue'
+import { apiGet, apiPost, clearTokens, getRefreshToken, setTokens } from './api'
 
 const currentUser = ref(null)
 const loading = ref(false)
 const initialized = ref(false)
+let initPromise = null
 
 function loadUserFromStorage() {
   try {
     const raw = localStorage.getItem('user')
     if (raw) {
-      const user = JSON.parse(raw)
-      if (user && user.id) return user
+      const savedUser = JSON.parse(raw)
+      if (savedUser?.id) return savedUser
     }
   } catch {
-    // ignore
+    // 本地缓存损坏时忽略。
   }
   return null
 }
 
-// ---- 计算属性 ----
+function saveLoginResult(data) {
+  if (data.status !== 'success' || !data.access_token || !data.user) {
+    return {
+      success: false,
+      error: data.message || '登录失败',
+    }
+  }
+
+  setTokens(data.access_token, data.refresh_token)
+  localStorage.setItem('user', JSON.stringify(data.user))
+  currentUser.value = data.user
+
+  return {
+    success: true,
+    user: data.user,
+  }
+}
 
 const isAuthenticated = computed(() => {
-  return !!(currentUser.value?.id && localStorage.getItem('access_token'))
+  return Boolean(currentUser.value?.id && localStorage.getItem('access_token'))
 })
 
-const isAdmin = computed(() => {
-  return currentUser.value?.role === 'admin'
-})
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+const role = computed(() => currentUser.value?.role || 'user')
 
-// ---- 公开方法 ----
+// 兼容重构后的用户端和管理员端命名。
+const user = currentUser
 
 async function login(account, password, remember = false) {
   loading.value = true
+
   try {
     const data = await apiPost('/api/auth/login', {
       account,
       password,
       remember,
     })
-
-    if (data.status === 'success') {
-      setTokens(data.access_token, data.refresh_token)
-      localStorage.setItem('user', JSON.stringify(data.user))
-      currentUser.value = data.user
-      return { success: true, user: data.user }
-    }
-    return { success: false, error: data.message || '登录失败' }
+    return saveLoginResult(data)
   } catch (error) {
-    return { success: false, error: error.message || '登录失败，请检查网络连接' }
+    return {
+      success: false,
+      error: error.message || '登录失败，请检查网络连接',
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+async function sendLoginCode(email) {
+  const data = await apiPost('/api/auth/send-code', {
+    email: email.trim().toLowerCase(),
+  })
+
+  return {
+    success: data.status === 'success',
+    message: data.message || '验证码已发送',
+  }
+}
+
+async function loginByCode(email, code, remember = false) {
+  loading.value = true
+
+  try {
+    const data = await apiPost('/api/auth/login-by-code', {
+      email: email.trim().toLowerCase(),
+      code: code.trim(),
+      remember,
+    })
+    return saveLoginResult(data)
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message || '验证码登录失败',
+    }
   } finally {
     loading.value = false
   }
@@ -61,13 +107,17 @@ async function login(account, password, remember = false) {
 
 async function logout() {
   const refreshToken = getRefreshToken()
+
   if (refreshToken) {
     try {
-      await apiPost('/api/auth/logout', { refresh_token: refreshToken })
+      await apiPost('/api/auth/logout', {
+        refresh_token: refreshToken,
+      })
     } catch {
-      // 即使服务端请求失败，也要清除本地状态
+      // 服务端退出失败时仍清除本地登录状态。
     }
   }
+
   clearTokens()
   currentUser.value = null
 }
@@ -75,34 +125,44 @@ async function logout() {
 async function fetchMe() {
   try {
     const data = await apiGet('/api/auth/me')
+
     if (data.status === 'success') {
       currentUser.value = data.user
       localStorage.setItem('user', JSON.stringify(data.user))
+      return true
     }
   } catch {
-    // token 无效，清除状态
     clearTokens()
     currentUser.value = null
   }
+
+  return false
 }
 
 async function init() {
   if (initialized.value) return
-  initialized.value = true
+  if (initPromise) return initPromise
 
-  // 从 localStorage 恢复用户信息
-  const savedUser = loadUserFromStorage()
-  if (savedUser) {
-    currentUser.value = savedUser
-  }
+  initPromise = (async () => {
+    const savedUser = loadUserFromStorage()
+    if (savedUser) {
+      currentUser.value = savedUser
+    }
 
-  // 如果有 access token，验证其有效性
-  if (localStorage.getItem('access_token')) {
-    await fetchMe()
+    if (localStorage.getItem('access_token')) {
+      await fetchMe()
+    }
+
+    initialized.value = true
+  })()
+
+  try {
+    await initPromise
+  } finally {
+    initPromise = null
   }
 }
 
-// 注册全局退出事件监听（在首次 import 时执行）
 if (typeof window !== 'undefined') {
   window.addEventListener('auth:logout', () => {
     clearTokens()
@@ -110,16 +170,18 @@ if (typeof window !== 'undefined') {
   })
 }
 
-// ---- 导出 ----
-
 export function useAuth() {
   return {
     currentUser,
+    user,
+    role,
     isAuthenticated,
     isAdmin,
     loading,
     initialized,
     login,
+    sendLoginCode,
+    loginByCode,
     logout,
     fetchMe,
     init,

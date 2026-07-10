@@ -1,612 +1,346 @@
-﻿<template>
-  <div class="login-page">
-    <div class="login-card">
-      <div class="login-header">
-        <div class="login-logo">&#x1f698;</div>
-        <h2>智能车载视觉感知与告警系统</h2>
-        <p class="login-subtitle">请登录以继续操作</p>
+<template>
+  <main class="auth-page">
+    <section class="auth-card login-card-wide">
+      <div class="auth-brand">
+        <div class="auth-brand-mark">AI</div>
+        <div>
+          <h1>智能交通识别系统</h1>
+          <p>用户业务端与管理员数据端统一认证入口</p>
+        </div>
       </div>
 
-      <!-- 登录方式切换 -->
-      <div class="login-tabs">
+      <div class="login-tabs" role="tablist">
         <button
           type="button"
-          class="login-tab"
           :class="{ active: loginMode === 'password' }"
-          @click="loginMode = 'password'"
+          @click="switchMode('password')"
         >
           密码登录
         </button>
         <button
           type="button"
-          class="login-tab"
           :class="{ active: loginMode === 'code' }"
-          @click="loginMode = 'code'"
+          @click="switchMode('code')"
         >
-          验证码登录
+          邮箱验证码登录
         </button>
       </div>
 
-      <!-- 密码登录表单 -->
-      <form v-if="loginMode === 'password'" class="login-form" @submit.prevent="handleLogin">
-        <!-- 账号 -->
-        <label class="login-field">
-          <span>用户名 / 邮箱</span>
+      <form v-if="loginMode === 'password'" class="auth-form" @submit.prevent="handlePasswordLogin">
+        <label class="auth-field">
+          <span>用户名或邮箱</span>
           <input
-            v-model="form.account"
-            type="text"
-            placeholder="请输入用户名或邮箱"
+            v-model.trim="passwordForm.account"
             autocomplete="username"
+            placeholder="请输入用户名或邮箱"
             :disabled="submitting"
-            @input="clearFieldError('account')"
           />
-          <p v-if="fieldErrors.account" class="login-field-error">{{ fieldErrors.account }}</p>
         </label>
 
-        <!-- 密码 -->
-        <label class="login-field">
+        <label class="auth-field">
           <span>密码</span>
-          <div class="login-password-wrap">
+          <div class="password-row">
             <input
-              v-model="form.password"
+              v-model="passwordForm.password"
               :type="showPassword ? 'text' : 'password'"
-              placeholder="请输入密码"
               autocomplete="current-password"
+              placeholder="请输入密码"
               :disabled="submitting"
-              @input="clearFieldError('password')"
             />
-            <button
-              type="button"
-              class="login-toggle-pw small-btn"
-              @click="showPassword = !showPassword"
-              tabindex="-1"
-            >
+            <button type="button" @click="showPassword = !showPassword">
               {{ showPassword ? '隐藏' : '显示' }}
             </button>
           </div>
-          <p v-if="fieldErrors.password" class="login-field-error">{{ fieldErrors.password }}</p>
         </label>
 
-        <!-- 记住我 -->
-        <label class="checkbox-line login-remember">
-          <input v-model="form.remember" type="checkbox" :disabled="submitting" />
-          <span>记住我（保持登录 30 天）</span>
+        <label class="remember-row">
+          <input v-model="passwordForm.remember" type="checkbox" />
+          <span>记住登录状态</span>
         </label>
 
-        <!-- 错误提示 -->
-        <div v-if="errorMessage" class="login-error">{{ errorMessage }}</div>
+        <div v-if="errorMessage" class="auth-error">{{ errorMessage }}</div>
 
-        <!-- 提交按钮 -->
-        <button type="submit" class="login-submit-btn" :disabled="submitting">
-          <span v-if="submitting" class="login-spinner"></span>
-          {{ submitting ? '登录中...' : '登录' }}
+        <button class="auth-submit" type="submit" :disabled="submitting">
+          <span v-if="submitting" class="loading-dot"></span>
+          {{ submitting ? '登录中...' : '登录系统' }}
         </button>
       </form>
 
-      <!-- 验证码登录表单 -->
-      <form v-else class="login-form" @submit.prevent="handleCodeLogin">
-        <!-- 邮箱 -->
-        <label class="login-field">
-          <span>邮箱</span>
+      <form v-else class="auth-form" @submit.prevent="handleCodeLogin">
+        <label class="auth-field">
+          <span>注册邮箱</span>
           <input
-            v-model="codeForm.email"
+            v-model.trim="codeForm.email"
             type="email"
-            placeholder="请输入注册时使用的邮箱"
             autocomplete="email"
+            placeholder="请输入已注册邮箱"
             :disabled="submitting"
-            @input="clearCodeFieldError('email')"
           />
-          <p v-if="codeFieldErrors.email" class="login-field-error">{{ codeFieldErrors.email }}</p>
         </label>
 
-        <!-- 验证码 -->
-        <label class="login-field">
-          <span>验证码</span>
-          <div class="login-code-wrap">
+        <label class="auth-field">
+          <span>邮箱验证码</span>
+          <div class="code-row">
             <input
-              v-model="codeForm.code"
-              type="text"
+              v-model.trim="codeForm.code"
+              inputmode="numeric"
               maxlength="6"
-              placeholder="请输入6位验证码"
               autocomplete="one-time-code"
+              placeholder="请输入 6 位验证码"
               :disabled="submitting"
-              @input="clearCodeFieldError('code')"
             />
             <button
               type="button"
-              class="login-send-code-btn"
-              :disabled="sendingCode || codeCountdown > 0 || !codeForm.email.includes('@')"
+              :disabled="sendingCode || countdown > 0 || submitting"
               @click="handleSendCode"
             >
-              <span v-if="sendingCode" class="login-spinner small-spinner"></span>
-              {{ codeCountdown > 0 ? `${codeCountdown}s` : '发送验证码' }}
+              {{ sendCodeButtonText }}
             </button>
           </div>
-          <p v-if="codeFieldErrors.code" class="login-field-error">{{ codeFieldErrors.code }}</p>
         </label>
 
-        <!-- 成功提示 -->
-        <div v-if="codeSuccessMessage" class="login-success">{{ codeSuccessMessage }}</div>
+        <label class="remember-row">
+          <input v-model="codeForm.remember" type="checkbox" />
+          <span>记住登录状态</span>
+        </label>
 
-        <!-- 错误提示 -->
-        <div v-if="errorMessage" class="login-error">{{ errorMessage }}</div>
+        <div v-if="successMessage" class="auth-success">{{ successMessage }}</div>
+        <div v-if="errorMessage" class="auth-error">{{ errorMessage }}</div>
 
-        <!-- 提交按钮 -->
-        <button type="submit" class="login-submit-btn" :disabled="submitting || !codeForm.code">
-          <span v-if="submitting" class="login-spinner"></span>
-          {{ submitting ? '登录中...' : '登录' }}
+        <button class="auth-submit" type="submit" :disabled="submitting">
+          <span v-if="submitting" class="loading-dot"></span>
+          {{ submitting ? '验证中...' : '验证码登录' }}
         </button>
       </form>
 
-      <div class="login-footer">
-        <span>还没有账号？<router-link to="/register">立即注册</router-link></span>
+      <div class="auth-footer">
+        还没有账号？
+        <router-link to="/register">注册新账号</router-link>
       </div>
-    </div>
-  </div>
+    </section>
+  </main>
 </template>
+
 <script setup>
-import { reactive, ref, onBeforeUnmount } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
+import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from '../useAuth'
-import { apiPost, setTokens } from '../api'
 
-const router = useRouter()
 const route = useRoute()
-const { login, currentUser } = useAuth()
+const router = useRouter()
+const auth = useAuth()
 
-// 登录方式：'password' | 'code'
 const loginMode = ref('password')
+const showPassword = ref(false)
+const submitting = ref(false)
+const sendingCode = ref(false)
+const countdown = ref(0)
+const countdownTimer = ref(null)
+const errorMessage = ref('')
+const successMessage = ref('')
 
-// ---- 密码登录表单 ----
-const form = reactive({
+const passwordForm = reactive({
   account: '',
   password: '',
   remember: false,
 })
 
-const showPassword = ref(false)
-const submitting = ref(false)
-const errorMessage = ref('')
-const fieldErrors = reactive({
-  account: '',
-  password: '',
-})
-
-function clearFieldError(field) {
-  fieldErrors[field] = ''
-  errorMessage.value = ''
-}
-
-function validate() {
-  let valid = true
-  fieldErrors.account = ''
-  fieldErrors.password = ''
-
-  if (!form.account.trim()) {
-    fieldErrors.account = '请输入用户名或邮箱'
-    valid = false
-  }
-
-  if (!form.password) {
-    fieldErrors.password = '请输入密码'
-    valid = false
-  } else if (form.password.length < 8) {
-    fieldErrors.password = '密码长度不能少于 8 位'
-    valid = false
-  }
-
-  return valid
-}
-
-async function handleLogin() {
-  if (submitting.value) return
-  if (!validate()) return
-
-  submitting.value = true
-  errorMessage.value = ''
-
-  const result = await login(form.account, form.password, form.remember)
-
-  if (result.success) {
-    const redirect = route.query.redirect || '/'
-    router.push(redirect)
-  } else {
-    errorMessage.value = result.error || '登录失败，请重试'
-  }
-
-  submitting.value = false
-}
-
-// ---- 验证码登录表单 ----
 const codeForm = reactive({
   email: '',
   code: '',
+  remember: false,
 })
 
-const codeFieldErrors = reactive({
-  email: '',
-  code: '',
+const sendCodeButtonText = computed(() => {
+  if (sendingCode.value) return '发送中...'
+  if (countdown.value > 0) return `${countdown.value} 秒后重试`
+  return '获取验证码'
 })
 
-const codeSuccessMessage = ref('')
-const sendingCode = ref(false)
-const codeCountdown = ref(0)
-let countdownTimer = null
-
-function clearCodeFieldError(field) {
-  codeFieldErrors[field] = ''
+function switchMode(mode) {
+  loginMode.value = mode
   errorMessage.value = ''
-  codeSuccessMessage.value = ''
+  successMessage.value = ''
 }
 
-function validateCodeForm() {
-  let valid = true
-  codeFieldErrors.email = ''
-  codeFieldErrors.code = ''
+function validateEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+}
 
-  if (!codeForm.email.trim() || !codeForm.email.includes('@')) {
-    codeFieldErrors.email = '请输入有效的邮箱地址'
-    valid = false
+function startCountdown() {
+  countdown.value = 60
+
+  if (countdownTimer.value) {
+    window.clearInterval(countdownTimer.value)
   }
 
-  if (!codeForm.code) {
-    codeFieldErrors.code = '请输入验证码'
-    valid = false
-  } else if (codeForm.code.length !== 6) {
-    codeFieldErrors.code = '验证码为 6 位数字'
-    valid = false
-  }
+  countdownTimer.value = window.setInterval(() => {
+    countdown.value -= 1
 
-  return valid
+    if (countdown.value <= 0) {
+      window.clearInterval(countdownTimer.value)
+      countdownTimer.value = null
+    }
+  }, 1000)
 }
 
 async function handleSendCode() {
-  if (sendingCode.value || codeCountdown.value > 0) return
-  if (!codeForm.email.trim() || !codeForm.email.includes('@')) {
-    codeFieldErrors.email = '请输入有效的邮箱地址'
+  if (!validateEmail(codeForm.email)) {
+    errorMessage.value = '请输入有效的注册邮箱'
     return
   }
 
   sendingCode.value = true
-  codeSuccessMessage.value = ''
   errorMessage.value = ''
+  successMessage.value = ''
 
   try {
-    const data = await apiPost('/api/auth/send-code', {
-      email: codeForm.email.trim(),
-    })
-
-    if (data.status === 'success') {
-      codeSuccessMessage.value = data.message || '验证码已发送，请查收邮件'
-      // 开始倒计时
-      codeCountdown.value = 60
-      countdownTimer = setInterval(() => {
-        codeCountdown.value--
-        if (codeCountdown.value <= 0) {
-          clearInterval(countdownTimer)
-          countdownTimer = null
-        }
-      }, 1000)
-    }
+    const result = await auth.sendLoginCode(codeForm.email)
+    successMessage.value = result.message || '验证码已发送，请查收邮箱'
+    startCountdown()
   } catch (error) {
-    errorMessage.value = error.message || '验证码发送失败，请重试'
+    errorMessage.value = error.message || '验证码发送失败'
   } finally {
     sendingCode.value = false
   }
 }
 
-async function handleCodeLogin() {
-  if (submitting.value) return
-  if (!validateCodeForm()) return
+async function finishLogin(result) {
+  if (!result.success) {
+    errorMessage.value = result.error || '登录失败'
+    return
+  }
+
+  const redirect = String(route.query.redirect || '')
+
+  if (redirect && redirect !== '/login') {
+    await router.replace(redirect)
+    return
+  }
+
+  await router.replace(auth.isAdmin.value ? '/admin' : '/')
+}
+
+async function handlePasswordLogin() {
+  if (!passwordForm.account || !passwordForm.password) {
+    errorMessage.value = '请输入账号和密码'
+    return
+  }
 
   submitting.value = true
   errorMessage.value = ''
-  codeSuccessMessage.value = ''
+  successMessage.value = ''
 
   try {
-    const data = await apiPost('/api/auth/login-by-code', {
-      email: codeForm.email.trim(),
-      code: codeForm.code,
-    })
-
-    if (data.status === 'success') {
-      // 保存 token 和用户信息
-      setTokens(data.access_token, data.refresh_token)
-      localStorage.setItem('user', JSON.stringify(data.user))
-
-      // 更新 useAuth 的响应式状态，让路由守卫立即识别已登录
-      currentUser.value = data.user
-
-      const redirect = route.query.redirect || '/'
-      router.push(redirect)
-    }
-  } catch (error) {
-    errorMessage.value = error.message || '登录失败，请重试'
+    const result = await auth.login(
+      passwordForm.account,
+      passwordForm.password,
+      passwordForm.remember,
+    )
+    await finishLogin(result)
   } finally {
     submitting.value = false
   }
 }
 
-// 组件卸载时清除定时器
+async function handleCodeLogin() {
+  if (!validateEmail(codeForm.email)) {
+    errorMessage.value = '请输入有效的注册邮箱'
+    return
+  }
+
+  if (!/^\d{6}$/.test(codeForm.code)) {
+    errorMessage.value = '请输入 6 位数字验证码'
+    return
+  }
+
+  submitting.value = true
+  errorMessage.value = ''
+  successMessage.value = ''
+
+  try {
+    const result = await auth.loginByCode(
+      codeForm.email,
+      codeForm.code,
+      codeForm.remember,
+    )
+    await finishLogin(result)
+  } finally {
+    submitting.value = false
+  }
+}
+
 onBeforeUnmount(() => {
-  if (countdownTimer) {
-    clearInterval(countdownTimer)
-    countdownTimer = null
+  if (countdownTimer.value) {
+    window.clearInterval(countdownTimer.value)
   }
 })
 </script>
+
 <style scoped>
-.login-page {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 24px;
-  background:
-    radial-gradient(circle at top left, rgba(42, 109, 255, 0.10), transparent 34%),
-    linear-gradient(135deg, #eef3f8 0%, #f7fafc 100%);
+.login-card-wide {
+  width: min(500px, 100%);
 }
 
-.login-card {
-  width: 100%;
-  max-width: 420px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(211, 222, 235, 0.9);
-  border-radius: 24px;
-  padding: 36px 32px;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.10);
-  backdrop-filter: blur(18px);
-}
-
-.login-header {
-  text-align: center;
-  margin-bottom: 28px;
-}
-
-.login-logo {
-  font-size: 48px;
-  margin-bottom: 8px;
-}
-
-.login-header h2 {
-  font-size: 20px;
-  color: #0f172a;
-  margin: 0 0 6px;
-}
-
-.login-subtitle {
-  color: #64748b;
-  font-size: 14px;
-  margin: 0;
-}
-
-/* ---- 登录方式切换标签 ---- */
 .login-tabs {
-  display: flex;
-  gap: 0;
-  margin-bottom: 24px;
-  border: 1px solid #d7e0ea;
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-.login-tab {
-  flex: 1;
-  padding: 10px;
-  border: none;
-  background: #f8fafc;
-  color: #64748b;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.login-tab.active {
-  background: #2563eb;
-  color: white;
-}
-
-.login-tab:not(.active):hover {
-  background: #eef2f6;
-}
-
-/* ---- 表单 ---- */
-.login-form {
   display: grid;
-  gap: 18px;
-}
-
-.login-field {
-  display: grid;
-  gap: 6px;
-}
-
-.login-field > span {
-  font-size: 13px;
-  font-weight: 700;
-  color: #506177;
-}
-
-.login-field input[type="text"],
-.login-field input[type="password"],
-.login-field input[type="email"] {
-  border: 1px solid #d7e0ea;
-  border-radius: 10px;
-  padding: 11px 12px;
-  background: #ffffff;
-  color: #162033;
-  outline: none;
-  font-size: 15px;
-  width: 100%;
-}
-
-.login-field input:focus {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
-}
-
-.login-field input:disabled {
-  background: #f1f5f9;
-  cursor: not-allowed;
-}
-
-.login-password-wrap {
-  display: flex;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  margin-bottom: 20px;
+  padding: 5px;
+  border: 1px solid #26354d;
+  border-radius: 13px;
+  background: #0b1424;
 }
 
-.login-password-wrap input {
-  flex: 1;
-}
-
-.login-toggle-pw {
-  white-space: nowrap;
-  padding: 8px 14px;
-  border-radius: 10px;
-  font-size: 13px;
-  background: #f1f5f9;
-  color: #506177;
-  box-shadow: none;
-}
-
-.login-toggle-pw:hover {
-  background: #e2e8f0;
-}
-
-.login-field-error {
-  color: #dc2626;
-  font-size: 12px;
-  margin: 2px 0 0;
-}
-
-.login-remember {
-  margin: 0;
-}
-
-.login-error {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  color: #b91c1c;
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.login-success {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  color: #15803d;
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.login-submit-btn {
-  width: 100%;
-  padding: 13px;
-  font-size: 16px;
-  border-radius: 12px;
-  background: #2563eb;
-  color: white;
+.login-tabs button {
+  padding: 10px 12px;
   border: 0;
-  cursor: pointer;
-  font-weight: 700;
-  box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-}
-
-.login-submit-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 14px 26px rgba(37, 99, 235, 0.22);
-}
-
-.login-submit-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.login-spinner {
-  display: inline-block;
-  width: 18px;
-  height: 18px;
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-top-color: white;
-  border-radius: 50%;
-  animation: login-spin 0.6s linear infinite;
-}
-
-.small-spinner {
-  width: 14px;
-  height: 14px;
-  border-width: 2px;
-}
-
-@keyframes login-spin {
-  to { transform: rotate(360deg); }
-}
-
-/* ---- 验证码输入行 ---- */
-.login-code-wrap {
-  display: flex;
-  gap: 8px;
-}
-
-.login-code-wrap input {
-  flex: 1;
-}
-
-.login-send-code-btn {
-  white-space: nowrap;
-  padding: 8px 14px;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 600;
-  background: #2563eb;
-  color: white;
-  box-shadow: none;
-  border: none;
-  cursor: pointer;
-  transition: background 0.2s ease;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 100px;
-  justify-content: center;
-}
-
-.login-send-code-btn:hover:not(:disabled) {
-  background: #1d4ed8;
-}
-
-.login-send-code-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-/* ---- 页脚 ---- */
-.login-footer {
-  margin-top: 24px;
-  text-align: center;
-  font-size: 12px;
+  border-radius: 9px;
+  background: transparent;
   color: #94a3b8;
+  font-weight: 800;
 }
 
-.login-footer a {
-  color: #2563eb;
-  text-decoration: none;
-  font-weight: 600;
+.login-tabs button.active {
+  background: #1d4ed8;
+  color: #ffffff;
 }
 
-.login-footer a:hover {
-  text-decoration: underline;
+.password-row,
+.code-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+}
+
+.password-row button,
+.code-row button {
+  min-width: 96px;
+  padding: 0 12px;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  background: #172033;
+  color: #cbd5e1;
+  font-weight: 800;
+}
+
+.password-row button:disabled,
+.code-row button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.remember-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.remember-row input {
+  width: 16px;
+  height: 16px;
 }
 </style>
-
-

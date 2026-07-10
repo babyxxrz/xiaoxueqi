@@ -5,6 +5,8 @@
 import random
 import smtplib
 from email.mime.text import MIMEText
+import os
+from dotenv import load_dotenv
 
 import re
 import secrets
@@ -23,6 +25,7 @@ from slowapi.util import get_remote_address
 # ---------- 配置 ----------
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 
@@ -40,11 +43,12 @@ limiter = Limiter(key_func=get_remote_address)
 
 DATA_DIR.mkdir(exist_ok=True)
 # ---------- 邮箱配置 ----------
-SMTP_HOST = "smtp.qq.com"
-SMTP_PORT = 465
-SMTP_USER = "3514037381@qq.com"
-SMTP_PASS = "bycisjsahhxgdbij"
-SMTP_FROM = "3514037381@qq.com"
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
 # 验证码配置
 VERIFY_CODE_EXPIRE_MINUTES = 5  # 验证码有效期

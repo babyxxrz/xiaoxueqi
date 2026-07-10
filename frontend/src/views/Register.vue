@@ -1,94 +1,79 @@
 <template>
-  <div class="login-page">
-    <div class="login-card">
-      <div class="login-header">
-        <div class="login-logo">&#x1f698;</div>
-        <h2>注册新账号</h2>
-        <p class="login-subtitle">创建账号以使用智能车载系统</p>
+  <main class="auth-page">
+    <section class="auth-card">
+      <div class="auth-brand">
+        <div class="auth-brand-mark">AI</div>
+        <div>
+          <h2>注册新账号</h2>
+          <p>创建普通用户账号，管理员角色由后台分配</p>
+        </div>
       </div>
 
-      <form class="login-form" @submit.prevent="handleRegister">
-        <!-- 用户名 -->
-        <label class="login-field">
+      <form class="auth-form" @submit.prevent="handleRegister">
+        <label class="auth-field">
           <span>用户名</span>
           <input
-            v-model="form.username"
-            type="text"
-            placeholder="2-20位字母、数字、下划线或中文"
+            v-model.trim="form.username"
             autocomplete="username"
+            placeholder="2—20 位字符"
             :disabled="submitting"
           />
-          <p v-if="fieldErrors.username" class="login-field-error">{{ fieldErrors.username }}</p>
+          <p v-if="fieldErrors.username" class="field-error">{{ fieldErrors.username }}</p>
         </label>
 
-        <!-- 邮箱 -->
-        <label class="login-field">
+        <label class="auth-field">
           <span>邮箱</span>
           <input
-            v-model="form.email"
+            v-model.trim="form.email"
             type="email"
-            placeholder="请输入邮箱地址"
             autocomplete="email"
+            placeholder="请输入邮箱"
             :disabled="submitting"
           />
-          <p v-if="fieldErrors.email" class="login-field-error">{{ fieldErrors.email }}</p>
+          <p v-if="fieldErrors.email" class="field-error">{{ fieldErrors.email }}</p>
         </label>
 
-        <!-- 密码 -->
-        <label class="login-field">
+        <label class="auth-field">
           <span>密码</span>
-          <div class="login-password-wrap">
-            <input
-              v-model="form.password"
-              :type="showPassword ? 'text' : 'password'"
-              placeholder="最少8位，含大小写字母和数字"
-              autocomplete="new-password"
-              :disabled="submitting"
-            />
-            <button
-              type="button"
-              class="login-toggle-pw small-btn"
-              @click="showPassword = !showPassword"
-              tabindex="-1"
-            >
-              {{ showPassword ? '隐藏' : '显示' }}
-            </button>
-          </div>
-          <p v-if="fieldErrors.password" class="login-field-error">{{ fieldErrors.password }}</p>
+          <input
+            v-model="form.password"
+            type="password"
+            autocomplete="new-password"
+            placeholder="至少 8 位，包含大小写字母和数字"
+            :disabled="submitting"
+          />
+          <p v-if="fieldErrors.password" class="field-error">{{ fieldErrors.password }}</p>
         </label>
 
-        <!-- 确认密码 -->
-        <label class="login-field">
+        <label class="auth-field">
           <span>确认密码</span>
           <input
             v-model="form.confirmPassword"
             type="password"
-            placeholder="再次输入密码"
             autocomplete="new-password"
+            placeholder="再次输入密码"
             :disabled="submitting"
           />
-          <p v-if="fieldErrors.confirmPassword" class="login-field-error">{{ fieldErrors.confirmPassword }}</p>
+          <p v-if="fieldErrors.confirmPassword" class="field-error">
+            {{ fieldErrors.confirmPassword }}
+          </p>
         </label>
 
-        <!-- 成功提示 -->
-        <div v-if="successMessage" class="login-success">{{ successMessage }}</div>
+        <div v-if="successMessage" class="auth-success">{{ successMessage }}</div>
+        <div v-if="errorMessage" class="auth-error">{{ errorMessage }}</div>
 
-        <!-- 错误提示 -->
-        <div v-if="errorMessage" class="login-error">{{ errorMessage }}</div>
-
-        <!-- 提交按钮 -->
-        <button type="submit" class="login-submit-btn" :disabled="submitting">
-          <span v-if="submitting" class="login-spinner"></span>
-          {{ submitting ? '注册中...' : '注册' }}
+        <button class="auth-submit" type="submit" :disabled="submitting">
+          <span v-if="submitting" class="loading-dot"></span>
+          {{ submitting ? '注册中...' : '注册账号' }}
         </button>
       </form>
 
-      <div class="login-footer">
+      <div class="auth-footer">
         已有账号？
-        <router-link to="/login">立即登录</router-link>
+        <router-link to="/login">返回登录</router-link>
       </div>
-    </div>
-  </div>
+    </section>
+  </main>
 </template>
 
 <script setup>
@@ -97,6 +82,9 @@ import { useRouter } from 'vue-router'
 import { apiPost } from '../api'
 
 const router = useRouter()
+const submitting = ref(false)
+const errorMessage = ref('')
+const successMessage = ref('')
 
 const form = reactive({
   username: '',
@@ -105,10 +93,6 @@ const form = reactive({
   confirmPassword: '',
 })
 
-const showPassword = ref(false)
-const submitting = ref(false)
-const errorMessage = ref('')
-const successMessage = ref('')
 const fieldErrors = reactive({
   username: '',
   email: '',
@@ -117,39 +101,29 @@ const fieldErrors = reactive({
 })
 
 function validate() {
+  Object.keys(fieldErrors).forEach((key) => {
+    fieldErrors[key] = ''
+  })
+
   let valid = true
-  fieldErrors.username = ''
-  fieldErrors.email = ''
-  fieldErrors.password = ''
-  fieldErrors.confirmPassword = ''
 
-  if (!form.username.trim() || form.username.trim().length < 2) {
-    fieldErrors.username = '用户名至少需要2个字符'
-    valid = false
-  } else if (form.username.length > 20) {
-    fieldErrors.username = '用户名不能超过20个字符'
+  if (form.username.length < 2 || form.username.length > 20) {
+    fieldErrors.username = '用户名长度应为 2—20 位'
     valid = false
   }
 
-  if (!form.email.trim() || !form.email.includes('@')) {
-    fieldErrors.email = '请输入有效的邮箱地址'
+  if (!form.email.includes('@')) {
+    fieldErrors.email = '请输入有效邮箱'
     valid = false
   }
 
-  if (!form.password) {
-    fieldErrors.password = '请输入密码'
-    valid = false
-  } else if (form.password.length < 8) {
-    fieldErrors.password = '密码长度不能少于8位'
-    valid = false
-  } else if (!/[A-Z]/.test(form.password)) {
-    fieldErrors.password = '密码必须包含大写字母'
-    valid = false
-  } else if (!/[a-z]/.test(form.password)) {
-    fieldErrors.password = '密码必须包含小写字母'
-    valid = false
-  } else if (!/\d/.test(form.password)) {
-    fieldErrors.password = '密码必须包含数字'
+  if (
+    form.password.length < 8 ||
+    !/[A-Z]/.test(form.password) ||
+    !/[a-z]/.test(form.password) ||
+    !/\d/.test(form.password)
+  ) {
+    fieldErrors.password = '密码至少 8 位，并包含大小写字母和数字'
     valid = false
   }
 
@@ -162,52 +136,29 @@ function validate() {
 }
 
 async function handleRegister() {
-  if (submitting.value) return
-  if (!validate()) return
+  if (!validate() || submitting.value) return
 
   submitting.value = true
   errorMessage.value = ''
   successMessage.value = ''
 
   try {
-    const data = await apiPost('/api/auth/register', {
-      username: form.username.trim(),
-      email: form.email.trim(),
-      password: form.password,
-    })
+    await apiPost(
+      '/api/auth/register',
+      {
+        username: form.username,
+        email: form.email,
+        password: form.password,
+      },
+      { auth: false },
+    )
 
-    if (data.status === 'success') {
-      successMessage.value = '注册成功！即将跳转到登录页...'
-      setTimeout(() => {
-        router.push('/login')
-      }, 1500)
-    }
+    successMessage.value = '注册成功，即将返回登录页'
+    window.setTimeout(() => router.push('/login'), 1000)
   } catch (error) {
-    errorMessage.value = error.message || '注册失败，请重试'
+    errorMessage.value = error.message || '注册失败'
   } finally {
     submitting.value = false
   }
 }
 </script>
-
-<style scoped>
-.login-success {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  color: #15803d;
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.login-footer a {
-  color: #2563eb;
-  text-decoration: none;
-  font-weight: 600;
-}
-
-.login-footer a:hover {
-  text-decoration: underline;
-}
-</style>
