@@ -6470,6 +6470,13 @@ def delete_video_source(source_id: int):
 
 @app.post("/api/video-sources/{source_id}/check")
 def check_video_source(source_id: int):
+    """
+    快速检测视频源是否可用。
+
+    重要说明：
+    - RTSP / MediaMTX 检测只检查 host:port 是否可连接，避免 OpenCV VideoCapture 阻塞页面。
+    - 是否真的有画面，会在实际识别时由 /api/fusion/monitor/channel/recognize 验证。
+    """
     item = _vsm_get_source_or_404(source_id)
 
     if item.get("use_mock_frame"):
@@ -6478,6 +6485,7 @@ def check_video_source(source_id: int):
         if demo_file:
             demo_path = _vsm_project_root() / "demo" / demo_file
             ok = demo_path.exists()
+
             return {
                 "status": "success",
                 "online": ok,
@@ -6501,48 +6509,64 @@ def check_video_source(source_id: int):
             "status": "success",
             "online": True,
             "mode": "backend_source_id",
-            "message": "未填写 source_url，将使用后端 source_id 配置读取。",
+            "message": "未填写 source_url，将使用后端 source_id 配置读取。该检测不会阻塞。",
             "item": item,
         }
-
-    cap = None
 
     try:
-        cap = _vsm_cv2.VideoCapture(source_url)
+        from urllib.parse import urlparse as _vsm_urlparse
+        import socket as _vsm_socket
 
-        if not cap.isOpened():
+        parsed = _vsm_urlparse(source_url)
+        scheme = (parsed.scheme or "").lower()
+        host = parsed.hostname
+
+        port = parsed.port
+        if port is None:
+            if scheme in {"rtsp", "rtsps"}:
+                port = 554
+            elif scheme == "http":
+                port = 80
+            elif scheme == "https":
+                port = 443
+
+        if not host or not port:
             return {
                 "status": "success",
                 "online": False,
-                "mode": "rtsp",
-                "message": f"无法打开视频源：{source_url}",
+                "mode": "url_parse",
+                "message": f"无法解析视频源地址：{source_url}",
                 "item": item,
             }
 
-        warmup_frames = int(item.get("warmup_frames") or 3)
+        timeout_seconds = 1.5
 
-        for _ in range(max(0, warmup_frames)):
-            cap.read()
+        try:
+            with _vsm_socket.create_connection((host, int(port)), timeout=timeout_seconds):
+                pass
 
-        ok, frame = cap.read()
+            return {
+                "status": "success",
+                "online": True,
+                "mode": "port_check",
+                "message": f"视频源服务端口可连接：{host}:{port}。注意：这表示 RTSP / MediaMTX 服务可达，是否有画面会在实际识别时验证。",
+                "item": item,
+            }
 
-        if not ok or frame is None:
+        except OSError as exc:
             return {
                 "status": "success",
                 "online": False,
-                "mode": "rtsp",
-                "message": "视频源已打开，但无法读取有效帧。",
+                "mode": "port_check",
+                "message": f"无法连接视频源服务：{host}:{port}。请确认 MediaMTX 是否启动、推流是否开始、地址是否正确。错误：{exc}",
                 "item": item,
             }
 
+    except Exception as exc:
         return {
             "status": "success",
-            "online": True,
-            "mode": "rtsp",
-            "message": "视频源在线，已成功读取一帧。",
+            "online": False,
+            "mode": "quick_check_error",
+            "message": f"快速检测失败：{exc}",
             "item": item,
         }
-
-    finally:
-        if cap is not None:
-            cap.release()

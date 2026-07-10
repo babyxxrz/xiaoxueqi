@@ -42,6 +42,7 @@ const videoSources = ref([])
 const selectedFusionPlateSourceId = ref('')
 const selectedFusionTrafficSourceId = ref('')
 const videoSourceCheckResults = reactive({})
+const videoSourceChecking = reactive({})
 
 const videoSourceForm = reactive({
   id: null,
@@ -565,7 +566,7 @@ async function deleteVideoSource(item) {
 }
 
 async function checkVideoSource(item) {
-  loading.videoSource = true
+  videoSourceChecking[item.id] = true
   errors.videoSource = ''
 
   try {
@@ -581,7 +582,7 @@ async function checkVideoSource(item) {
       message: error.message,
     }
   } finally {
-    loading.videoSource = false
+    videoSourceChecking[item.id] = false
   }
 }
 
@@ -1654,8 +1655,8 @@ onBeforeUnmount(() => {
                   <td>{{ shortText(item.source_url || item.demo_file || '-', 60) }}</td>
                   <td>{{ item.use_mock_frame ? '是' : '否' }}</td>
                   <td>
-                    <button class="small-btn" :disabled="loading.videoSource" @click="checkVideoSource(item)">
-                      检测
+                    <button class="small-btn" :disabled="videoSourceChecking[item.id]" @click="checkVideoSource(item)">
+                      {{ videoSourceChecking[item.id] ? '检测中...' : '检测' }}
                     </button>
                     <p class="source-check-text" v-if="videoSourceCheckResults[item.id]">
                       {{ videoSourceCheckResults[item.id].online ? '在线' : '不可用' }}：
