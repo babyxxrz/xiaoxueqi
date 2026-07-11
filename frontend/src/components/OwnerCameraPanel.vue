@@ -1,10 +1,10 @@
-<template>
+﻿<template>
   <section class="camera-panel">
     <div class="camera-heading">
       <div>
         <p class="section-kicker">DRIVER GESTURE</p>
         <h3>车主摄像头实时识别</h3>
-        <p>采集手部关键点并映射车辆控制操作。</p>
+        <p>按照任务要求识别静态与动态手势，并联动车载控制面板。</p>
       </div>
 
       <div class="status-row">
@@ -61,7 +61,7 @@
           </div>
           <div>
             <span>当前功能</span>
-            <strong>{{ vehicleState.current_function || 'home' }}</strong>
+            <strong>{{ currentFunctionText }}</strong>
           </div>
           <div>
             <span>音量</span>
@@ -71,6 +71,26 @@
             <span>电话状态</span>
             <strong>{{ vehicleState.phone_status || '空闲' }}</strong>
           </div>
+          <div>
+            <span>空调温度</span>
+            <strong>{{ vehicleState.temperature ?? 24 }} ℃</strong>
+          </div>
+          <div>
+            <span>动作状态</span>
+            <strong :class="{ triggered: result.triggered }">
+              {{ actionStatusText }}
+            </strong>
+          </div>
+        </div>
+
+        <div class="volume-state">
+          <div>
+            <span>媒体音量</span>
+            <strong>{{ vehicleState.volume ?? 50 }}</strong>
+          </div>
+          <div class="volume-track">
+            <span :style="{ width: `${vehicleState.volume ?? 50}%` }"></span>
+          </div>
         </div>
 
         <div class="vehicle-state">
@@ -79,6 +99,28 @@
         </div>
       </div>
     </div>
+
+    <section class="mapping-panel">
+      <div class="mapping-heading">
+        <div>
+          <span>任务要求映射</span>
+          <strong>至少 6 类车主手势 · 当前支持 9 条控制指令</strong>
+        </div>
+        <small>静态手势需连续两帧确认；动态手势按最近轨迹识别。</small>
+      </div>
+
+      <div class="mapping-grid">
+        <article
+          v-for="item in gestureMappings"
+          :key="item.gesture"
+          :class="{ active: result.gesture === item.gesture }"
+        >
+          <span>{{ item.type === 'dynamic' ? '动态' : '静态' }}</span>
+          <strong>{{ item.gestureName }}</strong>
+          <small>{{ item.description }}</small>
+        </article>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -107,13 +149,62 @@ const result = reactive({
   description: '',
   latency_ms: null,
   landmarks: [],
+  triggered: false,
+  stable_count: 0,
+  required_stable_frames: 2,
+  dynamic_gesture: '',
+  cooldown_remaining_ms: 0,
+  gesture_mapping_version: '',
 })
 
 const vehicleState = reactive({
   system_awake: false,
   current_function: 'home',
   volume: 50,
+  temperature: 24,
   phone_status: '空闲',
+  last_action: 'none',
+  last_description: '未触发车辆控制',
+})
+
+const functionLabels = {
+  home: '主页',
+  media: '媒体',
+  climate: '空调',
+  phone: '电话',
+  navigation: '导航',
+}
+
+const gestureMappings = [
+  { gesture: 'open_palm', gestureName: '手掌张开', description: '启动 / 唤醒系统', type: 'static' },
+  { gesture: 'fist', gestureName: '握拳', description: '确认 / 执行', type: 'static' },
+  { gesture: 'circle_clockwise', gestureName: '单指顺时针画圈', description: '调高音量', type: 'dynamic' },
+  { gesture: 'circle_counterclockwise', gestureName: '单指逆时针画圈', description: '调低音量', type: 'dynamic' },
+  { gesture: 'swipe_left', gestureName: '向左滑动', description: '切换到上一功能', type: 'dynamic' },
+  { gesture: 'swipe_right', gestureName: '向右滑动', description: '切换到下一功能', type: 'dynamic' },
+  { gesture: 'thumb_up', gestureName: '拇指向上', description: '接听电话', type: 'static' },
+  { gesture: 'thumb_down', gestureName: '拇指向下', description: '挂断电话', type: 'static' },
+  { gesture: 'wave', gestureName: '挥手', description: '返回主页', type: 'dynamic' },
+]
+
+const currentFunctionText = computed(() =>
+  functionLabels[vehicleState.current_function] ||
+  vehicleState.current_function ||
+  '主页',
+)
+
+const actionStatusText = computed(() => {
+  if (result.triggered) return '已执行'
+  if (result.cooldown_remaining_ms > 0) {
+    return `冷却 ${result.cooldown_remaining_ms} ms`
+  }
+  if (
+    result.gesture &&
+    !['unknown', 'no_hand', 'one', 'two', 'ok'].includes(result.gesture)
+  ) {
+    return `确认 ${result.stable_count}/${result.required_stable_frames}`
+  }
+  return '未触发'
 })
 
 const confidenceText = computed(() =>
@@ -244,6 +335,12 @@ function updateResult(data, clientLatency) {
   result.description = payload.description || ''
   result.latency_ms = data.latency_ms ?? clientLatency
   result.landmarks = payload.landmarks || []
+  result.triggered = Boolean(payload.triggered)
+  result.stable_count = Number(payload.stable_count || 0)
+  result.required_stable_frames = Number(payload.required_stable_frames || 2)
+  result.dynamic_gesture = payload.dynamic_gesture || ''
+  result.cooldown_remaining_ms = Number(payload.cooldown_remaining_ms || 0)
+  result.gesture_mapping_version = payload.gesture_mapping_version || ''
 
   Object.assign(vehicleState, state)
   drawLandmarks(result.landmarks)
@@ -516,6 +613,121 @@ window.addEventListener('resize', resizeOverlay)
   margin-top: 5px;
   color: #e2e8f0;
   word-break: break-word;
+}
+
+.volume-state {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid rgba(34, 211, 238, 0.14);
+  border-radius: 14px;
+  background: rgba(8, 20, 38, 0.72);
+}
+
+.volume-state > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.volume-state span {
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.volume-state strong {
+  color: #e2e8f0;
+}
+
+.volume-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+}
+
+.volume-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #22d3ee, #5eead4);
+  transition: width 0.25s ease;
+}
+
+.triggered {
+  color: #5eead4 !important;
+}
+
+.mapping-panel {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid rgba(94, 234, 212, 0.16);
+  border-radius: 16px;
+  background: rgba(6, 18, 34, 0.76);
+}
+
+.mapping-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.mapping-heading > div {
+  display: grid;
+  gap: 5px;
+}
+
+.mapping-heading span,
+.mapping-heading small {
+  color: #8fa9c6;
+  font-size: 12px;
+}
+
+.mapping-heading strong {
+  color: #e2e8f0;
+}
+
+.mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mapping-grid article {
+  display: grid;
+  gap: 5px;
+  min-height: 88px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 12px;
+  background: rgba(15, 29, 49, 0.76);
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.mapping-grid article.active {
+  border-color: rgba(94, 234, 212, 0.72);
+  background: rgba(13, 148, 136, 0.14);
+}
+
+.mapping-grid article > span {
+  width: fit-content;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.1);
+  color: #67e8f9;
+  font-size: 11px;
+}
+
+.mapping-grid article strong {
+  color: #f8fafc;
+  font-size: 14px;
+}
+
+.mapping-grid article small {
+  color: #8fa9c6;
+  line-height: 1.5;
 }
 
 .vehicle-state {

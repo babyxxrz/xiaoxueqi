@@ -2,11 +2,10 @@
 认证与权限管理模块
 提供用户注册、登录、Token 刷新、退出、权限中间件、邮箱验证码登录等功能。
 """
+import os
 import random
 import smtplib
 from email.mime.text import MIMEText
-import os
-from dotenv import load_dotenv
 
 import re
 import secrets
@@ -21,15 +20,18 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from dotenv import load_dotenv
 
 # ---------- 配置 ----------
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 
-SECRET_KEY = "xiaoxueqi_jwt_secret_2025_s8f3k2m9"  # 生产环境应使用环境变量
+# 只加载 backend/.env。真实密钥不要写入代码或提交到 Git。
+load_dotenv(BASE_DIR / ".env")
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-change-this-jwt-secret")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 7
@@ -43,16 +45,35 @@ limiter = Limiter(key_func=get_remote_address)
 
 DATA_DIR.mkdir(exist_ok=True)
 # ---------- 邮箱配置 ----------
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
+# SMTP_AUTH_CODE 是邮箱服务商生成的“授权码”，不是邮箱登录密码。
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_AUTH_CODE", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_DEBUG = os.getenv("AUTH_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # 验证码配置
-VERIFY_CODE_EXPIRE_MINUTES = 5  # 验证码有效期
-VERIFY_CODE_LENGTH = 6          # 验证码长度
+VERIFY_CODE_EXPIRE_MINUTES = int(os.getenv("VERIFY_CODE_EXPIRE_MINUTES", "5"))
+VERIFY_CODE_LENGTH = int(os.getenv("VERIFY_CODE_LENGTH", "6"))
+
+
+def is_smtp_configured() -> bool:
+    """只判断 SMTP 必要配置是否齐全，不暴露授权码。"""
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM)
+
+
+def mask_email(email: str) -> str:
+    """用于诊断接口，仅显示脱敏后的发件邮箱。"""
+    if not email or "@" not in email:
+        return ""
+    name, domain = email.split("@", 1)
+    if len(name) <= 2:
+        masked_name = name[:1] + "*"
+    else:
+        masked_name = name[:2] + "*" * max(2, len(name) - 2)
+    return f"{masked_name}@{domain}"
 
 
 
@@ -104,8 +125,74 @@ class LoginByCodeRequest(BaseModel):
 
 # ---------- 邮箱工具 ----------
 
+def send_html_email(
+    to_emails: str | list[str] | tuple[str, ...] | set[str],
+    subject: str,
+    html_body: str,
+) -> tuple[bool, str]:
+    """
+    使用当前 SMTP 配置发送 HTML 邮件。
+
+    返回：
+    - (True, "")：发送成功
+    - (False, "错误信息")：发送失败
+
+    该函数不会输出或返回 SMTP 授权码。
+    """
+    if not is_smtp_configured():
+        message = "SMTP 未配置，请检查 backend/.env"
+        print(f"[EMAIL ERROR] {message}")
+        return False, message
+
+    if isinstance(to_emails, str):
+        raw_recipients = [to_emails]
+    else:
+        raw_recipients = list(to_emails or [])
+
+    recipients: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_recipients:
+        email = str(item or "").strip().lower()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        recipients.append(email)
+
+    if not recipients:
+        return False, "收件人邮箱为空"
+
+    msg = MIMEText(html_body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = ", ".join(recipients)
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_FROM, recipients, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_FROM, recipients, msg.as_string())
+
+        return True, ""
+    except Exception as error:
+        error_message = f"{type(error).__name__}: {error}"
+        print(
+            "[EMAIL ERROR] 发送邮件失败，收件人="
+            f"{', '.join(mask_email(item) for item in recipients)}，"
+            f"原因={error_message}"
+        )
+        return False, error_message
+
+
 def send_verify_code_email(to_email: str, code: str) -> bool:
-    """向指定邮箱发送验证码邮件，成功返回 True"""
+    """向指定邮箱发送验证码邮件，成功返回 True。"""
     subject = "智能车载视觉感知与告警系统 - 验证码"
     body = f"""<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e0e0e0; border-radius: 12px;">
     <h2 style="color: #2563eb; margin-top: 0;">智能车载视觉感知与告警系统</h2>
@@ -118,20 +205,12 @@ def send_verify_code_email(to_email: str, code: str) -> bool:
     <p style="color: #94a3b8; font-size: 12px; margin-top: 24px;">此邮件由系统自动发送，请勿回复。</p>
 </div>"""
 
-    msg = MIMEText(body, "html", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
-
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
-        return True
-    except Exception as e:
-        print(f"[EMAIL ERROR] 发送验证码到 {to_email} 失败: {e}")
-        return False
-
+    success, _ = send_html_email(
+        to_emails=to_email,
+        subject=subject,
+        html_body=body,
+    )
+    return success
 
 def generate_verify_code(length: int = VERIFY_CODE_LENGTH) -> str:
     """生成指定长度的数字验证码"""
@@ -587,7 +666,10 @@ def send_code(request: SendCodeRequest):
 
 @auth_router.post("/debug-send-code")
 def debug_send_code(request: SendCodeRequest):
-    """【调试用】发送邮箱验证码并直接返回验证码（不依赖真实邮箱）"""
+    """调试接口。仅当 backend/.env 中 AUTH_DEBUG=true 时开放。"""
+    if not AUTH_DEBUG:
+        raise HTTPException(status_code=404, detail="调试接口未启用")
+
     email = request.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
@@ -715,6 +797,22 @@ def get_me(current_user: dict = Depends(get_current_user)):
     return {
         "status": "success",
         "user": current_user,
+    }
+
+
+@auth_router.get("/email-config-check")
+def check_email_config():
+    """检查邮箱配置是否完整；不会返回授权码。"""
+    return {
+        "status": "success",
+        "smtp_configured": is_smtp_configured(),
+        "smtp_host": SMTP_HOST,
+        "smtp_port": SMTP_PORT,
+        "smtp_use_ssl": SMTP_USE_SSL,
+        "smtp_user_masked": mask_email(SMTP_USER),
+        "smtp_from_masked": mask_email(SMTP_FROM),
+        "auth_debug": AUTH_DEBUG,
+        "authorization_code_loaded": bool(SMTP_PASS),
     }
 
 

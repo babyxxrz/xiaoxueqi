@@ -1,7 +1,8 @@
-from pathlib import Path
+﻿from pathlib import Path
 from collections import Counter
 from uuid import uuid4
 from datetime import datetime
+from contextvars import ContextVar
 import asyncio
 import json
 import queue
@@ -12,14 +13,18 @@ import time
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from algorithm.plate_recognizer import recognize_plate_real
+from algorithm.plate_video_aggregator import aggregate_plate_frame_results_v2
 from algorithm.owner_gesture_recognizer import recognize_owner_gesture_image
-from algorithm.traffic_gesture_recognizer import recognize_traffic_gesture_image
+from algorithm.traffic_gesture_recognizer import (
+    recognize_traffic_gesture_image,
+    aggregate_traffic_gesture_sequence,
+)
 from algorithm.alert_agent import (
     AlertAgent,
     Alert,
@@ -31,7 +36,24 @@ from algorithm.alert_agent import (
     get_alert_agent,
     reset_alert_agent,
 )
-from auth import auth_router, init_auth
+from auth import (
+    auth_router,
+    init_auth,
+    get_current_user,
+    require_admin,
+    decode_access_token,
+    get_user_by_id,
+)
+from alert_email_notifier import (
+    alert_email_config_summary,
+    get_alert_notification_summary,
+    init_alert_notification_db,
+    list_alert_notifications,
+    retry_alert_notifications,
+    retry_all_failed_notifications,
+    schedule_alert_notifications,
+    start_alert_notification_worker,
+)
 
 # --- AlertAgent 全局实例 ---
 _ALERT_AGENT = get_alert_agent()
@@ -51,6 +73,55 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+
+
+_REQUEST_USER_ID: ContextVar[int | None] = ContextVar(
+    "request_user_id",
+    default=None,
+)
+_REQUEST_USER: ContextVar[dict | None] = ContextVar(
+    "request_user",
+    default=None,
+)
+
+
+@app.middleware("http")
+async def bind_request_user_context(request: Request, call_next):
+    """
+    从 Bearer access token 中读取当前用户，并写入 ContextVar。
+
+    现有识别接口无需逐个重写参数，所有记录、告警和操作日志写入函数
+    都可以自动绑定本次请求的 user_id。未登录的系统任务保留为 NULL，
+    只在管理员全局视图中展示。
+    """
+    current_user = None
+    authorization = request.headers.get("Authorization", "")
+
+    if authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        if token:
+            try:
+                payload = decode_access_token(token)
+                current_user = get_user_by_id(int(payload["sub"]))
+            except Exception:
+                current_user = None
+
+    user_token = _REQUEST_USER.set(current_user)
+    user_id_token = _REQUEST_USER_ID.set(
+        int(current_user["id"]) if current_user else None
+    )
+
+    try:
+        return await call_next(request)
+    finally:
+        _REQUEST_USER.reset(user_token)
+        _REQUEST_USER_ID.reset(user_id_token)
+
+
+def current_request_user_id(explicit_user_id: int | None = None) -> int | None:
+    if explicit_user_id is not None:
+        return int(explicit_user_id)
+    return _REQUEST_USER_ID.get()
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -98,7 +169,10 @@ class StreamRecognizeRequest(BaseModel):
     frame_count: int = 50
     sample_interval: int = 5
     use_mock_frame: bool = False
+    # 保留旧字段，兼容现有前端。
     custom_rtsp_url: str | None = None
+    # 新字段同时支持 RTSP、HTTP 视频、本地视频路径和摄像头编号。
+    custom_source_url: str | None = None
 
 
 class MonitorStartRequest(BaseModel):
@@ -168,6 +242,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS recognition_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             task_type TEXT NOT NULL,
             input_type TEXT NOT NULL,
             original_filename TEXT,
@@ -184,6 +259,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS alert_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             level TEXT NOT NULL,
             event_type TEXT NOT NULL,
             summary TEXT NOT NULL,
@@ -200,6 +276,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS operation_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             action TEXT NOT NULL,
             detail TEXT,
             created_at TEXT NOT NULL
@@ -244,23 +321,92 @@ def init_db():
         """,
         (now_text(),),
     )
-
     conn.commit()
 
+    # 兼容已有 SQLite 数据库，启动时自动补列，不删除旧数据。
     ensure_column_exists(
         conn=conn,
         table_name="recognition_records",
         column_name="output_image_url",
         column_definition="TEXT",
     )
-
+    ensure_column_exists(
+        conn=conn,
+        table_name="recognition_records",
+        column_name="user_id",
+        column_definition="INTEGER",
+    )
+    ensure_column_exists(
+        conn=conn,
+        table_name="alert_events",
+        column_name="user_id",
+        column_definition="INTEGER",
+    )
+    ensure_column_exists(
+        conn=conn,
+        table_name="operation_logs",
+        column_name="user_id",
+        column_definition="INTEGER",
+    )
     conn.close()
 
-    # 初始化认证相关表及种子数据
+    # 初始化认证表，确保 users 表和默认管理员已经存在。
     init_auth()
+    init_alert_notification_db(DB_PATH)
 
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-def insert_operation_log(action: str, detail: dict | str | None = None) -> int:
+    # 旧版本没有 user_id。为了保留既有记录，将历史无归属数据统一归到
+    # 最早创建的管理员账号；新记录则自动绑定发起请求的当前用户。
+    admin_row = cursor.execute(
+        """
+        SELECT id
+        FROM users
+        WHERE role = 'admin'
+        ORDER BY id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    legacy_owner_id = int(admin_row["id"]) if admin_row else None
+
+    if legacy_owner_id is not None:
+        for table_name in (
+            "recognition_records",
+            "alert_events",
+            "operation_logs",
+        ):
+            cursor.execute(
+                f"UPDATE {table_name} SET user_id = ? WHERE user_id IS NULL",
+                (legacy_owner_id,),
+            )
+
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_recognition_records_user_created
+        ON recognition_records(user_id, created_at DESC)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_alert_events_user_created
+        ON alert_events(user_id, created_at DESC)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_operation_logs_user_created
+        ON operation_logs(user_id, created_at DESC)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+def insert_operation_log(
+    action: str,
+    detail: dict | str | None = None,
+    user_id: int | None = None,
+) -> int:
     if isinstance(detail, dict):
         detail_text = json.dumps(detail, ensure_ascii=False)
     elif detail is None:
@@ -268,31 +414,31 @@ def insert_operation_log(action: str, detail: dict | str | None = None) -> int:
     else:
         detail_text = str(detail)
 
+    effective_user_id = current_request_user_id(user_id)
+
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute(
         """
         INSERT INTO operation_logs (
+            user_id,
             action,
             detail,
             created_at
         )
-        VALUES (?, ?, ?)
+        VALUES (?, ?, ?, ?)
         """,
         (
+            effective_user_id,
             action,
             detail_text,
             now_text(),
         ),
     )
-
     conn.commit()
     log_id = cursor.lastrowid
     conn.close()
-
-    return log_id
-
+    return int(log_id)
 
 def insert_alert_event(
     level: str,
@@ -302,13 +448,16 @@ def insert_alert_event(
     suggestion: str,
     related_record_id: int | None = None,
     status: str = "未处理",
+    user_id: int | None = None,
 ) -> int:
+    effective_user_id = current_request_user_id(user_id)
+
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute(
         """
         INSERT INTO alert_events (
+            user_id,
             level,
             event_type,
             summary,
@@ -318,9 +467,10 @@ def insert_alert_event(
             related_record_id,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            effective_user_id,
             level,
             event_type,
             summary,
@@ -331,13 +481,23 @@ def insert_alert_event(
             now_text(),
         ),
     )
-
     conn.commit()
     alert_id = cursor.lastrowid
     conn.close()
 
-    return alert_id
+    try:
+        schedule_alert_notifications(
+            DB_PATH,
+            int(alert_id),
+        )
+    except Exception as error:
+        print(
+            "[ALERT EMAIL SCHEDULE ERROR] "
+            f"alert_id={alert_id}, "
+            f"{type(error).__name__}: {error}"
+        )
 
+    return int(alert_id)
 
 def insert_recognition_record(
     task_type: str,
@@ -347,13 +507,16 @@ def insert_recognition_record(
     image_url: str,
     output_image_url: str,
     result: dict,
+    user_id: int | None = None,
 ) -> int:
+    effective_user_id = current_request_user_id(user_id)
+
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute(
         """
         INSERT INTO recognition_records (
+            user_id,
             task_type,
             input_type,
             original_filename,
@@ -363,9 +526,10 @@ def insert_recognition_record(
             result_json,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            effective_user_id,
             task_type,
             input_type,
             original_filename,
@@ -376,13 +540,10 @@ def insert_recognition_record(
             now_text(),
         ),
     )
-
     conn.commit()
     record_id = cursor.lastrowid
     conn.close()
-
-    return record_id
-
+    return int(record_id)
 
 def create_annotated_plate_image(
     input_path: Path,
@@ -390,79 +551,23 @@ def create_annotated_plate_image(
     confidence: float = 0.92,
 ) -> dict:
     """
-    真实车牌识别版本：
-    使用 HyperLPR3 完成车牌检测 + OCR 识别。
-    confidence 参数只用于“模拟低置信度告警”测试：
-    - 如果 confidence < 0.6，则强制把模型输出置信度改低，用于触发告警。
-    - 正常识别时使用模型自己的置信度。
+    使用 HyperLPR3 完成一帧中的多车牌检测、OCR、颜色推断和标注。
+
+    confidence 仅用于模拟低置信度告警：当传入值小于 0.6 时，
+    强制覆盖模型置信度；正常识别始终采用模型真实置信度。
     """
     try:
         force_confidence = confidence if confidence < 0.6 else None
-
         return recognize_plate_real(
             input_path=input_path,
             output_path=output_path,
             force_confidence=force_confidence,
         )
-
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"真实车牌识别失败：{error}"
-        )
-    image = cv2.imread(str(input_path))
-
-    if image is None:
-        raise HTTPException(status_code=400, detail="图片读取失败，请检查图片格式是否正确")
-
-    height, width = image.shape[:2]
-
-    x1 = int(width * 0.35)
-    y1 = int(height * 0.65)
-    x2 = int(width * 0.65)
-    y2 = int(height * 0.75)
-
-    x1 = max(0, min(x1, width - 1))
-    y1 = max(0, min(y1, height - 1))
-    x2 = max(0, min(x2, width - 1))
-    y2 = max(0, min(y2, height - 1))
-
-    plate_number = "京A12345"
-    plate_number_for_image = "JingA12345"
-    plate_color = "蓝牌"
-
-    box_color = (0, 255, 0) if confidence >= 0.6 else (0, 165, 255)
-
-    cv2.rectangle(image, (x1, y1), (x2, y2), box_color, 3)
-
-    label = f"{plate_number_for_image} {confidence:.2f}"
-
-    cv2.putText(
-        image,
-        label,
-        (x1, max(y1 - 10, 30)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        box_color,
-        2,
-        cv2.LINE_AA,
-    )
-
-    success = cv2.imwrite(str(output_path), image)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="标注结果图保存失败")
-
-    return {
-        "plates": [
-            {
-                "plate_number": plate_number,
-                "plate_color": plate_color,
-                "confidence": confidence,
-                "bbox": [x1, y1, x2, y2],
-            }
-        ]
-    }
+            detail=f"真实车牌识别失败：{error}",
+        ) from error
 
 
 def create_mock_rtsp_frame(source_name: str, output_path: Path):
@@ -502,14 +607,59 @@ def create_mock_rtsp_frame(source_name: str, output_path: Path):
         raise HTTPException(status_code=500, detail="模拟视频帧保存失败")
 
 
-def capture_rtsp_frame(source: dict, output_path: Path):
-    cap = cv2.VideoCapture(source["url"], cv2.CAP_FFMPEG)
+def _source_kind(source_value: str | int) -> str:
+    if isinstance(source_value, int):
+        return "camera"
+
+    text = str(source_value or "").strip()
+    if text.isdigit():
+        return "camera"
+    if Path(text).expanduser().exists():
+        return "local_video"
+    if text.lower().startswith("rtsp://"):
+        return "rtsp"
+    if text.lower().startswith(("http://", "https://")):
+        return "http_video"
+    return "video_source"
+
+
+def open_video_capture(source: dict):
+    """统一打开 RTSP、HTTP 视频、本地视频文件或电脑摄像头。"""
+    source_value = source.get("url", "")
+    kind = source.get("kind") or _source_kind(source_value)
+
+    if kind == "camera":
+        camera_index = int(source_value)
+        cap = cv2.VideoCapture(camera_index)
+    elif kind == "local_video":
+        cap = cv2.VideoCapture(str(Path(str(source_value)).expanduser()))
+    else:
+        cap = cv2.VideoCapture(str(source_value), cv2.CAP_FFMPEG)
+
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def stream_input_type(source: dict, use_mock_frame: bool) -> str:
+    if use_mock_frame:
+        return "mock_stream"
+
+    kind = source.get("kind") or _source_kind(source.get("url", ""))
+    return {
+        "camera": "camera_stream",
+        "local_video": "local_video",
+        "http_video": "http_video",
+        "rtsp": "rtsp_stream",
+    }.get(kind, "video_stream")
+
+
+def capture_rtsp_frame(source: dict, output_path: Path):
+    cap = open_video_capture(source)
 
     if not cap.isOpened():
         raise HTTPException(
             status_code=400,
-            detail=f"无法打开 RTSP 视频流：{source['name']}。可勾选模拟帧用于离线演示。",
+            detail=f"无法打开视频源：{source['name']}。请检查地址、文件路径或摄像头编号。",
         )
 
     ret, frame = cap.read()
@@ -518,13 +668,11 @@ def capture_rtsp_frame(source: dict, output_path: Path):
     if not ret or frame is None:
         raise HTTPException(
             status_code=400,
-            detail=f"读取 RTSP 视频帧失败：{source['name']}",
+            detail=f"读取视频帧失败：{source['name']}",
         )
 
-    success = cv2.imwrite(str(output_path), frame)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="RTSP 视频帧保存失败")
+    if not cv2.imwrite(str(output_path), frame):
+        raise HTTPException(status_code=500, detail="视频帧保存失败")
 
 
 
@@ -533,20 +681,31 @@ def clamp_int(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(int(value), max_value))
 
 
-def get_stream_source(source_id: str, custom_rtsp_url: str | None = None) -> dict:
-    if custom_rtsp_url:
+def get_stream_source(source_id: str, custom_source_url: str | None = None) -> dict:
+    if custom_source_url:
+        kind = _source_kind(custom_source_url)
+        kind_name = {
+            "camera": "自定义摄像头",
+            "local_video": "本地视频文件",
+            "http_video": "HTTP 视频源",
+            "rtsp": "自定义 RTSP 视频源",
+        }.get(kind, "自定义视频源")
+
         return {
             "id": "custom",
-            "name": "自定义 RTSP 视频源",
-            "url": custom_rtsp_url,
+            "name": kind_name,
+            "url": custom_source_url,
+            "kind": kind,
         }
 
     source = next((item for item in RTSP_SOURCES if item["id"] == source_id), None)
 
     if source is None:
-        raise HTTPException(status_code=404, detail="未找到指定 RTSP 视频源")
+        raise HTTPException(status_code=404, detail="未找到指定视频源")
 
-    return source
+    result = dict(source)
+    result["kind"] = _source_kind(result.get("url", ""))
+    return result
 
 
 def save_frame_image(frame, filename_prefix: str) -> dict:
@@ -572,12 +731,11 @@ def capture_stream_sampled_frames(
     use_mock_frame: bool,
 ) -> tuple[list[dict], int]:
     """
-    从 RTSP 视频流中连续读取 frame_count 帧，并每隔 sample_interval 帧保存一张抽样帧。
-    返回：抽样帧列表、实际读取帧数。
+    从 RTSP、本地视频、HTTP 视频或摄像头连续读取 frame_count 帧，
+    每隔 sample_interval 帧保存一张抽样帧。
     """
     frame_count = clamp_int(frame_count, 5, 300)
     sample_interval = clamp_int(sample_interval, 1, 60)
-
     sampled_frames: list[dict] = []
 
     if use_mock_frame:
@@ -587,50 +745,59 @@ def capture_stream_sampled_frames(
             saved_filename = f"stream_mock_{source['id']}_{index:03d}_{uuid4().hex}.jpg"
             saved_path = UPLOAD_DIR / saved_filename
             create_mock_rtsp_frame(source["name"], saved_path)
-            sampled_frames.append(
-                {
-                    "frame_index": index * sample_interval,
-                    "saved_filename": saved_filename,
-                    "saved_path": saved_path,
-                    "image_url": f"/uploads/{saved_filename}",
-                }
-            )
+            sampled_frames.append({
+                "frame_index": index * sample_interval,
+                "saved_filename": saved_filename,
+                "saved_path": saved_path,
+                "image_url": f"/uploads/{saved_filename}",
+                "captured_at": now_text(),
+            })
 
         return sampled_frames, frame_count
 
-    cap = cv2.VideoCapture(source["url"], cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap = open_video_capture(source)
 
     if not cap.isOpened():
         raise HTTPException(
             status_code=400,
-            detail=f"无法打开 RTSP 视频流：{source['name']}。请确认沙盘推流已开启、RTSP 地址正确，或勾选模拟视频帧。",
+            detail=(
+                f"无法打开视频源：{source['name']}。"
+                "请确认 RTSP/HTTP 地址、本地文件路径或摄像头编号正确。"
+            ),
         )
 
     frames_read = 0
+    consecutive_failures = 0
 
-    for frame_index in range(frame_count):
-        ret, frame = cap.read()
+    try:
+        for frame_index in range(frame_count):
+            ret, frame = cap.read()
 
-        if not ret or frame is None:
-            continue
+            if not ret or frame is None:
+                consecutive_failures += 1
+                # 本地视频读到结尾或网络流连续失败时提前结束，避免无效等待。
+                if consecutive_failures >= 8:
+                    break
+                continue
 
-        frames_read += 1
+            consecutive_failures = 0
+            frames_read += 1
 
-        if frame_index % sample_interval == 0:
-            frame_info = save_frame_image(
-                frame=frame,
-                filename_prefix=f"stream_{source['id']}_{frame_index:03d}",
-            )
-            frame_info["frame_index"] = frame_index
-            sampled_frames.append(frame_info)
-
-    cap.release()
+            if frame_index % sample_interval == 0:
+                frame_info = save_frame_image(
+                    frame=frame,
+                    filename_prefix=f"stream_{source['id']}_{frame_index:03d}",
+                )
+                frame_info["frame_index"] = frame_index
+                frame_info["captured_at"] = now_text()
+                sampled_frames.append(frame_info)
+    finally:
+        cap.release()
 
     if not sampled_frames:
         raise HTTPException(
             status_code=400,
-            detail=f"已尝试读取 RTSP 视频流，但没有得到可用抽样帧：{source['name']}",
+            detail=f"已尝试读取视频源，但没有得到可用抽样帧：{source['name']}",
         )
 
     return sampled_frames, frames_read
@@ -647,6 +814,7 @@ def get_result_confidence(task_type: str, result: dict) -> float:
 
 
 def recognize_single_sampled_frame(frame_info: dict, task_type: str) -> dict:
+    started = time.perf_counter()
     input_path = frame_info["saved_path"]
     output_filename = f"annotated_{task_type}_{frame_info['saved_filename']}"
     output_path = OUTPUT_DIR / output_filename
@@ -670,15 +838,19 @@ def recognize_single_sampled_frame(frame_info: dict, task_type: str) -> dict:
     else:
         raise HTTPException(status_code=400, detail="不支持的连续帧识别任务类型")
 
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    result.setdefault("latency_ms", latency_ms)
     confidence = get_result_confidence(task_type, result)
 
     return {
         "frame_index": frame_info["frame_index"],
+        "captured_at": frame_info.get("captured_at", ""),
         "saved_filename": frame_info["saved_filename"],
         "image_url": frame_info["image_url"],
         "output_filename": output_filename,
         "output_image_url": f"/outputs/{output_filename}",
         "confidence": confidence,
+        "latency_ms": latency_ms,
         "result": result,
     }
 
@@ -687,9 +859,11 @@ def compact_frame_result(task_type: str, item: dict) -> dict:
     result = item.get("result", {})
     compact = {
         "frame_index": item.get("frame_index"),
+        "captured_at": item.get("captured_at", ""),
         "image_url": item.get("image_url"),
         "output_image_url": item.get("output_image_url"),
         "confidence": item.get("confidence", 0),
+        "latency_ms": item.get("latency_ms", result.get("latency_ms", 0)),
     }
 
     if task_type == "plate":
@@ -717,87 +891,38 @@ def compact_frame_result(task_type: str, item: dict) -> dict:
 
 
 def aggregate_plate_frame_results(frame_results: list[dict]) -> dict:
-    """
-    多帧、多车牌聚合：
-    - 每个抽样帧可能识别出 0 到多个车牌。
-    - 按 plate_number 聚合同一车牌在多帧中的结果。
-    - 同一车牌保留最高置信度结果，同时记录出现次数和出现帧序号。
-    - 最终 plates 字段保留多个车牌，不再只返回单帧最高置信度结果。
-    """
-    best = max(
-        frame_results,
-        key=lambda item: (
-            len(item.get("result", {}).get("plates", []) or []),
-            float(item.get("confidence", 0) or 0),
-        ),
+    """调用车牌视频聚合 V2。"""
+    return aggregate_plate_frame_results_v2(
+        frame_results=frame_results,
+        compact_frame_result_fn=compact_frame_result,
     )
-
-    aggregated: dict[str, dict] = {}
-
-    for item in frame_results:
-        frame_index = item.get("frame_index")
-        image_url = item.get("image_url", "")
-        output_image_url = item.get("output_image_url", "")
-        plates = item.get("result", {}).get("plates", []) or []
-
-        for plate in plates:
-            plate_number = str(plate.get("plate_number") or "").strip()
-            if not plate_number:
-                # 未得到车牌号时，按定位框近似区分，避免把多个未知车牌误合并。
-                plate_number = f"UNKNOWN_{frame_index}_{len(aggregated) + 1}"
-
-            confidence = float(plate.get("confidence", 0) or 0)
-
-            if plate_number not in aggregated:
-                item_copy = dict(plate)
-                item_copy["plate_number"] = plate_number
-                item_copy["confidence"] = confidence
-                item_copy["appear_count"] = 1
-                item_copy["frame_indices"] = [frame_index]
-                item_copy["best_frame_index"] = frame_index
-                item_copy["best_image_url"] = image_url
-                item_copy["best_output_image_url"] = output_image_url
-                aggregated[plate_number] = item_copy
-                continue
-
-            existing = aggregated[plate_number]
-            existing["appear_count"] = int(existing.get("appear_count", 0)) + 1
-            existing.setdefault("frame_indices", []).append(frame_index)
-
-            if confidence > float(existing.get("confidence", 0) or 0):
-                existing.update(dict(plate))
-                existing["plate_number"] = plate_number
-                existing["confidence"] = confidence
-                existing["best_frame_index"] = frame_index
-                existing["best_image_url"] = image_url
-                existing["best_output_image_url"] = output_image_url
-
-    aggregated_plates = sorted(
-        aggregated.values(),
-        key=lambda plate: (
-            int(plate.get("appear_count", 0)),
-            float(plate.get("confidence", 0) or 0),
-        ),
-        reverse=True,
-    )
-
-    final_result = dict(best["result"])
-    final_result["model"] = final_result.get("model", "HyperLPR3")
-    final_result["plates"] = aggregated_plates
-    final_result["plate_count"] = len(aggregated_plates)
-    final_result["stream_strategy"] = "连续帧抽样 + 多车牌多帧聚合"
-    final_result["best_frame_index"] = best["frame_index"]
-    final_result["best_frame_plate_count"] = len(best.get("result", {}).get("plates", []) or [])
-    final_result["sampled_frames"] = len(frame_results)
-    final_result["frame_results"] = [compact_frame_result("plate", item) for item in frame_results]
-
-    return {
-        "best": best,
-        "final_result": final_result,
-    }
-
 
 def aggregate_gesture_frame_results(task_type: str, frame_results: list[dict]) -> dict:
+    if task_type == "traffic_gesture":
+        final_result = aggregate_traffic_gesture_sequence(frame_results)
+        best_frame_index = final_result.get("best_frame_index")
+
+        best = next(
+            (item for item in frame_results if item.get("frame_index") == best_frame_index),
+            None,
+        )
+        if best is None:
+            best = max(
+                frame_results,
+                key=lambda item: float(item.get("confidence", 0) or 0),
+            )
+
+        final_result["stream_strategy"] = "关键点规则 + 连续帧投票 + 手腕轨迹"
+        final_result["sampled_frames"] = len(frame_results)
+        final_result["frame_results"] = [
+            compact_frame_result(task_type, item) for item in frame_results
+        ]
+
+        return {
+            "best": best,
+            "final_result": final_result,
+        }
+
     valid_items = [
         item for item in frame_results
         if item.get("result", {}).get("gesture") not in (None, "", "unknown")
@@ -810,26 +935,37 @@ def aggregate_gesture_frame_results(task_type: str, frame_results: list[dict]) -
             same_gesture_items = [
                 item for item in valid_items if item["result"].get("gesture") == gesture
             ]
-            avg_confidence = sum(item.get("confidence", 0) for item in same_gesture_items) / len(same_gesture_items)
+            avg_confidence = sum(
+                float(item.get("confidence", 0) or 0) for item in same_gesture_items
+            ) / len(same_gesture_items)
             return counter[gesture], avg_confidence
 
         selected_gesture = max(counter.keys(), key=gesture_score)
         candidates = [
-            item for item in valid_items if item["result"].get("gesture") == selected_gesture
+            item for item in valid_items
+            if item["result"].get("gesture") == selected_gesture
         ]
         best = max(candidates, key=lambda item: float(item.get("confidence", 0) or 0))
         strategy = "连续帧抽样 + 手势多数投票"
+        stable_frames = counter[selected_gesture]
+        vote_ratio = stable_frames / max(1, len(valid_items))
     else:
         best = max(frame_results, key=lambda item: float(item.get("confidence", 0) or 0))
         counter = Counter()
         strategy = "连续帧抽样 + 最高置信度兜底"
+        stable_frames = 0
+        vote_ratio = 0.0
 
     final_result = dict(best["result"])
     final_result["stream_strategy"] = strategy
     final_result["best_frame_index"] = best["frame_index"]
     final_result["sampled_frames"] = len(frame_results)
+    final_result["stable_frames"] = stable_frames
+    final_result["vote_ratio"] = round(vote_ratio, 4)
     final_result["vote_counts"] = dict(counter)
-    final_result["frame_results"] = [compact_frame_result(task_type, item) for item in frame_results]
+    final_result["frame_results"] = [
+        compact_frame_result(task_type, item) for item in frame_results
+    ]
 
     return {
         "best": best,
@@ -949,36 +1085,135 @@ def maybe_create_low_confidence_alert(record_id: int, result: dict) -> int | Non
     return None
 
 
+def _row_value(row: sqlite3.Row, key: str, default=None):
+    return row[key] if key in row.keys() else default
+
+
+def summarize_recognition_result(task_type: str, result: dict) -> str:
+    result = result or {}
+
+    if task_type == "plate":
+        plates = result.get("plates") or []
+        numbers = [
+            str(
+                item.get("plate_number")
+                or item.get("plate")
+                or item.get("text")
+                or ""
+            ).strip()
+            for item in plates
+            if isinstance(item, dict)
+        ]
+        numbers = [item for item in numbers if item]
+        if numbers:
+            preview = "、".join(numbers[:3])
+            if len(numbers) > 3:
+                preview += f" 等 {len(numbers)} 个"
+            return preview
+        return "未识别到有效车牌"
+
+    if task_type == "traffic_gesture":
+        gesture_name = result.get("gesture_name") or result.get("gesture") or "未知手势"
+        command = result.get("traffic_command") or result.get("command") or ""
+        return f"{gesture_name} · {command}" if command else str(gesture_name)
+
+    if task_type == "owner_gesture":
+        gesture_name = result.get("gesture_name") or result.get("gesture") or "未知手势"
+        action = result.get("description") or result.get("action") or ""
+        return f"{gesture_name} · {action}" if action else str(gesture_name)
+
+    if task_type == "all":
+        tasks = result.get("tasks") or {}
+        labels = []
+        for key, label in (
+            ("plate", "车牌"),
+            ("traffic_gesture", "交警"),
+            ("owner_gesture", "车主"),
+        ):
+            payload = tasks.get(key, {}).get("result", {})
+            labels.append(f"{label}:{summarize_recognition_result(key, payload)}")
+        return "；".join(labels)
+
+    return (
+        result.get("summary")
+        or result.get("suggestion")
+        or result.get("message")
+        or "查看完整结果"
+    )
+
+
 def row_to_record(row: sqlite3.Row) -> dict:
+    result_text = _row_value(row, "result_json", "") or ""
+
+    try:
+        result = json.loads(result_text) if result_text else {}
+    except json.JSONDecodeError:
+        result = {"raw": result_text}
+
+    task_type = _row_value(row, "task_type", "")
     return {
-        "id": row["id"],
-        "task_type": row["task_type"],
-        "input_type": row["input_type"],
-        "original_filename": row["original_filename"],
-        "saved_filename": row["saved_filename"],
-        "image_url": row["image_url"],
-        "output_image_url": row["output_image_url"],
-        "result": json.loads(row["result_json"]),
-        "created_at": row["created_at"],
+        "id": _row_value(row, "id"),
+        "user_id": _row_value(row, "user_id"),
+        "username": _row_value(row, "username"),
+        "user_email": _row_value(row, "user_email"),
+        "task_type": task_type,
+        "input_type": _row_value(row, "input_type"),
+        "original_filename": _row_value(row, "original_filename"),
+        "saved_filename": _row_value(row, "saved_filename"),
+        "image_url": _row_value(row, "image_url"),
+        "output_image_url": _row_value(row, "output_image_url"),
+        "result": result,
+        "result_summary": summarize_recognition_result(task_type, result),
+        "created_at": _row_value(row, "created_at"),
     }
 
 
 def row_to_alert(row: sqlite3.Row) -> dict:
+    total_count = int(_row_value(row, "email_total_count", 0) or 0)
+    sent_count = int(_row_value(row, "email_sent_count", 0) or 0)
+    failed_count = int(_row_value(row, "email_failed_count", 0) or 0)
+    pending_count = int(_row_value(row, "email_pending_count", 0) or 0)
+    skipped_count = int(_row_value(row, "email_skipped_count", 0) or 0)
+
+    if total_count == 0:
+        email_status = "未创建"
+    elif pending_count > 0:
+        email_status = "发送中"
+    elif sent_count == total_count:
+        email_status = "已发送"
+    elif sent_count > 0 and (failed_count > 0 or skipped_count > 0):
+        email_status = "部分发送"
+    elif failed_count > 0:
+        email_status = "发送失败"
+    elif skipped_count == total_count:
+        email_status = "已跳过"
+    else:
+        email_status = "待发送"
+
     return {
-        "id": row["id"],
-        "level": row["level"],
-        "event_type": row["event_type"],
-        "summary": row["summary"],
-        "reason": row["reason"],
-        "suggestion": row["suggestion"],
-        "status": row["status"],
-        "related_record_id": row["related_record_id"],
-        "created_at": row["created_at"],
+        "id": _row_value(row, "id"),
+        "user_id": _row_value(row, "user_id"),
+        "username": _row_value(row, "username"),
+        "user_email": _row_value(row, "user_email"),
+        "level": _row_value(row, "level"),
+        "event_type": _row_value(row, "event_type"),
+        "summary": _row_value(row, "summary"),
+        "reason": _row_value(row, "reason"),
+        "suggestion": _row_value(row, "suggestion"),
+        "status": _row_value(row, "status"),
+        "related_record_id": _row_value(row, "related_record_id"),
+        "created_at": _row_value(row, "created_at"),
+        "email_notification_status": email_status,
+        "email_total_count": total_count,
+        "email_sent_count": sent_count,
+        "email_failed_count": failed_count,
+        "email_pending_count": pending_count,
+        "email_skipped_count": skipped_count,
     }
 
 
 def row_to_log(row: sqlite3.Row) -> dict:
-    detail_text = row["detail"] or ""
+    detail_text = _row_value(row, "detail", "") or ""
 
     try:
         detail = json.loads(detail_text) if detail_text else {}
@@ -986,12 +1221,14 @@ def row_to_log(row: sqlite3.Row) -> dict:
         detail = detail_text
 
     return {
-        "id": row["id"],
-        "action": row["action"],
+        "id": _row_value(row, "id"),
+        "user_id": _row_value(row, "user_id"),
+        "username": _row_value(row, "username"),
+        "user_email": _row_value(row, "user_email"),
+        "action": _row_value(row, "action"),
         "detail": detail,
-        "created_at": row["created_at"],
+        "created_at": _row_value(row, "created_at"),
     }
-
 
 def get_vehicle_state() -> dict:
     conn = get_db_connection()
@@ -1212,6 +1449,7 @@ def recognize_traffic_gesture(gesture: str) -> dict:
 @app.on_event("startup")
 def on_startup():
     init_db()
+    start_alert_notification_worker(DB_PATH)
 
 
 @app.get("/")
@@ -1246,48 +1484,98 @@ def self_check():
     }
 
 
-@app.get("/api/dashboard/summary")
-def get_dashboard_summary():
+def build_dashboard_summary(user_id: int | None = None) -> dict:
     conn = get_db_connection()
     cursor = conn.cursor()
-
     today = datetime.now().strftime("%Y-%m-%d")
 
+    where = ""
+    params: tuple = ()
+    if user_id is not None:
+        where = " WHERE user_id = ?"
+        params = (int(user_id),)
+
     total_records = cursor.execute(
-        "SELECT COUNT(*) AS count FROM recognition_records"
+        f"SELECT COUNT(*) AS count FROM recognition_records{where}",
+        params,
     ).fetchone()["count"]
 
-    today_records = cursor.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM recognition_records
-        WHERE created_at LIKE ?
-        """,
-        (f"{today}%",),
-    ).fetchone()["count"]
-
-    total_alerts = cursor.execute(
-        "SELECT COUNT(*) AS count FROM alert_events"
-    ).fetchone()["count"]
-
-    unresolved_alerts = cursor.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM alert_events
-        WHERE status = '未处理'
-        """
-    ).fetchone()["count"]
+    if user_id is None:
+        today_records = cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM recognition_records
+            WHERE created_at LIKE ?
+            """,
+            (f"{today}%",),
+        ).fetchone()["count"]
+        total_alerts = cursor.execute(
+            "SELECT COUNT(*) AS count FROM alert_events"
+        ).fetchone()["count"]
+        unresolved_alerts = cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM alert_events
+            WHERE status = '未处理'
+            """
+        ).fetchone()["count"]
+    else:
+        today_records = cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM recognition_records
+            WHERE user_id = ? AND created_at LIKE ?
+            """,
+            (int(user_id), f"{today}%"),
+        ).fetchone()["count"]
+        total_alerts = cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM alert_events
+            WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()["count"]
+        unresolved_alerts = cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM alert_events
+            WHERE user_id = ? AND status = '未处理'
+            """,
+            (int(user_id),),
+        ).fetchone()["count"]
 
     conn.close()
+    return {
+        "total_records": int(total_records),
+        "today_records": int(today_records),
+        "today_recognition_count": int(today_records),
+        "total_alerts": int(total_alerts),
+        "unresolved_alerts": int(unresolved_alerts),
+    }
 
+
+@app.get("/api/dashboard/summary")
+def get_dashboard_summary(
+    current_user: dict = Depends(get_current_user),
+):
+    summary = build_dashboard_summary(int(current_user["id"]))
     return {
         "status": "success",
-        "summary": {
-            "total_records": total_records,
-            "today_records": today_records,
-            "total_alerts": total_alerts,
-            "unresolved_alerts": unresolved_alerts,
-        }
+        "summary": summary,
+        **summary,
+    }
+
+
+@app.get("/api/admin/dashboard/summary")
+def get_admin_dashboard_summary(
+    admin_user: dict = Depends(require_admin),
+):
+    summary = build_dashboard_summary(None)
+    return {
+        "status": "success",
+        "summary": summary,
+        **summary,
     }
 
 
@@ -1374,6 +1662,7 @@ def process_stream_recognition_job(
     use_mock_frame: bool,
     log_action: str = "stream_frame_recognition",
 ) -> dict:
+    started = time.perf_counter()
     supported_tasks = {"plate", "traffic_gesture", "owner_gesture", "all"}
 
     if task_type not in supported_tasks:
@@ -1399,12 +1688,15 @@ def process_stream_recognition_job(
     )
 
     task_outputs: dict[str, dict] = {}
-
     for task in tasks_to_run:
         task_outputs[task] = recognize_stream_for_task(
             task_type=task,
             sampled_frames=sampled_frames,
         )
+
+    source_mode = "mock_frame" if use_mock_frame else (
+        source.get("kind") or _source_kind(source.get("url", ""))
+    )
 
     if task_type == "all":
         first_best = next(
@@ -1416,13 +1708,13 @@ def process_stream_recognition_job(
             raise HTTPException(status_code=500, detail="综合连续帧识别未得到有效结果")
 
         final_result = {
-            "model": "RTSP Frame Sampling + Multi-task Recognition",
+            "model": "Video Frame Sampling + Multi-task Recognition",
             "stream_strategy": "连续帧抽样 + 多任务分别融合",
             "source": {
                 "id": source["id"],
                 "name": source["name"],
                 "url": source["url"],
-                "mode": "mock_frame" if use_mock_frame else "real_rtsp",
+                "mode": source_mode,
             },
             "frame_count_requested": frame_count,
             "frames_read": frames_read,
@@ -1451,7 +1743,7 @@ def process_stream_recognition_job(
             "id": source["id"],
             "name": source["name"],
             "url": source["url"],
-            "mode": "mock_frame" if use_mock_frame else "real_rtsp",
+            "mode": source_mode,
         }
         final_result["frame_count_requested"] = frame_count
         final_result["frames_read"] = frames_read
@@ -1461,9 +1753,13 @@ def process_stream_recognition_job(
         best_output_image_url = best.get("output_image_url", "")
         best_saved_filename = best.get("saved_filename", "")
 
+    recognition_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    final_result["latency_ms"] = recognition_latency_ms
+    input_type = stream_input_type(source, use_mock_frame)
+
     record_id = insert_recognition_record(
         task_type=task_type,
-        input_type="rtsp_stream" if not use_mock_frame else "mock_stream",
+        input_type=input_type,
         original_filename=source["name"],
         saved_filename=best_saved_filename,
         image_url=best_image_url,
@@ -1476,6 +1772,8 @@ def process_stream_recognition_job(
         task_type=task_type,
         result=final_result,
     )
+
+    total_latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
     insert_operation_log(
         action=log_action,
@@ -1490,6 +1788,8 @@ def process_stream_recognition_job(
             "sample_interval": sample_interval,
             "sampled_frames": len(sampled_frames),
             "use_mock_frame": use_mock_frame,
+            "recognition_latency_ms": recognition_latency_ms,
+            "total_latency_ms": total_latency_ms,
         },
     )
 
@@ -1498,7 +1798,7 @@ def process_stream_recognition_job(
         "record_id": record_id,
         "alert_id": alert_id,
         "task_type": task_type,
-        "input_type": "rtsp_stream" if not use_mock_frame else "mock_stream",
+        "input_type": input_type,
         "source": source,
         "frame_count": frame_count,
         "frames_read": frames_read,
@@ -1506,6 +1806,8 @@ def process_stream_recognition_job(
         "sampled_frames": len(sampled_frames),
         "image_url": best_image_url,
         "output_image_url": best_output_image_url,
+        "recognition_latency_ms": recognition_latency_ms,
+        "latency_ms": total_latency_ms,
         "result": final_result,
     }
 
@@ -1718,131 +2020,233 @@ def get_monitor_state_snapshot() -> dict:
 @app.post("/api/stream/recognize")
 def recognize_stream_frames(request: StreamRecognizeRequest):
     """
-    沙盘视频连续帧识别接口：
-    1. 连接 RTSP 沙盘视频源，或使用模拟视频帧兜底
-    2. 连续读取 frame_count 帧
-    3. 每隔 sample_interval 帧抽样保存
-    4. 对抽样帧执行车牌 / 交警手势 / 车主手势识别
-    5. 对多帧结果做最高置信度或多数投票融合
-    6. 写入识别记录、告警记录、操作日志
-    """
-    supported_tasks = {"plate", "traffic_gesture", "owner_gesture", "all"}
+    统一视频连续帧识别接口。
 
-    if request.task_type not in supported_tasks:
+    支持：
+    - 预设 RTSP source_id
+    - custom_rtsp_url（兼容旧前端）
+    - custom_source_url（RTSP/HTTP/本地视频路径/摄像头编号）
+    - plate / traffic_gesture / owner_gesture / all
+    """
+    custom_source = request.custom_source_url or request.custom_rtsp_url
+    source = get_stream_source(request.source_id, custom_source)
+
+    return process_stream_recognition_job(
+        source=source,
+        task_type=request.task_type,
+        frame_count=request.frame_count,
+        sample_interval=request.sample_interval,
+        use_mock_frame=request.use_mock_frame,
+        log_action="stream_frame_recognition",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 本地视频上传识别：车牌 / 交警手势
+# ---------------------------------------------------------------------------
+
+VIDEO_UPLOAD_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024
+
+
+def _save_uploaded_recognition_video(file: UploadFile, task_type: str) -> dict:
+    """保存浏览器上传的视频，并进行扩展名、空文件和大小检查。"""
+    original_filename = file.filename or ""
+    suffix = Path(original_filename).suffix.lower()
+
+    if suffix not in VIDEO_UPLOAD_SUFFIXES:
         raise HTTPException(
             status_code=400,
-            detail="task_type 只支持 plate、traffic_gesture、owner_gesture、all",
+            detail="只支持 mp4、avi、mov、mkv、webm、m4v 格式视频",
         )
 
-    frame_count = clamp_int(request.frame_count, 5, 300)
-    sample_interval = clamp_int(request.sample_interval, 1, 60)
-    source = get_stream_source(request.source_id, request.custom_rtsp_url)
+    saved_filename = f"{task_type}_video_{uuid4().hex}{suffix}"
+    saved_path = UPLOAD_DIR / saved_filename
 
-    sampled_frames, frames_read = capture_stream_sampled_frames(
-        source=source,
-        frame_count=frame_count,
-        sample_interval=sample_interval,
-        use_mock_frame=request.use_mock_frame,
+    try:
+        with saved_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+
+    file_size = saved_path.stat().st_size if saved_path.exists() else 0
+
+    if file_size <= 0:
+        saved_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="上传的视频文件为空")
+
+    if file_size > MAX_VIDEO_UPLOAD_BYTES:
+        saved_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="视频文件不能超过 500MB")
+
+    return {
+        "original_filename": original_filename,
+        "saved_filename": saved_filename,
+        "saved_path": saved_path,
+        "video_url": f"/uploads/{saved_filename}",
+        "file_size_bytes": file_size,
+    }
+
+
+def _read_uploaded_video_metadata(video_path: Path) -> dict:
+    """读取上传视频的基础信息，无法解码时直接返回明确错误。"""
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        cap.release()
+        raise HTTPException(
+            status_code=400,
+            detail="视频文件无法打开，请确认文件未损坏且编码格式受 OpenCV/FFmpeg 支持",
+        )
+
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        cap.release()
+
+    duration_seconds = (
+        round(total_frames / fps, 3)
+        if fps > 0 and total_frames > 0
+        else None
     )
 
-    tasks_to_run = (
-        ["plate", "traffic_gesture", "owner_gesture"]
-        if request.task_type == "all"
-        else [request.task_type]
-    )
+    return {
+        "fps": round(fps, 3) if fps > 0 else 0,
+        "total_frames": total_frames,
+        "duration_seconds": duration_seconds,
+        "width": width,
+        "height": height,
+    }
 
-    task_outputs: dict[str, dict] = {}
 
-    for task in tasks_to_run:
-        task_outputs[task] = recognize_stream_for_task(
-            task_type=task,
+def process_uploaded_video_recognition(
+    file: UploadFile,
+    task_type: str,
+    frame_count: int,
+    sample_interval: int,
+    log_action: str = "uploaded_video_recognition",
+) -> dict:
+    """
+    上传视频连续帧识别主流程。
+
+    - plate：HyperLPR3 多车牌检测 + 多帧去重聚合
+    - traffic_gesture：MediaPipe Pose + 连续帧投票 + 手腕轨迹
+    """
+    if task_type not in {"plate", "traffic_gesture"}:
+        raise HTTPException(
+            status_code=400,
+            detail="task_type 只支持 plate 或 traffic_gesture",
+        )
+
+    frame_count = clamp_int(frame_count, 5, 300)
+    sample_interval = clamp_int(sample_interval, 1, 60)
+    started = time.perf_counter()
+
+    upload_info = _save_uploaded_recognition_video(file, task_type)
+    video_metadata = _read_uploaded_video_metadata(upload_info["saved_path"])
+
+    source = {
+        "id": f"uploaded_{task_type}",
+        "name": upload_info["original_filename"] or "上传视频",
+        "url": str(upload_info["saved_path"]),
+        "kind": "local_video",
+    }
+
+    try:
+        sampled_frames, frames_read = capture_stream_sampled_frames(
+            source=source,
+            frame_count=frame_count,
+            sample_interval=sample_interval,
+            use_mock_frame=False,
+        )
+
+        recognition_output = recognize_stream_for_task(
+            task_type=task_type,
             sampled_frames=sampled_frames,
         )
-
-    if request.task_type == "all":
-        first_best = next(
-            (output["best"] for output in task_outputs.values() if output.get("best")),
-            None,
+    except HTTPException:
+        insert_operation_log(
+            action=f"{log_action}_failed",
+            detail={
+                "task_type": task_type,
+                "original_filename": upload_info["original_filename"],
+                "saved_filename": upload_info["saved_filename"],
+            },
         )
-
-        if first_best is None:
-            raise HTTPException(status_code=500, detail="综合连续帧识别未得到有效结果")
-
-        final_result = {
-            "model": "RTSP Frame Sampling + Multi-task Recognition",
-            "stream_strategy": "连续帧抽样 + 多任务分别融合",
-            "source": {
-                "id": source["id"],
-                "name": source["name"],
-                "url": source["url"],
-                "mode": "mock_frame" if request.use_mock_frame else "real_rtsp",
+        raise
+    except Exception as error:
+        insert_operation_log(
+            action=f"{log_action}_failed",
+            detail={
+                "task_type": task_type,
+                "original_filename": upload_info["original_filename"],
+                "saved_filename": upload_info["saved_filename"],
+                "reason": str(error),
             },
-            "frame_count_requested": frame_count,
-            "frames_read": frames_read,
-            "sample_interval": sample_interval,
-            "sampled_frames": len(sampled_frames),
-            "tasks": {
-                task: {
-                    "best_frame_index": output["best"].get("frame_index"),
-                    "image_url": output["best"].get("image_url"),
-                    "output_image_url": output["best"].get("output_image_url"),
-                    "confidence": output["best"].get("confidence", 0),
-                    "result": output["final_result"],
-                }
-                for task, output in task_outputs.items()
-            },
-        }
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"上传视频识别失败：{error}",
+        ) from error
 
-        best_image_url = first_best.get("image_url", "")
-        best_output_image_url = first_best.get("output_image_url", "")
-        best_saved_filename = first_best.get("saved_filename", "")
-    else:
-        output = task_outputs[request.task_type]
-        best = output["best"]
-        final_result = output["final_result"]
-        final_result["source"] = {
-            "id": source["id"],
-            "name": source["name"],
-            "url": source["url"],
-            "mode": "mock_frame" if request.use_mock_frame else "real_rtsp",
-        }
-        final_result["frame_count_requested"] = frame_count
-        final_result["frames_read"] = frames_read
-        final_result["sample_interval"] = sample_interval
+    best = recognition_output["best"]
+    final_result = recognition_output["final_result"]
+    processing_latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
-        best_image_url = best.get("image_url", "")
-        best_output_image_url = best.get("output_image_url", "")
-        best_saved_filename = best.get("saved_filename", "")
+    final_result["source"] = {
+        "id": source["id"],
+        "name": source["name"],
+        "kind": "uploaded_video",
+        "video_url": upload_info["video_url"],
+    }
+    final_result["video_metadata"] = video_metadata
+    final_result["frame_count_requested"] = frame_count
+    final_result["frames_read"] = frames_read
+    final_result["sample_interval"] = sample_interval
+    final_result["sampled_frames"] = len(sampled_frames)
+    final_result["processing_latency_ms"] = processing_latency_ms
+    final_result["input_mode"] = "uploaded_video"
+
+    best_image_url = best.get("image_url", "")
+    best_output_image_url = best.get("output_image_url", "")
+    best_saved_filename = best.get("saved_filename", "")
 
     record_id = insert_recognition_record(
-        task_type=request.task_type,
-        input_type="rtsp_stream" if not request.use_mock_frame else "mock_stream",
-        original_filename=source["name"],
-        saved_filename=best_saved_filename,
-        image_url=best_image_url,
+        task_type=task_type,
+        input_type="video_upload",
+        original_filename=upload_info["original_filename"],
+        saved_filename=upload_info["saved_filename"],
+        image_url=upload_info["video_url"],
         output_image_url=best_output_image_url,
         result=final_result,
     )
 
     alert_id = maybe_create_stream_alert(
         record_id=record_id,
-        task_type=request.task_type,
+        task_type=task_type,
         result=final_result,
     )
 
     insert_operation_log(
-        action="stream_frame_recognition",
+        action=log_action,
         detail={
             "record_id": record_id,
             "alert_id": alert_id,
-            "source_id": source["id"],
-            "source_name": source["name"],
-            "task_type": request.task_type,
+            "task_type": task_type,
+            "original_filename": upload_info["original_filename"],
+            "saved_filename": upload_info["saved_filename"],
+            "file_size_bytes": upload_info["file_size_bytes"],
             "frame_count": frame_count,
             "frames_read": frames_read,
             "sample_interval": sample_interval,
             "sampled_frames": len(sampled_frames),
-            "use_mock_frame": request.use_mock_frame,
+            "processing_latency_ms": processing_latency_ms,
         },
     )
 
@@ -1850,17 +2254,72 @@ def recognize_stream_frames(request: StreamRecognizeRequest):
         "status": "success",
         "record_id": record_id,
         "alert_id": alert_id,
-        "task_type": request.task_type,
-        "input_type": "rtsp_stream" if not request.use_mock_frame else "mock_stream",
-        "source": source,
+        "task_type": task_type,
+        "input_type": "video_upload",
+        "original_filename": upload_info["original_filename"],
+        "saved_filename": upload_info["saved_filename"],
+        "video_url": upload_info["video_url"],
+        "file_size_bytes": upload_info["file_size_bytes"],
+        "video_metadata": video_metadata,
         "frame_count": frame_count,
         "frames_read": frames_read,
         "sample_interval": sample_interval,
         "sampled_frames": len(sampled_frames),
         "image_url": best_image_url,
         "output_image_url": best_output_image_url,
+        "best_saved_filename": best_saved_filename,
+        "processing_latency_ms": processing_latency_ms,
         "result": final_result,
     }
+
+
+@app.post("/api/video/recognize")
+def recognize_uploaded_video(
+    file: UploadFile = File(...),
+    task_type: str = Query("plate", description="plate 或 traffic_gesture"),
+    frame_count: int = Query(120, ge=5, le=300, description="最多连续读取的帧数"),
+    sample_interval: int = Query(5, ge=1, le=60, description="每隔多少帧识别一次"),
+):
+    """统一的本地视频上传识别接口。"""
+    return process_uploaded_video_recognition(
+        file=file,
+        task_type=task_type,
+        frame_count=frame_count,
+        sample_interval=sample_interval,
+        log_action="uploaded_video_recognition",
+    )
+
+
+@app.post("/api/plate/video")
+def recognize_plate_from_video(
+    file: UploadFile = File(...),
+    frame_count: int = Query(120, ge=5, le=300),
+    sample_interval: int = Query(5, ge=1, le=60),
+):
+    """上传本地视频并执行多车牌连续帧识别。"""
+    return process_uploaded_video_recognition(
+        file=file,
+        task_type="plate",
+        frame_count=frame_count,
+        sample_interval=sample_interval,
+        log_action="plate_video_recognition",
+    )
+
+
+@app.post("/api/gesture/traffic/video")
+def recognize_traffic_gesture_from_video(
+    file: UploadFile = File(...),
+    frame_count: int = Query(120, ge=5, le=300),
+    sample_interval: int = Query(3, ge=1, le=60),
+):
+    """上传本地视频并执行交警手势连续帧识别。"""
+    return process_uploaded_video_recognition(
+        file=file,
+        task_type="traffic_gesture",
+        frame_count=frame_count,
+        sample_interval=sample_interval,
+        log_action="traffic_gesture_video_recognition",
+    )
 
 
 @app.post("/api/monitor/start")
@@ -2477,81 +2936,449 @@ def build_alert_analysis(alerts: list[dict]) -> dict:
         "generated_at": now_text(),
     }
 
-@app.get("/api/records")
-def list_recognition_records(limit: int = 20):
-    if limit <= 0:
-        raise HTTPException(status_code=400, detail="limit 必须大于 0")
+RECORD_SELECT_COLUMNS = """
+    r.id,
+    r.user_id,
+    u.username,
+    u.email AS user_email,
+    r.task_type,
+    r.input_type,
+    r.original_filename,
+    r.saved_filename,
+    r.image_url,
+    r.output_image_url,
+    r.result_json,
+    r.created_at
+"""
 
+
+@app.get("/api/records")
+def list_recognition_records(
+    limit: int = Query(30, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    """普通用户仅查看自己的识别记录。"""
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute(
-        """
-        SELECT
-            id,
-            task_type,
-            input_type,
-            original_filename,
-            saved_filename,
-            image_url,
-            output_image_url,
-            result_json,
-            created_at
-        FROM recognition_records
-        ORDER BY id DESC
+        f"""
+        SELECT {RECORD_SELECT_COLUMNS}
+        FROM recognition_records r
+        LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.user_id = ?
+        ORDER BY r.id DESC
         LIMIT ?
         """,
-        (limit,),
+        (int(current_user["id"]), int(limit)),
     )
-
     rows = cursor.fetchall()
     conn.close()
-
     records = [row_to_record(row) for row in rows]
-
     return {
         "status": "success",
+        "scope": "current_user",
         "total": len(records),
         "records": records,
     }
 
 
-@app.get("/api/alerts")
-def list_alert_events(limit: int = 20):
-    if limit <= 0:
-        raise HTTPException(status_code=400, detail="limit 必须大于 0")
-
+@app.get("/api/records/{record_id}")
+def get_recognition_record_detail(
+    record_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """查看完整识别结果；普通用户只能访问自己的记录，管理员可访问全部。"""
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            id,
-            level,
-            event_type,
-            summary,
-            reason,
-            suggestion,
-            status,
-            related_record_id,
-            created_at
-        FROM alert_events
-        ORDER BY id DESC
-        LIMIT ?
+    row = cursor.execute(
+        f"""
+        SELECT {RECORD_SELECT_COLUMNS}
+        FROM recognition_records r
+        LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.id = ?
         """,
-        (limit,),
-    )
-
-    rows = cursor.fetchall()
+        (int(record_id),),
+    ).fetchone()
     conn.close()
 
-    alerts = [row_to_alert(row) for row in rows]
+    if row is None:
+        raise HTTPException(status_code=404, detail="识别记录不存在")
+
+    if (
+        current_user.get("role") != "admin"
+        and int(row["user_id"] or 0) != int(current_user["id"])
+    ):
+        raise HTTPException(status_code=403, detail="无权查看其他用户的识别记录")
 
     return {
         "status": "success",
+        "record": row_to_record(row),
+    }
+
+
+@app.get("/api/admin/records")
+def list_admin_recognition_records(
+    limit: int = Query(100, ge=1, le=500),
+    user_id: int | None = Query(None, ge=1),
+    task_type: str | None = Query(None),
+    keyword: str | None = Query(None),
+    admin_user: dict = Depends(require_admin),
+):
+    """管理员查看全部用户的识别记录。"""
+    conditions = []
+    params: list = []
+
+    if user_id is not None:
+        conditions.append("r.user_id = ?")
+        params.append(int(user_id))
+    if task_type:
+        conditions.append("r.task_type = ?")
+        params.append(task_type.strip())
+    if keyword:
+        keyword_value = f"%{keyword.strip()}%"
+        conditions.append(
+            "(u.username LIKE ? OR u.email LIKE ? OR r.original_filename LIKE ?)"
+        )
+        params.extend([keyword_value, keyword_value, keyword_value])
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT {RECORD_SELECT_COLUMNS}
+        FROM recognition_records r
+        LEFT JOIN users u ON u.id = r.user_id
+        {where_sql}
+        ORDER BY r.id DESC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    records = [row_to_record(row) for row in rows]
+    return {
+        "status": "success",
+        "scope": "admin_global",
+        "total": len(records),
+        "records": records,
+    }
+
+
+@app.get("/api/admin/users")
+def list_admin_users(
+    limit: int = Query(200, ge=1, le=500),
+    role: str | None = Query(None),
+    keyword: str | None = Query(None),
+    admin_user: dict = Depends(require_admin),
+):
+    """管理员用户列表，附带每个账号的业务数据数量。"""
+    conditions = []
+    params: list = []
+
+    if role:
+        normalized_role = role.strip().lower()
+        if normalized_role not in {"user", "admin"}:
+            raise HTTPException(status_code=400, detail="role 只支持 user 或 admin")
+        conditions.append("u.role = ?")
+        params.append(normalized_role)
+
+    if keyword:
+        keyword_value = f"%{keyword.strip()}%"
+        conditions.append("(u.username LIKE ? OR u.email LIKE ?)")
+        params.extend([keyword_value, keyword_value])
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT
+            u.id,
+            u.username,
+            u.email,
+            u.role,
+            u.created_at,
+            (
+                SELECT COUNT(*)
+                FROM recognition_records r
+                WHERE r.user_id = u.id
+            ) AS recognition_count,
+            (
+                SELECT COUNT(*)
+                FROM alert_events a
+                WHERE a.user_id = u.id
+            ) AS alert_count,
+            (
+                SELECT COUNT(*)
+                FROM operation_logs l
+                WHERE l.user_id = u.id
+            ) AS operation_count
+        FROM users u
+        {where_sql}
+        ORDER BY u.id ASC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    users = [
+        {
+            "id": int(row["id"]),
+            "username": row["username"],
+            "email": row["email"],
+            "role": row["role"],
+            "status": "正常",
+            "enabled": True,
+            "created_at": row["created_at"],
+            "recognition_count": int(row["recognition_count"] or 0),
+            "alert_count": int(row["alert_count"] or 0),
+            "operation_count": int(row["operation_count"] or 0),
+        }
+        for row in rows
+    ]
+    return {
+        "status": "success",
+        "total": len(users),
+        "users": users,
+    }
+
+
+ALERT_SELECT_COLUMNS = """
+    a.id,
+    a.user_id,
+    u.username,
+    u.email AS user_email,
+    a.level,
+    a.event_type,
+    a.summary,
+    a.reason,
+    a.suggestion,
+    a.status,
+    a.related_record_id,
+    a.created_at,
+    (
+        SELECT COUNT(*)
+        FROM alert_notifications n
+        WHERE n.alert_id = a.id
+    ) AS email_total_count,
+    (
+        SELECT COUNT(*)
+        FROM alert_notifications n
+        WHERE n.alert_id = a.id AND n.status = 'sent'
+    ) AS email_sent_count,
+    (
+        SELECT COUNT(*)
+        FROM alert_notifications n
+        WHERE n.alert_id = a.id AND n.status = 'failed'
+    ) AS email_failed_count,
+    (
+        SELECT COUNT(*)
+        FROM alert_notifications n
+        WHERE n.alert_id = a.id
+          AND n.status IN ('pending', 'processing', 'retrying')
+    ) AS email_pending_count,
+    (
+        SELECT COUNT(*)
+        FROM alert_notifications n
+        WHERE n.alert_id = a.id AND n.status = 'skipped'
+    ) AS email_skipped_count
+"""
+
+
+@app.get("/api/alerts")
+def list_alert_events(
+    limit: int = Query(30, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    """普通用户仅查看自己的告警记录。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT {ALERT_SELECT_COLUMNS}
+        FROM alert_events a
+        LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.user_id = ?
+        ORDER BY a.id DESC
+        LIMIT ?
+        """,
+        (int(current_user["id"]), int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    alerts = [row_to_alert(row) for row in rows]
+    return {
+        "status": "success",
+        "scope": "current_user",
         "total": len(alerts),
         "alerts": alerts,
+    }
+
+
+@app.get("/api/admin/alerts")
+def list_admin_alert_events(
+    limit: int = Query(100, ge=1, le=500),
+    user_id: int | None = Query(None, ge=1),
+    admin_user: dict = Depends(require_admin),
+):
+    conditions = []
+    params: list = []
+    if user_id is not None:
+        conditions.append("a.user_id = ?")
+        params.append(int(user_id))
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT {ALERT_SELECT_COLUMNS}
+        FROM alert_events a
+        LEFT JOIN users u ON u.id = a.user_id
+        {where_sql}
+        ORDER BY a.id DESC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    alerts = [row_to_alert(row) for row in rows]
+    return {
+        "status": "success",
+        "scope": "admin_global",
+        "total": len(alerts),
+        "alerts": alerts,
+    }
+
+
+
+def _ensure_alert_access(
+    alert_id: int,
+    current_user: dict,
+) -> sqlite3.Row:
+    conn = get_db_connection()
+    row = conn.execute(
+        """
+        SELECT id, user_id
+        FROM alert_events
+        WHERE id = ?
+        """,
+        (int(alert_id),),
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="告警不存在")
+
+    if (
+        current_user.get("role") != "admin"
+        and int(row["user_id"] or 0) != int(current_user["id"])
+    ):
+        raise HTTPException(status_code=403, detail="无权访问其他用户的告警通知")
+
+    return row
+
+
+@app.get("/api/alert-notifications/config")
+def get_alert_email_config(
+    current_user: dict = Depends(get_current_user),
+):
+    return {
+        "status": "success",
+        "config": alert_email_config_summary(),
+    }
+
+
+@app.get("/api/alert-notifications/{alert_id}")
+def get_alert_email_notifications(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    _ensure_alert_access(alert_id, current_user)
+
+    return {
+        "status": "success",
+        "alert_id": int(alert_id),
+        "summary": get_alert_notification_summary(DB_PATH, alert_id),
+        "notifications": list_alert_notifications(
+            DB_PATH,
+            alert_id=alert_id,
+            limit=100,
+        ),
+    }
+
+
+@app.post("/api/alert-notifications/{alert_id}/retry")
+def retry_alert_email(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    _ensure_alert_access(alert_id, current_user)
+    retry_count = retry_alert_notifications(DB_PATH, alert_id)
+
+    insert_operation_log(
+        action="retry_alert_email",
+        detail={
+            "alert_id": int(alert_id),
+            "retry_count": retry_count,
+        },
+    )
+
+    return {
+        "status": "success",
+        "alert_id": int(alert_id),
+        "retry_count": retry_count,
+        "message": (
+            "失败邮件已重新加入发送队列"
+            if retry_count > 0
+            else "当前没有可重试的失败邮件"
+        ),
+    }
+
+
+@app.get("/api/admin/alert-notifications")
+def list_admin_alert_email_notifications(
+    limit: int = Query(200, ge=1, le=1000),
+    admin_user: dict = Depends(require_admin),
+):
+    items = list_alert_notifications(
+        DB_PATH,
+        limit=limit,
+    )
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
+
+
+@app.post("/api/admin/alert-notifications/retry-failed")
+def retry_all_failed_alert_emails(
+    admin_user: dict = Depends(require_admin),
+):
+    retry_count = retry_all_failed_notifications(DB_PATH)
+
+    insert_operation_log(
+        action="retry_all_failed_alert_emails",
+        detail={
+            "retry_count": retry_count,
+        },
+    )
+
+    return {
+        "status": "success",
+        "retry_count": retry_count,
+        "message": (
+            f"已重新排队 {retry_count} 封失败邮件"
+            if retry_count > 0
+            else "当前没有失败邮件"
+        ),
     }
 
 
@@ -2609,48 +3436,32 @@ def analyze_alert_events(limit: int = 100):
     }
 
 
-@app.post("/api/alerts/test")
-def create_test_alert():
-    alert_id = insert_alert_event(
-        level="warning",
-        event_type="manual_test",
-        summary="测试告警：识别服务运行状态检查",
-        reason="用户手动触发测试告警，用于验证告警中心、告警记录和前端展示功能。",
-        suggestion="确认前端告警中心是否能正常刷新并显示该事件。",
-        related_record_id=None,
-    )
-
-    insert_operation_log(
-        action="create_test_alert",
-        detail={
-            "alert_id": alert_id,
-        },
-    )
-
-    return {
-        "status": "success",
-        "alert_id": alert_id,
-        "message": "测试告警已生成",
-    }
-
-
 @app.post("/api/alerts/{alert_id}/resolve")
-def resolve_alert(alert_id: int):
+def resolve_alert(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
     conn = get_db_connection()
     cursor = conn.cursor()
-
     existing = cursor.execute(
         """
-        SELECT id
+        SELECT id, user_id
         FROM alert_events
         WHERE id = ?
         """,
-        (alert_id,),
+        (int(alert_id),),
     ).fetchone()
 
     if existing is None:
         conn.close()
         raise HTTPException(status_code=404, detail="告警不存在")
+
+    if (
+        current_user.get("role") != "admin"
+        and int(existing["user_id"] or 0) != int(current_user["id"])
+    ):
+        conn.close()
+        raise HTTPException(status_code=403, detail="无权处理其他用户的告警")
 
     cursor.execute(
         """
@@ -2658,22 +3469,19 @@ def resolve_alert(alert_id: int):
         SET status = '已处理'
         WHERE id = ?
         """,
-        (alert_id,),
+        (int(alert_id),),
     )
-
     conn.commit()
     conn.close()
 
     insert_operation_log(
         action="resolve_alert",
-        detail={
-            "alert_id": alert_id,
-        },
+        detail={"alert_id": int(alert_id)},
     )
 
     return {
         "status": "success",
-        "alert_id": alert_id,
+        "alert_id": int(alert_id),
         "message": "告警已标记为已处理",
     }
 
@@ -2955,38 +3763,83 @@ async def alert_sse_stream():
     )
 
 
-@app.get("/api/logs")
-def list_operation_logs(limit: int = 30):
-    if limit <= 0:
-        raise HTTPException(status_code=400, detail="limit 必须大于 0")
+LOG_SELECT_COLUMNS = """
+    l.id,
+    l.user_id,
+    u.username,
+    u.email AS user_email,
+    l.action,
+    l.detail,
+    l.created_at
+"""
 
+
+@app.get("/api/logs")
+def list_operation_logs(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    """普通用户仅查看自己的操作日志。"""
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute(
-        """
-        SELECT
-            id,
-            action,
-            detail,
-            created_at
-        FROM operation_logs
-        ORDER BY id DESC
+        f"""
+        SELECT {LOG_SELECT_COLUMNS}
+        FROM operation_logs l
+        LEFT JOIN users u ON u.id = l.user_id
+        WHERE l.user_id = ?
+        ORDER BY l.id DESC
         LIMIT ?
         """,
-        (limit,),
+        (int(current_user["id"]), int(limit)),
     )
-
     rows = cursor.fetchall()
     conn.close()
-
     logs = [row_to_log(row) for row in rows]
-
     return {
         "status": "success",
+        "scope": "current_user",
         "total": len(logs),
         "logs": logs,
     }
+
+
+@app.get("/api/admin/logs")
+def list_admin_operation_logs(
+    limit: int = Query(100, ge=1, le=500),
+    user_id: int | None = Query(None, ge=1),
+    admin_user: dict = Depends(require_admin),
+):
+    conditions = []
+    params: list = []
+    if user_id is not None:
+        conditions.append("l.user_id = ?")
+        params.append(int(user_id))
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT {LOG_SELECT_COLUMNS}
+        FROM operation_logs l
+        LEFT JOIN users u ON u.id = l.user_id
+        {where_sql}
+        ORDER BY l.id DESC
+        LIMIT ?
+        """,
+        (*params, int(limit)),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    logs = [row_to_log(row) for row in rows]
+    return {
+        "status": "success",
+        "scope": "admin_global",
+        "total": len(logs),
+        "logs": logs,
+    }
+
 
 # OWNER_GESTURE_CONTROL_PATCH_V2
 # 车主手势控车增强：车辆状态映射 + 上传视频识别接口
@@ -5224,7 +6077,93 @@ import numpy as _oc_np
 _OC_MP = None
 _OC_HANDS = None
 _OC_HISTORY = []
-_OC_HISTORY_MAX_SECONDS = 2.5
+_OC_HISTORY_MAX_SECONDS = 3.0
+
+# 静态手势至少连续两帧稳定后才触发控制，降低误操作。
+_OC_STABLE_TRACK = {
+    "gesture": "",
+    "count": 0,
+}
+_OC_STATIC_STABLE_FRAMES = 2
+
+# 同一控制动作设置冷却时间，避免 400ms 摄像头轮询导致音量连续暴增。
+_OC_ACTION_COOLDOWN_SECONDS = 1.2
+_OC_LAST_ACTION_AT: dict[str, float] = {}
+
+_OC_FUNCTION_ORDER = [
+    "home",
+    "media",
+    "climate",
+    "phone",
+    "navigation",
+]
+
+_OC_GESTURE_MAPPING_VERSION = "owner_gesture_v2_teacher_aligned"
+_OC_GESTURE_MAPPING = [
+    {
+        "gesture": "open_palm",
+        "gesture_name": "手掌张开",
+        "action": "wake_system",
+        "description": "启动/唤醒系统",
+        "type": "static",
+    },
+    {
+        "gesture": "fist",
+        "gesture_name": "握拳",
+        "action": "confirm",
+        "description": "确认/执行",
+        "type": "static",
+    },
+    {
+        "gesture": "circle_clockwise",
+        "gesture_name": "单指顺时针画圈",
+        "action": "volume_up",
+        "description": "调高音量",
+        "type": "dynamic",
+    },
+    {
+        "gesture": "circle_counterclockwise",
+        "gesture_name": "单指逆时针画圈",
+        "action": "volume_down",
+        "description": "调低音量",
+        "type": "dynamic",
+    },
+    {
+        "gesture": "swipe_left",
+        "gesture_name": "向左滑动",
+        "action": "previous_function",
+        "description": "切换到上一功能",
+        "type": "dynamic",
+    },
+    {
+        "gesture": "swipe_right",
+        "gesture_name": "向右滑动",
+        "action": "next_function",
+        "description": "切换到下一功能",
+        "type": "dynamic",
+    },
+    {
+        "gesture": "thumb_up",
+        "gesture_name": "拇指向上",
+        "action": "answer_call",
+        "description": "接听电话",
+        "type": "static",
+    },
+    {
+        "gesture": "thumb_down",
+        "gesture_name": "拇指向下",
+        "action": "hang_up_call",
+        "description": "挂断电话",
+        "type": "static",
+    },
+    {
+        "gesture": "wave",
+        "gesture_name": "挥手",
+        "action": "back_home",
+        "description": "返回主页",
+        "type": "dynamic",
+    },
+]
 
 _OC_VEHICLE_STATE = {
     "system_awake": False,
@@ -5232,6 +6171,8 @@ _OC_VEHICLE_STATE = {
     "volume": 50,
     "temperature": 24,
     "phone_status": "空闲",
+    "last_action": "none",
+    "last_description": "未触发车辆控制",
     "updated_at": "",
 }
 
@@ -5312,11 +6253,13 @@ def _oc_finger_extended(lms, tip: int, pip: int, mcp: int, wrist: int = 0) -> bo
     return bool((y_extended and distance_extended) or (distance_extended and long_enough and tip_lm.y < mcp_lm.y + 0.02))
 
 
-def _oc_detect_wave(hand_center: dict, static_gesture: str) -> bool:
-    """
-    通过最近 2.5 秒手掌中心点的水平往返运动检测挥手。
-    挥手通常静态形态像 open_palm，所以必须用连续帧轨迹判断。
-    """
+def _oc_reset_tracking() -> None:
+    _OC_HISTORY.clear()
+    _OC_STABLE_TRACK["gesture"] = ""
+    _OC_STABLE_TRACK["count"] = 0
+
+
+def _oc_update_history(hand_center: dict, static_gesture: str) -> None:
     now = _oc_time.time()
 
     _OC_HISTORY.append({
@@ -5329,30 +6272,243 @@ def _oc_detect_wave(hand_center: dict, static_gesture: str) -> bool:
     while _OC_HISTORY and now - _OC_HISTORY[0]["t"] > _OC_HISTORY_MAX_SECONDS:
         _OC_HISTORY.pop(0)
 
-    if len(_OC_HISTORY) < 4:
-        return False
 
-    xs = [item["x"] for item in _OC_HISTORY]
-    amplitude = max(xs) - min(xs)
+def _oc_recent_history(seconds: float) -> list[dict]:
+    if not _OC_HISTORY:
+        return []
 
-    if amplitude < 0.16:
-        return False
+    now = _OC_HISTORY[-1]["t"]
+    return [
+        item
+        for item in _OC_HISTORY
+        if now - float(item.get("t") or now) <= seconds
+    ]
 
-    signs = []
-    for i in range(1, len(xs)):
-        dx = xs[i] - xs[i - 1]
-        if abs(dx) < 0.025:
+
+def _oc_direction_change_count(values: list[float], min_delta: float = 0.02) -> int:
+    signs: list[int] = []
+
+    for index in range(1, len(values)):
+        delta = values[index] - values[index - 1]
+        if abs(delta) < min_delta:
             continue
-        signs.append(1 if dx > 0 else -1)
+        signs.append(1 if delta > 0 else -1)
 
-    changes = 0
-    for i in range(1, len(signs)):
-        if signs[i] != signs[i - 1]:
-            changes += 1
+    return sum(
+        1
+        for index in range(1, len(signs))
+        if signs[index] != signs[index - 1]
+    )
 
-    open_like_count = sum(1 for item in _OC_HISTORY if item.get("gesture") in {"open_palm", "wave"})
 
-    return changes >= 1 and open_like_count >= 2
+def _oc_detect_wave() -> bool:
+    """
+    张开手掌做水平往返运动。
+    与单向滑动的区别：挥手需要至少两次方向变化。
+    """
+    history = _oc_recent_history(2.2)
+    if len(history) < 5:
+        return False
+
+    open_like = [
+        item
+        for item in history
+        if item.get("gesture") in {"open_palm", "wave"}
+    ]
+    if len(open_like) < 4:
+        return False
+
+    xs = [float(item["x"]) for item in open_like]
+    ys = [float(item["y"]) for item in open_like]
+
+    return (
+        max(xs) - min(xs) >= 0.18
+        and max(ys) - min(ys) <= 0.28
+        and _oc_direction_change_count(xs, min_delta=0.025) >= 2
+    )
+
+
+def _oc_detect_swipe() -> str | None:
+    """
+    张开手掌做一次明显的单向水平移动：
+    - 向左滑动：切换到上一功能
+    - 向右滑动：切换到下一功能
+    """
+    history = _oc_recent_history(1.25)
+    if len(history) < 4:
+        return None
+
+    open_like = [
+        item
+        for item in history
+        if item.get("gesture") in {"open_palm", "swipe_left", "swipe_right"}
+    ]
+    if len(open_like) < 3:
+        return None
+
+    xs = [float(item["x"]) for item in open_like]
+    ys = [float(item["y"]) for item in open_like]
+    displacement = xs[-1] - xs[0]
+
+    if abs(displacement) < 0.22:
+        return None
+    if max(ys) - min(ys) > 0.18:
+        return None
+
+    direction = 1 if displacement > 0 else -1
+    directional_steps = 0
+    significant_steps = 0
+
+    for index in range(1, len(xs)):
+        delta = xs[index] - xs[index - 1]
+        if abs(delta) < 0.015:
+            continue
+        significant_steps += 1
+        if (delta > 0 and direction > 0) or (delta < 0 and direction < 0):
+            directional_steps += 1
+
+    if significant_steps == 0:
+        return None
+
+    consistency = directional_steps / significant_steps
+    if consistency < 0.75:
+        return None
+
+    return "swipe_right" if displacement > 0 else "swipe_left"
+
+
+def _oc_detect_circle() -> str | None:
+    """
+    单指画圈检测。
+
+    使用最近轨迹相对于轨迹中心的累计转角：
+    - 图像坐标 y 轴向下，因此累计角为正时近似顺时针。
+    - 轨迹需要同时具备横向和纵向跨度，避免把直线移动误判为画圈。
+    """
+    history = _oc_recent_history(2.8)
+    one_items = [
+        item
+        for item in history
+        if item.get("gesture") in {"one", "circle_clockwise", "circle_counterclockwise"}
+    ]
+
+    if len(one_items) < 6:
+        return None
+
+    xs = [float(item["x"]) for item in one_items]
+    ys = [float(item["y"]) for item in one_items]
+
+    if max(xs) - min(xs) < 0.10 or max(ys) - min(ys) < 0.10:
+        return None
+
+    center_x = sum(xs) / len(xs)
+    center_y = sum(ys) / len(ys)
+
+    angles: list[float] = []
+    for x, y in zip(xs, ys):
+        radius = _oc_math.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
+        if radius < 0.035:
+            continue
+        angles.append(_oc_math.atan2(y - center_y, x - center_x))
+
+    if len(angles) < 5:
+        return None
+
+    total_angle = 0.0
+    for index in range(1, len(angles)):
+        delta = angles[index] - angles[index - 1]
+        while delta > _oc_math.pi:
+            delta -= 2 * _oc_math.pi
+        while delta < -_oc_math.pi:
+            delta += 2 * _oc_math.pi
+
+        if abs(delta) <= 1.45:
+            total_angle += delta
+
+    if abs(total_angle) < 4.0:
+        return None
+
+    start_end_distance = _oc_math.sqrt(
+        (xs[-1] - xs[0]) ** 2
+        + (ys[-1] - ys[0]) ** 2
+    )
+    if start_end_distance > 0.22:
+        return None
+
+    return (
+        "circle_clockwise"
+        if total_angle > 0
+        else "circle_counterclockwise"
+    )
+
+
+def _oc_detect_dynamic_gesture(
+    hand_center: dict,
+    static_gesture: str,
+) -> tuple[str | None, str | None, float]:
+    _oc_update_history(hand_center, static_gesture)
+
+    circle = _oc_detect_circle()
+    if circle:
+        return (
+            circle,
+            "单指顺时针画圈" if circle == "circle_clockwise" else "单指逆时针画圈",
+            0.88,
+        )
+
+    if _oc_detect_wave():
+        return "wave", "挥手", 0.87
+
+    swipe = _oc_detect_swipe()
+    if swipe:
+        return (
+            swipe,
+            "向左滑动" if swipe == "swipe_left" else "向右滑动",
+            0.86,
+        )
+
+    return None, None, 0.0
+
+
+def _oc_confirm_gesture(
+    gesture: str,
+    *,
+    dynamic: bool = False,
+) -> tuple[bool, int, int]:
+    if gesture in {"", "unknown", "no_hand", "one", "two", "ok"}:
+        _OC_STABLE_TRACK["gesture"] = gesture
+        _OC_STABLE_TRACK["count"] = 0
+        return False, 0, _OC_STATIC_STABLE_FRAMES
+
+    if dynamic:
+        _OC_STABLE_TRACK["gesture"] = gesture
+        _OC_STABLE_TRACK["count"] = 1
+        return True, 1, 1
+
+    if _OC_STABLE_TRACK.get("gesture") == gesture:
+        _OC_STABLE_TRACK["count"] = int(_OC_STABLE_TRACK.get("count") or 0) + 1
+    else:
+        _OC_STABLE_TRACK["gesture"] = gesture
+        _OC_STABLE_TRACK["count"] = 1
+
+    stable_count = int(_OC_STABLE_TRACK["count"])
+    return (
+        stable_count >= _OC_STATIC_STABLE_FRAMES,
+        stable_count,
+        _OC_STATIC_STABLE_FRAMES,
+    )
+
+
+def _oc_next_function(direction: int) -> str:
+    current = _OC_VEHICLE_STATE.get("current_function") or "home"
+
+    try:
+        index = _OC_FUNCTION_ORDER.index(current)
+    except ValueError:
+        index = 0
+
+    index = (index + direction) % len(_OC_FUNCTION_ORDER)
+    return _OC_FUNCTION_ORDER[index]
 
 
 def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
@@ -5449,61 +6605,164 @@ def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
     return "unknown", "未识别手势", 0.45, features
 
 
-def _oc_apply_vehicle_action(gesture: str) -> tuple[str, str, dict]:
+def _oc_apply_vehicle_action(
+    gesture: str,
+    *,
+    confirmed: bool,
+    dynamic: bool,
+    stable_count: int,
+    required_stable_frames: int,
+) -> tuple[str, str, dict, bool, int]:
     state = _OC_VEHICLE_STATE
-    now = _oc_now_text()
+    now = _oc_time.time()
+    now_text = _oc_now_text()
 
     action = "none"
     description = "未触发车辆控制"
+    triggered = False
+    cooldown_remaining_ms = 0
+
+    if not confirmed:
+        if gesture == "one":
+            description = "保持单指并画圈以调节音量"
+        elif gesture in {"two", "ok"}:
+            description = "该静态手势不执行车辆控制"
+        elif gesture not in {"", "unknown", "no_hand"}:
+            description = (
+                f"等待手势稳定确认 "
+                f"({stable_count}/{required_stable_frames})"
+            )
+
+        state["last_action"] = action
+        state["last_description"] = description
+        state["updated_at"] = now_text
+        return action, description, dict(state), triggered, cooldown_remaining_ms
+
+    action_map = {
+        "open_palm": "wake_system",
+        "fist": "confirm",
+        "circle_clockwise": "volume_up",
+        "circle_counterclockwise": "volume_down",
+        "swipe_left": "previous_function",
+        "swipe_right": "next_function",
+        "thumb_up": "answer_call",
+        "thumb_down": "hang_up_call",
+        "wave": "back_home",
+        # 兼容旧版 OK 手势，但不作为教师要求的六类主手势。
+        "ok": "confirm",
+    }
+
+    action = action_map.get(gesture, "none")
+    if action == "none":
+        state["last_action"] = action
+        state["last_description"] = description
+        state["updated_at"] = now_text
+        return action, description, dict(state), triggered, cooldown_remaining_ms
+
+    last_time = float(_OC_LAST_ACTION_AT.get(action) or 0)
+    elapsed = now - last_time
+
+    if elapsed < _OC_ACTION_COOLDOWN_SECONDS:
+        cooldown_remaining_ms = max(
+            0,
+            int(round((_OC_ACTION_COOLDOWN_SECONDS - elapsed) * 1000)),
+        )
+        action = "cooldown"
+        description = f"动作冷却中，还需等待约 {cooldown_remaining_ms} ms"
+        state["last_action"] = action
+        state["last_description"] = description
+        state["updated_at"] = now_text
+        return action, description, dict(state), triggered, cooldown_remaining_ms
+
+    state["system_awake"] = True
 
     if gesture == "open_palm":
-        state["system_awake"] = True
         state["current_function"] = "home"
-        action = "wake_system"
-        description = "系统已唤醒"
+        description = "系统已启动并唤醒"
 
     elif gesture in {"fist", "ok"}:
-        state["system_awake"] = True
-        action = "confirm"
-        description = "已确认当前操作"
+        description = "已确认并执行当前功能"
 
-    elif gesture == "one":
-        state["system_awake"] = True
+    elif gesture == "circle_clockwise":
+        state["current_function"] = "media"
         state["volume"] = min(100, int(state.get("volume", 50)) + 5)
-        state["current_function"] = "media"
-        action = "volume_up"
-        description = "音量已调高"
+        description = f"音量已调高至 {state['volume']}"
 
-    elif gesture == "two":
-        state["system_awake"] = True
-        state["volume"] = max(0, int(state.get("volume", 50)) - 5)
+    elif gesture == "circle_counterclockwise":
         state["current_function"] = "media"
-        action = "volume_down"
-        description = "音量已调低"
+        state["volume"] = max(0, int(state.get("volume", 50)) - 5)
+        description = f"音量已调低至 {state['volume']}"
+
+    elif gesture == "swipe_left":
+        state["current_function"] = _oc_next_function(-1)
+        description = f"已切换到上一功能：{state['current_function']}"
+
+    elif gesture == "swipe_right":
+        state["current_function"] = _oc_next_function(1)
+        description = f"已切换到下一功能：{state['current_function']}"
 
     elif gesture == "thumb_up":
-        state["system_awake"] = True
         state["current_function"] = "phone"
         state["phone_status"] = "通话中"
-        action = "answer_call"
         description = "已接听电话"
 
     elif gesture == "thumb_down":
-        state["system_awake"] = True
         state["current_function"] = "phone"
         state["phone_status"] = "已挂断"
-        action = "hang_up_call"
         description = "已挂断电话"
 
     elif gesture == "wave":
-        state["system_awake"] = True
         state["current_function"] = "home"
-        action = "back_home"
         description = "已返回主页"
 
-    state["updated_at"] = now
+    _OC_LAST_ACTION_AT[action] = now
+    state["last_action"] = action
+    state["last_description"] = description
+    state["updated_at"] = now_text
+    triggered = True
 
-    return action, description, dict(state)
+    if dynamic:
+        _OC_HISTORY.clear()
+
+    return action, description, dict(state), triggered, cooldown_remaining_ms
+
+
+@app.get("/api/gesture/owner/mapping")
+def get_owner_gesture_mapping():
+    return {
+        "status": "success",
+        "version": _OC_GESTURE_MAPPING_VERSION,
+        "minimum_supported_gestures": 6,
+        "items": _OC_GESTURE_MAPPING,
+        "vehicle_state": dict(_OC_VEHICLE_STATE),
+        "misoperation_suppression": {
+            "static_stable_frames": _OC_STATIC_STABLE_FRAMES,
+            "action_cooldown_seconds": _OC_ACTION_COOLDOWN_SECONDS,
+            "dynamic_trajectory_window_seconds": _OC_HISTORY_MAX_SECONDS,
+        },
+    }
+
+
+@app.post("/api/gesture/owner/reset-state")
+def reset_owner_vehicle_state():
+    _OC_VEHICLE_STATE.update({
+        "system_awake": False,
+        "current_function": "home",
+        "volume": 50,
+        "temperature": 24,
+        "phone_status": "空闲",
+        "last_action": "none",
+        "last_description": "车辆交互状态已重置",
+        "updated_at": _oc_now_text(),
+    })
+    _OC_LAST_ACTION_AT.clear()
+    _oc_reset_tracking()
+
+    return {
+        "status": "success",
+        "message": "车主手势控制状态已重置",
+        "vehicle_state": dict(_OC_VEHICLE_STATE),
+    }
 
 
 @app.post("/api/gesture/owner/camera-frame")
@@ -5547,7 +6806,7 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
         annotated = image_bgr.copy()
 
         if not result.multi_hand_landmarks:
-            _OC_HISTORY.clear()
+            _oc_reset_tracking()
             latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
             _oc_cv2.imwrite(str(output_path), annotated)
 
@@ -5585,15 +6844,34 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
             "y": round(sum(ys) / len(ys), 4),
         }
 
-        gesture = static_gesture
-        gesture_name = static_name
+        dynamic_gesture, dynamic_name, dynamic_confidence = _oc_detect_dynamic_gesture(
+            hand_center,
+            static_gesture,
+        )
 
-        if _oc_detect_wave(hand_center, static_gesture):
-            gesture = "wave"
-            gesture_name = "挥手"
-            confidence = 0.86
+        gesture = dynamic_gesture or static_gesture
+        gesture_name = dynamic_name or static_name
+        if dynamic_gesture:
+            confidence = dynamic_confidence
 
-        action, description, vehicle_state = _oc_apply_vehicle_action(gesture)
+        confirmed, stable_count, required_stable_frames = _oc_confirm_gesture(
+            gesture,
+            dynamic=bool(dynamic_gesture),
+        )
+
+        (
+            action,
+            description,
+            vehicle_state,
+            triggered,
+            cooldown_remaining_ms,
+        ) = _oc_apply_vehicle_action(
+            gesture,
+            confirmed=confirmed,
+            dynamic=bool(dynamic_gesture),
+            stable_count=stable_count,
+            required_stable_frames=required_stable_frames,
+        )
 
         if _OC_MP is not None:
             _OC_MP.solutions.drawing_utils.draw_landmarks(
@@ -5631,9 +6909,16 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
                 "hand_center": hand_center,
                 "action": action,
                 "description": description,
+                "triggered": triggered,
+                "stable_count": stable_count,
+                "required_stable_frames": required_stable_frames,
+                "dynamic_gesture": dynamic_gesture or "",
+                "cooldown_remaining_ms": cooldown_remaining_ms,
+                "gesture_mapping_version": _OC_GESTURE_MAPPING_VERSION,
+                "supported_gestures": _OC_GESTURE_MAPPING,
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
-                "dynamic_policy": "连续帧手掌中心轨迹判断 wave",
+                "dynamic_policy": "连续帧轨迹识别画圈、左右滑动和挥手；静态手势连续两帧确认",
             },
         }
 
@@ -5679,7 +6964,7 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
         latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
 
         if not result.multi_hand_landmarks:
-            _OC_HISTORY.clear()
+            _oc_reset_tracking()
 
             return {
                 "status": "success",
@@ -5714,15 +6999,34 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
             "y": round(sum(ys) / len(ys), 4),
         }
 
-        gesture = static_gesture
-        gesture_name = static_name
+        dynamic_gesture, dynamic_name, dynamic_confidence = _oc_detect_dynamic_gesture(
+            hand_center,
+            static_gesture,
+        )
 
-        if _oc_detect_wave(hand_center, static_gesture):
-            gesture = "wave"
-            gesture_name = "挥手"
-            confidence = 0.86
+        gesture = dynamic_gesture or static_gesture
+        gesture_name = dynamic_name or static_name
+        if dynamic_gesture:
+            confidence = dynamic_confidence
 
-        action, description, vehicle_state = _oc_apply_vehicle_action(gesture)
+        confirmed, stable_count, required_stable_frames = _oc_confirm_gesture(
+            gesture,
+            dynamic=bool(dynamic_gesture),
+        )
+
+        (
+            action,
+            description,
+            vehicle_state,
+            triggered,
+            cooldown_remaining_ms,
+        ) = _oc_apply_vehicle_action(
+            gesture,
+            confirmed=confirmed,
+            dynamic=bool(dynamic_gesture),
+            stable_count=stable_count,
+            required_stable_frames=required_stable_frames,
+        )
 
         return {
             "status": "success",
@@ -5746,10 +7050,17 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
                 "hand_center": hand_center,
                 "action": action,
                 "description": description,
+                "triggered": triggered,
+                "stable_count": stable_count,
+                "required_stable_frames": required_stable_frames,
+                "dynamic_gesture": dynamic_gesture or "",
+                "cooldown_remaining_ms": cooldown_remaining_ms,
+                "gesture_mapping_version": _OC_GESTURE_MAPPING_VERSION,
+                "supported_gestures": _OC_GESTURE_MAPPING,
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
                 "fast_mode": True,
-                "dynamic_policy": "快速模式：连续帧手掌中心轨迹判断 wave，不返回骨架图",
+                "dynamic_policy": "快速模式：连续帧轨迹识别画圈、左右滑动和挥手；静态手势连续两帧确认",
             },
         }
 
@@ -5958,10 +7269,15 @@ def _rfm_decide(evidence: dict) -> dict:
         if owner_gesture in {"thumb_up", "thumb_down"} or owner_action in {"answer_call", "hang_up_call"}:
             score += 15
             reasons.append("车主摄像头识别到电话相关手势，驾驶注意力存在分散风险。")
-        elif owner_gesture in {"open_palm", "wave"}:
+        elif owner_gesture in {"open_palm", "wave", "swipe_left", "swipe_right"}:
             score += 8
             reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车载交互。")
-        elif owner_gesture in {"fist", "one", "two", "ok", "circle"}:
+        elif owner_gesture in {
+            "fist",
+            "ok",
+            "circle_clockwise",
+            "circle_counterclockwise",
+        }:
             score += 10
             reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车辆控制动作。")
         elif owner_gesture == "no_hand":

@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="admin-shell">
     <aside class="admin-sidebar">
       <div class="admin-brand">
@@ -96,7 +96,7 @@
             <div>
               <p>USER MANAGEMENT</p>
               <h2>用户与角色</h2>
-              <span>管理员负责查看账号、角色和使用状态。用户数据隔离仍需后端增加 user_id 过滤。</span>
+              <span>查看系统账号、角色及每个用户的识别、告警和操作数据数量。</span>
             </div>
           </header>
 
@@ -114,6 +114,9 @@
                   <th>邮箱</th>
                   <th>角色</th>
                   <th>状态</th>
+                  <th>识别记录</th>
+                  <th>告警</th>
+                  <th>操作日志</th>
                   <th>注册时间</th>
                 </tr>
               </thead>
@@ -124,6 +127,9 @@
                   <td>{{ item.email || '-' }}</td>
                   <td><span class="role-badge">{{ item.role || item.user_role || 'user' }}</span></td>
                   <td>{{ item.status || (item.enabled === false ? '已禁用' : '正常') }}</td>
+                  <td>{{ item.recognition_count ?? 0 }}</td>
+                  <td>{{ item.alert_count ?? 0 }}</td>
+                  <td>{{ item.operation_count ?? 0 }}</td>
                   <td>{{ item.created_at || '-' }}</td>
                 </tr>
               </tbody>
@@ -149,19 +155,25 @@
         <th>ID</th>
         <th>用户</th>
         <th>任务</th>
+        <th>识别结果</th>
         <th>输入</th>
         <th>文件</th>
         <th>时间</th>
+        <th>操作</th>
       </tr>
     </thead>
     <tbody>
       <tr v-for="item in records" :key="item.id || item.record_id">
         <td>{{ item.id || item.record_id }}</td>
-        <td>{{ item.username || item.user_id || '-' }}</td>
-        <td>{{ item.task_type || '-' }}</td>
+        <td>{{ item.username || item.user_id || '系统任务' }}</td>
+        <td>{{ taskLabel(item.task_type) }}</td>
+        <td class="admin-record-summary">{{ recordResultSummary(item) }}</td>
         <td>{{ item.input_type || '-' }}</td>
         <td>{{ item.original_filename || item.saved_filename || '-' }}</td>
         <td>{{ item.created_at || item.created_time || '-' }}</td>
+        <td>
+          <button class="table-button" @click="openRecordDetail(item)">查看结果</button>
+        </td>
       </tr>
     </tbody>
   </table>
@@ -208,7 +220,19 @@
           <header>
             <div>
               <p>ALERT AGENT</p>
-              <h2>告警事件与处理状态</h2>
+              <h2>告警事件、邮件通知与处理状态</h2>
+              <span>
+                所有告警均自动通知所属用户，并同步发送给所有有效管理员邮箱。
+              </span>
+            </div>
+            <div class="header-action-group">
+              <button
+                class="light-button"
+                :disabled="retryingAllAlertEmails"
+                @click="retryAllAlertEmails"
+              >
+                {{ retryingAllAlertEmails ? '重试中...' : '重试全部失败邮件' }}
+              </button>
             </div>
           </header>
 
@@ -223,6 +247,7 @@
                   <th>用户</th>
                   <th>时间</th>
                   <th>状态</th>
+                  <th>邮件通知</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -236,13 +261,28 @@
                   <td>{{ item.created_at || item.created_time || '-' }}</td>
                   <td>{{ item.status || (item.resolved ? '已处理' : '待处理') }}</td>
                   <td>
-                    <button
-                      class="table-button"
-                      :disabled="item.resolved || item.status === 'resolved'"
-                      @click="resolveAlert(item)"
-                    >
-                      标记处理
-                    </button>
+                    <span :class="['admin-email-status', adminEmailStatusClass(item)]">
+                      {{ adminAlertEmailStatus(item) }}
+                    </span>
+                  </td>
+                  <td>
+                    <div class="table-action-group">
+                      <button
+                        class="table-button"
+                        :disabled="item.resolved || item.status === 'resolved'"
+                        @click="resolveAlert(item)"
+                      >
+                        标记处理
+                      </button>
+                      <button
+                        v-if="Number(item.email_failed_count || 0) > 0"
+                        class="table-button"
+                        :disabled="retryingAdminAlertId === (item.id || item.alert_id)"
+                        @click="retryAdminAlertEmail(item)"
+                      >
+                        {{ retryingAdminAlertId === (item.id || item.alert_id) ? '重试中' : '重试邮件' }}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               </tbody>
@@ -387,13 +427,108 @@
         </article>
       </section>
     </main>
+
+    <div
+      v-if="recordDetailOpen"
+      class="admin-record-modal-backdrop"
+      @click.self="closeRecordDetail"
+    >
+      <article class="admin-record-modal">
+        <header>
+          <div>
+            <p>RECOGNITION DETAIL</p>
+            <h2>{{ taskLabel(selectedRecord?.task_type) }}结果</h2>
+            <span>
+              记录 #{{ selectedRecord?.id || selectedRecord?.record_id || '-' }}
+              · 用户 {{ selectedRecord?.username || selectedRecord?.user_id || '系统任务' }}
+              · {{ selectedRecord?.created_at || '-' }}
+            </span>
+          </div>
+          <button class="light-button" @click="closeRecordDetail">关闭</button>
+        </header>
+
+        <div v-if="recordDetailLoading" class="admin-empty">正在加载完整识别结果...</div>
+
+        <template v-else-if="selectedRecord">
+          <section class="admin-record-meta">
+            <div>
+              <span>识别摘要</span>
+              <strong>{{ recordResultSummary(selectedRecord) }}</strong>
+            </div>
+            <div>
+              <span>输入方式</span>
+              <strong>{{ selectedRecord.input_type || '-' }}</strong>
+            </div>
+            <div>
+              <span>文件</span>
+              <strong>{{ selectedRecord.original_filename || selectedRecord.saved_filename || '-' }}</strong>
+            </div>
+            <div>
+              <span>处理耗时</span>
+              <strong>{{ recordLatencyText(selectedRecord) }}</strong>
+            </div>
+          </section>
+
+          <section
+            v-if="selectedRecord.image_url || selectedRecord.output_image_url"
+            class="admin-record-media"
+          >
+            <figure v-if="selectedRecord.image_url">
+              <figcaption>输入图像 / 最佳帧</figcaption>
+              <img :src="assetUrl(selectedRecord.image_url)" alt="输入图像" />
+            </figure>
+            <figure v-if="selectedRecord.output_image_url">
+              <figcaption>识别标注结果</figcaption>
+              <img :src="assetUrl(selectedRecord.output_image_url)" alt="识别结果" />
+            </figure>
+          </section>
+
+          <section v-if="recordPlateItems(selectedRecord).length" class="admin-record-block">
+            <h3>车牌结果</h3>
+            <div
+              v-for="(plate, index) in recordPlateItems(selectedRecord)"
+              :key="`${plate.plate_number || plate.plate || index}-${index}`"
+              class="admin-plate-row"
+            >
+              <strong>{{ plate.plate_number || plate.plate || plate.text || '-' }}</strong>
+              <span>{{ plate.plate_color || plate.color || '未知颜色' }}</span>
+              <span>置信度 {{ percent(plate.confidence) }}</span>
+              <span v-if="plate.appear_count">出现 {{ plate.appear_count }} 次</span>
+            </div>
+          </section>
+
+          <section v-if="recordGestureInfo(selectedRecord)" class="admin-record-block">
+            <h3>手势与控制结果</h3>
+            <div class="admin-gesture-grid">
+              <div>
+                <span>手势</span>
+                <strong>{{ recordGestureInfo(selectedRecord).gesture }}</strong>
+              </div>
+              <div>
+                <span>控制 / 指令</span>
+                <strong>{{ recordGestureInfo(selectedRecord).command }}</strong>
+              </div>
+              <div>
+                <span>置信度</span>
+                <strong>{{ percent(recordGestureInfo(selectedRecord).confidence) }}</strong>
+              </div>
+            </div>
+          </section>
+
+          <details class="admin-json-panel">
+            <summary>查看完整识别结果 JSON</summary>
+            <pre>{{ prettyJson(selectedRecord.result) }}</pre>
+          </details>
+        </template>
+      </article>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { apiDelete, apiGet, apiPost, apiPut } from '../api'
+import { API_BASE, apiDelete, apiGet, apiPost, apiPut } from '../api'
 import { useAuth } from '../useAuth'
 
 const router = useRouter()
@@ -417,7 +552,12 @@ const healthOk = ref(false)
 const users = ref([])
 const usersEndpointUnavailable = ref(false)
 const records = ref([])
+const selectedRecord = ref(null)
+const recordDetailOpen = ref(false)
+const recordDetailLoading = ref(false)
 const alerts = ref([])
+const retryingAllAlertEmails = ref(false)
+const retryingAdminAlertId = ref(null)
 const logs = ref([])
 const sources = ref([])
 const performanceSummary = ref({})
@@ -508,6 +648,129 @@ const runtimeMetrics = computed(() => [
   },
 ])
 
+
+function taskLabel(value) {
+  const labels = {
+    plate: '车牌识别',
+    traffic_gesture: '交警手势',
+    owner_gesture: '车主手势',
+    all: '多任务识别',
+    fusion_decision: '融合决策',
+  }
+  return labels[value] || value || '-'
+}
+
+function assetUrl(path) {
+  if (!path) return ''
+  if (/^https?:\/\//.test(path)) return path
+  return `${API_BASE}${path}`
+}
+
+function percent(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '-'
+  return `${Math.round(number <= 1 ? number * 100 : number)}%`
+}
+
+function formatMilliseconds(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '-'
+  if (number >= 1000) return `${(number / 1000).toFixed(2)} s`
+  return `${Math.round(number)} ms`
+}
+
+function recordResultSummary(item) {
+  if (!item) return '-'
+  if (item.result_summary) return item.result_summary
+  const result = item.result || {}
+
+  if (item.task_type === 'plate') {
+    const plates = Array.isArray(result.plates) ? result.plates : []
+    const numbers = plates
+      .map((plate) => plate.plate_number || plate.plate || plate.text)
+      .filter(Boolean)
+    return numbers.length ? numbers.slice(0, 3).join('、') : '未识别到有效车牌'
+  }
+
+  if (item.task_type === 'traffic_gesture') {
+    const gesture = result.gesture_name || result.gesture || '未知手势'
+    const command = result.traffic_command || result.command || ''
+    return command ? `${gesture} · ${command}` : gesture
+  }
+
+  if (item.task_type === 'owner_gesture') {
+    const gesture = result.gesture_name || result.gesture || '未知手势'
+    const action = result.description || result.action || ''
+    return action ? `${gesture} · ${action}` : gesture
+  }
+
+  return result.summary || result.suggestion || result.message || '查看完整结果'
+}
+
+function recordPlateItems(item) {
+  return Array.isArray(item?.result?.plates) ? item.result.plates : []
+}
+
+function recordGestureInfo(item) {
+  const result = item?.result || {}
+  if (!['traffic_gesture', 'owner_gesture'].includes(item?.task_type)) return null
+
+  return {
+    gesture: result.gesture_name || result.gesture || '未知手势',
+    command:
+      result.traffic_command ||
+      result.command ||
+      result.description ||
+      result.action ||
+      '-',
+    confidence: result.confidence,
+  }
+}
+
+function recordLatencyText(item) {
+  const result = item?.result || {}
+  return formatMilliseconds(
+    result.processing_latency_ms ??
+    result.latency_ms ??
+    result.total_latency_ms,
+  )
+}
+
+function prettyJson(value) {
+  try {
+    return JSON.stringify(value || {}, null, 2)
+  } catch {
+    return String(value ?? '')
+  }
+}
+
+async function openRecordDetail(item) {
+  selectedRecord.value = item
+  recordDetailOpen.value = true
+  recordDetailLoading.value = true
+
+  const recordId = item?.id || item?.record_id
+  if (!recordId) {
+    recordDetailLoading.value = false
+    return
+  }
+
+  try {
+    const data = await apiGet(`/api/records/${recordId}`)
+    selectedRecord.value = data?.record || item
+  } catch (error) {
+    errorMessage.value = `识别结果加载失败：${error.message}`
+  } finally {
+    recordDetailLoading.value = false
+  }
+}
+
+function closeRecordDetail() {
+  recordDetailOpen.value = false
+  selectedRecord.value = null
+  recordDetailLoading.value = false
+}
+
 function normalizeList(data) {
   if (Array.isArray(data)) return data
   return data?.items || data?.records || data?.alerts || data?.logs || data?.users || []
@@ -541,9 +804,9 @@ async function refreshAll() {
   const tasks = await Promise.allSettled([
     apiGet('/api/health'),
     loadUsers(),
-    apiGet('/api/records?limit=100'),
-    apiGet('/api/alerts?limit=100'),
-    apiGet('/api/logs?limit=100'),
+    apiGet('/api/admin/records?limit=100'),
+    apiGet('/api/admin/alerts?limit=100'),
+    apiGet('/api/admin/logs?limit=100'),
     apiGet('/api/video-sources?enabled_only=false'),
     apiGet('/api/performance/summary'),
     apiGet('/api/multistream/status'),
@@ -594,6 +857,58 @@ function alertLevelLabel(item) {
   }
   return map[alertLevel(item)]
 }
+
+
+function adminAlertEmailStatus(item) {
+  return item.email_notification_status || '未创建'
+}
+
+function adminEmailStatusClass(item) {
+  const value = adminAlertEmailStatus(item)
+  if (value === '已发送') return 'sent'
+  if (value === '发送失败') return 'failed'
+  if (value === '部分发送') return 'partial'
+  if (value === '发送中' || value === '待发送') return 'pending'
+  return 'skipped'
+}
+
+function waitForEmail(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
+async function retryAdminAlertEmail(item) {
+  const id = item.id || item.alert_id
+  if (!id) return
+
+  retryingAdminAlertId.value = id
+  errorMessage.value = ''
+
+  try {
+    await apiPost(`/api/alert-notifications/${id}/retry`, {})
+    await waitForEmail(1500)
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    retryingAdminAlertId.value = null
+  }
+}
+
+async function retryAllAlertEmails() {
+  retryingAllAlertEmails.value = true
+  errorMessage.value = ''
+
+  try {
+    await apiPost('/api/admin/alert-notifications/retry-failed', {})
+    await waitForEmail(1500)
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    retryingAllAlertEmails.value = false
+  }
+}
+
 
 async function resolveAlert(item) {
   const id = item.id || item.alert_id
@@ -1254,4 +1569,222 @@ onMounted(() => {
     grid-template-columns: 1fr;
   }
 }
+
+.admin-record-summary {
+  min-width: 220px;
+  color: #27364f;
+  font-weight: 650;
+}
+
+.admin-record-modal-backdrop {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(7px);
+}
+
+.admin-record-modal {
+  width: min(1080px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  padding: 22px;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.28);
+}
+
+.admin-record-modal > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #dce3ec;
+}
+
+.admin-record-modal > header p {
+  margin: 0;
+  color: #6366f1;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-record-modal > header h2 {
+  margin: 5px 0;
+}
+
+.admin-record-modal > header span {
+  color: #758197;
+  font-size: 13px;
+}
+
+.admin-record-meta,
+.admin-record-media,
+.admin-gesture-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.admin-record-meta {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.admin-record-meta > div,
+.admin-record-block,
+.admin-gesture-grid > div {
+  padding: 14px;
+  border: 1px solid #dce3ec;
+  border-radius: 13px;
+  background: #f8fafc;
+}
+
+.admin-record-meta span,
+.admin-gesture-grid span {
+  display: block;
+  color: #758197;
+  font-size: 12px;
+}
+
+.admin-record-meta strong,
+.admin-gesture-grid strong {
+  display: block;
+  margin-top: 7px;
+  color: #172033;
+}
+
+.admin-record-media {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.admin-record-media figure {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #dce3ec;
+  border-radius: 13px;
+  background: #eef2f7;
+}
+
+.admin-record-media figcaption {
+  padding: 10px 12px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.admin-record-media img {
+  display: block;
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+}
+
+.admin-record-block {
+  margin-top: 16px;
+}
+
+.admin-record-block h3 {
+  margin-top: 0;
+}
+
+.admin-plate-row {
+  display: grid;
+  grid-template-columns: 1.2fr repeat(3, minmax(100px, 1fr));
+  gap: 12px;
+  padding: 10px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.admin-plate-row:first-of-type {
+  border-top: 0;
+}
+
+.admin-gesture-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.admin-json-panel {
+  margin-top: 16px;
+  border: 1px solid #dce3ec;
+  border-radius: 13px;
+  background: #111827;
+}
+
+.admin-json-panel summary {
+  padding: 13px 15px;
+  color: #a5b4fc;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.admin-json-panel pre {
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  padding: 15px;
+  border-top: 1px solid #334155;
+  color: #dbeafe;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 850px) {
+  .admin-record-meta,
+  .admin-record-media,
+  .admin-gesture-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-plate-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+.header-action-group,
+.table-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.admin-email-status {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.admin-email-status.sent {
+  color: #047857;
+  background: #d1fae5;
+}
+
+.admin-email-status.failed {
+  color: #b91c1c;
+  background: #fee2e2;
+}
+
+.admin-email-status.partial {
+  color: #b45309;
+  background: #fef3c7;
+}
+
+.admin-email-status.pending {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.admin-email-status.skipped {
+  color: #64748b;
+  background: #e2e8f0;
+}
+
 </style>
