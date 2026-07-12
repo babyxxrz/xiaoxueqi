@@ -2,9 +2,9 @@
   <section class="camera-panel">
     <div class="camera-heading">
       <div>
-        <p class="section-kicker">DRIVER GESTURE</p>
-        <h3>车主摄像头实时识别</h3>
-        <p>按照任务要求识别静态与动态手势，并联动车载控制面板。</p>
+        <p class="section-kicker">TRAFFIC GESTURE CAMERA</p>
+        <h3>交警手势实时摄像头识别</h3>
+        <p>使用 MediaPipe Pose 进行全身姿态检测，实时识别 8 类交警手势并标注人体骨架。</p>
       </div>
 
       <div class="status-row">
@@ -51,16 +51,10 @@
       </div>
 
       <div class="result-card">
-        <div class="gesture-result" :class="`panel-${panelState}`">
-          <span>已确认动作</span>
-          <strong>{{ result.gesture_name || '等待下一个动作' }}</strong>
-          <small>
-            {{
-              panelState === 'confirmed'
-                ? result.gesture || '-'
-                : '完成完整动作后显示结果'
-            }}
-          </small>
+        <div class="gesture-result">
+          <span>当前手势</span>
+          <strong>{{ result.gesture_name || '等待识别' }}</strong>
+          <small>{{ result.gesture || '-' }}</small>
         </div>
 
         <div class="metric-grid">
@@ -73,54 +67,23 @@
             <strong>{{ latencyText }}</strong>
           </div>
           <div>
-            <span>车辆动作</span>
-            <strong>{{ result.description || result.action || '-' }}</strong>
+            <span>交通指令</span>
+            <strong>{{ result.traffic_command || '-' }}</strong>
           </div>
           <div>
-            <span>当前功能</span>
-            <strong>{{ currentFunctionText }}</strong>
+            <span>分类器</span>
+            <strong>{{ result.classifier_type || '-' }}</strong>
           </div>
           <div>
-            <span>音量</span>
-            <strong>{{ vehicleState.volume ?? 50 }}</strong>
+            <span>命中规则</span>
+            <strong>{{ result.matched_rule || '-' }}</strong>
           </div>
           <div>
-            <span>电话状态</span>
-            <strong>{{ vehicleState.phone_status || '空闲' }}</strong>
-          </div>
-          <div>
-            <span>空调温度</span>
-            <strong>{{ vehicleState.temperature ?? 24 }} ℃</strong>
-          </div>
-          <div>
-            <span>动作状态</span>
-            <strong :class="{ triggered: panelState === 'confirmed' }">
-              {{ actionStatusText }}
+            <span>姿态状态</span>
+            <strong :class="{ detected: hasPose }">
+              {{ hasPose ? '已检测到人体' : '未检测到' }}
             </strong>
           </div>
-          <div>
-            <span>识别流程</span>
-            <strong>{{ panelStatusText }}</strong>
-          </div>
-          <div>
-            <span>方向校正</span>
-            <strong>{{ result.camera_mirror_corrected ? '镜像方向已校正' : '标准方向' }}</strong>
-          </div>
-        </div>
-
-        <div class="volume-state">
-          <div>
-            <span>媒体音量</span>
-            <strong>{{ vehicleState.volume ?? 50 }}</strong>
-          </div>
-          <div class="volume-track">
-            <span :style="{ width: `${vehicleState.volume ?? 50}%` }"></span>
-          </div>
-        </div>
-
-        <div class="vehicle-state">
-          <span>车辆交互系统</span>
-          <strong>{{ vehicleState.system_awake ? '已唤醒' : '待机' }}</strong>
         </div>
       </div>
     </div>
@@ -128,24 +91,20 @@
     <section class="mapping-panel">
       <div class="mapping-heading">
         <div>
-          <span>任务要求映射</span>
-          <strong>至少 6 类车主手势 · 当前支持 9 条控制指令</strong>
+          <span>交警手势映射表</span>
+          <strong>8 类交警手势 · 基于 MediaPipe Pose 规则引擎</strong>
         </div>
-        <small>
-          摄像头镜像方向已校正。动作完成并确认后才更新右侧面板；
-          显示结束后进入“等待下一个动作”。
-        </small>
+        <small>基于身体关键点几何关系（手臂角度、位置、比例）进行规则评分分类。</small>
       </div>
 
       <div class="mapping-grid">
         <article
           v-for="item in gestureMappings"
           :key="item.gesture"
-          :class="{ active: panelState === 'confirmed' && result.gesture === item.gesture }"
+          :class="{ active: result.gesture === item.gesture }"
         >
-          <span>{{ item.type === 'dynamic' ? '动态' : '静态' }}</span>
           <strong>{{ item.gestureName }}</strong>
-          <small>{{ item.description }}</small>
+          <small>{{ item.command }}</small>
         </article>
       </div>
     </section>
@@ -165,9 +124,6 @@ const streamRef = ref(null)
 const timerRef = ref(null)
 const abortControllerRef = ref(null)
 const drawFrameRef = ref(null)
-const displayTimerRef = ref(null)
-const lastCommittedEventId = ref(0)
-const panelState = ref('waiting')
 
 const cameraRunning = ref(false)
 const loopRunning = ref(false)
@@ -177,73 +133,40 @@ const errorMessage = ref('')
 const result = reactive({
   gesture: '',
   gesture_name: '',
+  traffic_command: '',
   confidence: null,
-  action: '',
-  description: '',
   latency_ms: null,
   landmarks: [],
-  triggered: false,
-  stable_count: 0,
-  required_stable_frames: 2,
-  dynamic_gesture: '',
-  cooldown_remaining_ms: 0,
-  gesture_mapping_version: '',
-  dynamic_phase: 'idle',
-  motion_state: 'idle',
-  motion_debug: {},
-  event_id: 0,
-  camera_mirror_corrected: true,
+  classifier_type: '',
+  matched_rule: '',
 })
 
-const vehicleState = reactive({
-  system_awake: false,
-  current_function: 'home',
-  volume: 50,
-  temperature: 24,
-  phone_status: '空闲',
-  last_action: 'none',
-  last_description: '未触发车辆控制',
-})
-
-const functionLabels = {
-  home: '主页',
-  media: '媒体',
-  climate: '空调',
-  phone: '电话',
-  navigation: '导航',
-}
-
-const gestureMappings = [
-  { gesture: 'open_palm', gestureName: '手掌张开', description: '启动 / 唤醒系统', type: 'static' },
-  { gesture: 'fist', gestureName: '握拳', description: '确认 / 执行', type: 'static' },
-  { gesture: 'circle_clockwise', gestureName: '单指顺时针画圈', description: '调高音量', type: 'dynamic' },
-  { gesture: 'circle_counterclockwise', gestureName: '单指逆时针画圈', description: '调低音量', type: 'dynamic' },
-  { gesture: 'swipe_left', gestureName: '向左滑动', description: '切换到上一功能', type: 'dynamic' },
-  { gesture: 'swipe_right', gestureName: '向右滑动', description: '切换到下一功能', type: 'dynamic' },
-  { gesture: 'thumb_up', gestureName: '拇指向上', description: '接听电话', type: 'static' },
-  { gesture: 'thumb_down', gestureName: '拇指向下', description: '挂断电话', type: 'static' },
-  { gesture: 'wave', gestureName: '挥手', description: '返回主页', type: 'dynamic' },
+// MediaPipe Pose POSE_CONNECTIONS: 33 landmarks, 31 connections
+const POSE_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8],
+  [9, 10],
+  [11, 12],
+  [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
+  [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
+  [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [27, 29], [29, 31], [27, 31],
+  [24, 26], [26, 28], [28, 30], [30, 32], [28, 32],
 ]
 
-const currentFunctionText = computed(() =>
-  functionLabels[vehicleState.current_function] ||
-  vehicleState.current_function ||
-  '主页',
+const gestureMappings = [
+  { gesture: 'stop', gestureName: '停止信号', command: '车辆停止通行' },
+  { gesture: 'straight', gestureName: '直行信号', command: '车辆允许直行' },
+  { gesture: 'left_turn', gestureName: '左转弯信号', command: '车辆允许左转' },
+  { gesture: 'right_turn', gestureName: '右转弯信号', command: '车辆允许右转' },
+  { gesture: 'lane_change', gestureName: '变道信号', command: '车辆按指令变道' },
+  { gesture: 'left_turn_wait', gestureName: '左转弯待转信号', command: '车辆进入待转区' },
+  { gesture: 'slow_down', gestureName: '减速慢行信号', command: '车辆减速慢行' },
+  { gesture: 'pull_over', gestureName: '靠边停车信号', command: '车辆靠边停车' },
+]
+
+const hasPose = computed(() =>
+  Array.isArray(result.landmarks) && result.landmarks.length > 0,
 )
-
-const actionStatusText = computed(() =>
-  panelState.value === 'confirmed'
-    ? '动作已确认并执行'
-    : '等待动作完成',
-)
-
-const panelStatusText = computed(() => {
-  if (panelState.value === 'confirmed') {
-    return '结果稳定显示中'
-  }
-  return '等待下一个完整动作'
-})
-
 
 const confidenceText = computed(() =>
   result.confidence === null || result.confidence === undefined
@@ -293,7 +216,6 @@ function stopCamera() {
 
   cameraRunning.value = false
   clearOverlay()
-  resetCommittedPanel()
 }
 
 function startLoop() {
@@ -309,7 +231,8 @@ async function runLoopStep() {
   await captureAndRecognize()
 
   if (loopRunning.value && cameraRunning.value) {
-    timerRef.value = window.setTimeout(runLoopStep, 85)
+    // 请求完成后再发下一帧，彻底避免 setInterval 造成的请求堆积。
+    timerRef.value = window.setTimeout(runLoopStep, 70)
   }
 }
 
@@ -327,7 +250,7 @@ function stopLoop() {
 
 function canvasToBlob(canvas) {
   return new Promise((resolve) => {
-    canvas.toBlob(resolve, 'image/jpeg', 0.54)
+    canvas.toBlob(resolve, 'image/jpeg', 0.42)
   })
 }
 
@@ -343,7 +266,7 @@ async function captureAndRecognize() {
   errorMessage.value = ''
 
   try {
-    const scale = Math.min(1, 384 / video.videoWidth)
+    const scale = Math.min(1, 320 / video.videoWidth)
     const targetWidth = Math.round(video.videoWidth * scale)
     const targetHeight = Math.round(video.videoHeight * scale)
 
@@ -357,7 +280,7 @@ async function captureAndRecognize() {
     if (!blob) throw new Error('摄像头帧生成失败')
 
     const formData = new FormData()
-    formData.append('file', blob, `owner_camera_${Date.now()}.jpg`)
+    formData.append('file', blob, `traffic_camera_${Date.now()}.jpg`)
 
     const controller = new AbortController()
     abortControllerRef.value = controller
@@ -366,7 +289,7 @@ async function captureAndRecognize() {
     const started = performance.now()
     let response
     try {
-      response = await fetch(`${API_BASE}/api/gesture/owner/camera-fast-frame`, {
+      response = await fetch(`${API_BASE}/api/gesture/traffic/camera-fast-frame`, {
         method: 'POST',
         headers: authHeaders(),
         body: formData,
@@ -396,138 +319,29 @@ async function captureAndRecognize() {
   }
 }
 
-function clearDisplayTimer() {
-  if (displayTimerRef.value) {
-    window.clearTimeout(displayTimerRef.value)
-    displayTimerRef.value = null
-  }
-}
-
-function resetCommittedPanel() {
-  clearDisplayTimer()
-  panelState.value = 'waiting'
-
-  Object.assign(result, {
-    gesture: '',
-    gesture_name: '',
-    confidence: null,
-    action: '',
-    description: '',
-    latency_ms: null,
-    triggered: false,
-    stable_count: 0,
-    required_stable_frames: 3,
-    dynamic_gesture: '',
-    cooldown_remaining_ms: 0,
-    dynamic_phase: 'idle',
-    motion_state: 'waiting',
-    motion_debug: {},
-    event_id: 0,
-  })
-}
-
-function scheduleWaitingState(eventId) {
-  clearDisplayTimer()
-
-  displayTimerRef.value = window.setTimeout(() => {
-    // 新动作已经提交时，旧定时器不能清空新结果。
-    if (Number(result.event_id || 0) !== Number(eventId || 0)) {
-      return
-    }
-
-    panelState.value = 'waiting'
-    result.gesture = ''
-    result.gesture_name = ''
-    result.confidence = null
-    result.action = ''
-    result.description = ''
-    result.triggered = false
-    result.dynamic_gesture = ''
-    result.dynamic_phase = 'waiting'
-    result.motion_state = 'waiting'
-  }, 1800)
-}
-
-function shouldCommitPayload(payload) {
-  const eventId = Number(payload.event_id || 0)
-  const committed = Boolean(
-    payload.display_committed
-    || payload.triggered
-    || payload.dynamic_phase === 'event'
-  )
-
-  if (!committed) return false
-
-  if (
-    eventId > 0
-    && eventId === Number(lastCommittedEventId.value || 0)
-  ) {
-    return false
-  }
-
-  return true
-}
-
-function commitPayload(payload, latency) {
-  const eventId = Number(payload.event_id || Date.now())
-
-  lastCommittedEventId.value = eventId
-  panelState.value = 'confirmed'
+function updateResult(data, clientLatency) {
+  const payload = data.result || data
 
   result.gesture = payload.gesture || ''
   result.gesture_name = payload.gesture_name || ''
+  result.traffic_command = payload.traffic_command || ''
   result.confidence = payload.confidence
-  result.action = payload.action || ''
-  result.description = payload.description || ''
-  result.latency_ms = latency
-  result.triggered = true
-  result.stable_count = Number(payload.stable_count || 0)
-  result.required_stable_frames = Number(
-    payload.required_stable_frames || 3,
-  )
-  result.dynamic_gesture = payload.dynamic_gesture || ''
-  result.cooldown_remaining_ms = Number(
-    payload.cooldown_remaining_ms || 0,
-  )
-  result.gesture_mapping_version =
-    payload.gesture_mapping_version || ''
-  result.dynamic_phase = payload.dynamic_phase || 'event'
-  result.motion_state = 'confirmed'
-  result.motion_debug = payload.motion_debug || {}
-  result.event_id = eventId
-  result.camera_mirror_corrected =
-    payload.camera_mirror_corrected !== false
+  result.latency_ms = data.latency_ms ?? clientLatency
+  result.landmarks = payload.landmarks || []
+  result.classifier_type = payload.classifier_type || ''
+  result.matched_rule = payload.matched_rule || ''
 
-  scheduleWaitingState(eventId)
+  drawSkeleton(result.landmarks)
 
   emit('recognized', {
     status: 'success',
-    task_type: 'owner_gesture',
-    input_type: 'camera_fast_frame',
-    latency_ms: latency,
-    created_at: new Date().toISOString(),
-    result: {
-      ...payload,
-      vehicle_state: { ...vehicleState },
-    },
+    task_type: 'traffic_gesture',
+    input_type: data.input_type || 'camera_fast_frame',
+    latency_ms: result.latency_ms,
+    captured_at: new Date().toISOString(),
+    result: { ...payload },
   })
 }
-
-function updateResult(data, clientLatency) {
-  const payload = data.result || data
-  const state = payload.vehicle_state || {}
-  const latency = data.latency_ms ?? clientLatency
-
-  // 骨架和车辆状态仍然实时更新；右侧主结果只在动作确认时更新。
-  result.landmarks = payload.landmarks || []
-  Object.assign(vehicleState, state)
-  drawLandmarks(result.landmarks)
-
-  if (shouldCommitPayload(payload)) {
-    commitPayload(payload, latency)
-  }
-}
-
 
 function resizeOverlay() {
   const video = videoRef.value
@@ -547,7 +361,7 @@ function clearOverlay() {
   canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height)
 }
 
-function drawLandmarks(landmarks) {
+function drawSkeleton(landmarks) {
   if (drawFrameRef.value) {
     window.cancelAnimationFrame(drawFrameRef.value)
   }
@@ -563,34 +377,26 @@ function drawLandmarks(landmarks) {
 
     if (!Array.isArray(landmarks) || !landmarks.length) return
 
-    const connections = [
-      [0, 1], [1, 2], [2, 3], [3, 4],
-      [0, 5], [5, 6], [6, 7], [7, 8],
-      [5, 9], [9, 10], [10, 11], [11, 12],
-      [9, 13], [13, 14], [14, 15], [15, 16],
-      [13, 17], [17, 18], [18, 19], [19, 20],
-      [0, 17],
-    ]
-
     const pointMap = new Map(
       landmarks.map((landmark) => [
         Number(landmark.index),
         {
           x: Number(landmark.x) * canvas.width,
           y: Number(landmark.y) * canvas.height,
+          visibility: Number(landmark.visibility ?? 1),
         },
       ]),
     )
 
     context.lineWidth = 3
     context.strokeStyle = '#22d3ee'
-    context.fillStyle = '#fb923c'
     context.lineCap = 'round'
 
-    connections.forEach(([from, to]) => {
+    POSE_CONNECTIONS.forEach(([from, to]) => {
       const startPoint = pointMap.get(from)
       const endPoint = pointMap.get(to)
       if (!startPoint || !endPoint) return
+      if (startPoint.visibility < 0.25 || endPoint.visibility < 0.25) return
 
       context.beginPath()
       context.moveTo(startPoint.x, startPoint.y)
@@ -598,16 +404,17 @@ function drawLandmarks(landmarks) {
       context.stroke()
     })
 
+    context.fillStyle = '#fb923c'
     pointMap.forEach((point) => {
+      if (point.visibility < 0.25) return
       context.beginPath()
-      context.arc(point.x, point.y, 4, 0, Math.PI * 2)
+      context.arc(point.x, point.y, point.visibility > 0.5 ? 5 : 3, 0, Math.PI * 2)
       context.fill()
     })
   })
 }
 
 onBeforeUnmount(() => {
-  clearDisplayTimer()
   stopCamera()
   if (drawFrameRef.value) window.cancelAnimationFrame(drawFrameRef.value)
   window.removeEventListener('resize', resizeOverlay)
@@ -754,8 +561,7 @@ window.addEventListener('resize', resizeOverlay)
 }
 
 .gesture-result span,
-.metric-grid span,
-.vehicle-state span {
+.metric-grid span {
   color: #94a3b8;
   font-size: 12px;
 }
@@ -769,23 +575,6 @@ window.addEventListener('resize', resizeOverlay)
   color: #67e8f9;
 }
 
-.gesture-result.panel-waiting {
-  background: linear-gradient(
-    135deg,
-    rgba(51, 65, 85, 0.22),
-    rgba(15, 23, 42, 0.18)
-  );
-}
-
-.gesture-result.panel-confirmed {
-  border: 1px solid rgba(45, 212, 191, 0.26);
-  background: linear-gradient(
-    135deg,
-    rgba(13, 148, 136, 0.22),
-    rgba(37, 99, 235, 0.12)
-  );
-}
-
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -793,63 +582,22 @@ window.addEventListener('resize', resizeOverlay)
   margin-top: 12px;
 }
 
-.metric-grid div,
-.vehicle-state {
+.metric-grid div {
   padding: 11px;
   border: 1px solid #26354d;
   border-radius: 12px;
   background: #0d1b30;
 }
 
-.metric-grid strong,
-.vehicle-state strong {
+.metric-grid strong {
   display: block;
   margin-top: 5px;
   color: #e2e8f0;
   word-break: break-word;
 }
 
-.volume-state {
-  margin-top: 14px;
-  padding: 14px;
-  border: 1px solid rgba(34, 211, 238, 0.14);
-  border-radius: 14px;
-  background: rgba(8, 20, 38, 0.72);
-}
-
-.volume-state > div:first-child {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.volume-state span {
-  color: #94a3b8;
-  font-size: 13px;
-}
-
-.volume-state strong {
-  color: #e2e8f0;
-}
-
-.volume-track {
-  height: 8px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.16);
-}
-
-.volume-track span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #22d3ee, #5eead4);
-  transition: width 0.25s ease;
-}
-
-.triggered {
-  color: #5eead4 !important;
+.metric-grid .detected {
+  color: #6ee7b7;
 }
 
 .mapping-panel {
@@ -885,14 +633,14 @@ window.addEventListener('resize', resizeOverlay)
 
 .mapping-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
 .mapping-grid article {
   display: grid;
   gap: 5px;
-  min-height: 88px;
+  min-height: 72px;
   padding: 12px;
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 12px;
@@ -905,15 +653,6 @@ window.addEventListener('resize', resizeOverlay)
   background: rgba(13, 148, 136, 0.14);
 }
 
-.mapping-grid article > span {
-  width: fit-content;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: rgba(34, 211, 238, 0.1);
-  color: #67e8f9;
-  font-size: 11px;
-}
-
 .mapping-grid article strong {
   color: #f8fafc;
   font-size: 14px;
@@ -922,12 +661,6 @@ window.addEventListener('resize', resizeOverlay)
 .mapping-grid article small {
   color: #8fa9c6;
   line-height: 1.5;
-}
-
-.vehicle-state {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 12px;
 }
 
 .error-text {
@@ -942,6 +675,10 @@ window.addEventListener('resize', resizeOverlay)
 
   .camera-heading {
     flex-direction: column;
+  }
+
+  .mapping-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 

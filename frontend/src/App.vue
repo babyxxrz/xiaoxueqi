@@ -110,31 +110,16 @@
       </section>
 
       <section v-if="activeView === 'fusion'" class="content-grid">
-        <article class="panel span-12">
+        <!-- Row 1: 控制侧栏 + 实时视频画面 -->
+        <article class="panel fusion-ctrl-span">
           <header class="panel-title">
             <div>
               <p class="eyebrow">REALTIME FUSION</p>
               <h2>三路融合决策监控</h2>
-              <p>选择车牌流、交警手势流，并接入车主摄像头，系统自动完成风险分析。</p>
-            </div>
-            <div class="button-row">
-              <button
-                :disabled="fusionMonitor.running || loading.fusion"
-                @click="startFusionMonitor"
-              >
-                开始融合监控
-              </button>
-              <button
-                class="secondary"
-                :disabled="!fusionMonitor.running"
-                @click="stopFusionMonitor"
-              >
-                停止监控
-              </button>
             </div>
           </header>
 
-          <div class="source-select-grid">
+          <div class="fusion-ctrl-body">
             <label>
               <span>车牌视频流</span>
               <select v-model="selectedPlateSourceId">
@@ -146,9 +131,9 @@
             </label>
 
             <label>
-              <span>交警手势视频流</span>
+              <span>交警手势备用视频流（可选）</span>
               <select v-model="selectedTrafficSourceId">
-                <option value="">请选择交警手势视频源</option>
+                <option value="">优先使用下方电脑摄像头</option>
                 <option v-for="item in trafficSources" :key="item.id" :value="item.id">
                   {{ item.name }}
                 </option>
@@ -163,32 +148,122 @@
                 <option :value="10">10 秒</option>
               </select>
             </label>
-          </div>
 
-          <div class="channel-grid">
-            <div class="channel-card">
-              <span>车牌感知通道</span>
-              <strong>{{ plateEvidenceText }}</strong>
-              <small>{{ evidence.plate?.latency_ms ? `${evidence.plate.latency_ms} ms` : '等待识别' }}</small>
+            <div class="fusion-ctrl-actions">
+              <button
+                :disabled="fusionMonitor.running || loading.fusion"
+                @click="startFusionMonitor"
+              >
+                开始融合监控
+              </button>
+              <button
+                class="secondary"
+                :disabled="!fusionMonitor.running"
+                @click="stopFusionMonitor"
+              >
+                停止监控
+              </button>
             </div>
-            <div class="channel-card">
-              <span>交警手势通道</span>
-              <strong>{{ trafficEvidenceText }}</strong>
-              <small>{{ evidence.traffic?.latency_ms ? `${evidence.traffic.latency_ms} ms` : '等待识别' }}</small>
-            </div>
-            <div class="channel-card">
-              <span>车主摄像头通道</span>
-              <strong>{{ ownerEvidenceText }}</strong>
-              <small>{{ evidence.owner?.latency_ms ? `${Math.round(evidence.owner.latency_ms)} ms` : '等待摄像头输入' }}</small>
+
+            <!-- 沙盘车牌识别按钮 -->
+            <button
+              class="primary"
+              style="width:100%;margin-top:8px;"
+              :disabled="!livePreviewSourceId || loadingPlateRecognize"
+              @click="recognizeSandboxPlate"
+            >
+              {{ loadingPlateRecognize ? '识别中...' : '识别车牌' }}
+            </button>
+
+            <!-- 通道状态卡片 -->
+            <div class="fusion-channel-cards">
+              <div class="channel-card">
+                <span>车牌感知通道</span>
+                <strong>{{ plateEvidenceText }}</strong>
+                <small>{{ evidence.plate?.latency_ms ? `${evidence.plate.latency_ms} ms` : '等待识别' }}</small>
+              </div>
+              <div class="channel-card">
+                <span>交警手势通道</span>
+                <strong>{{ trafficEvidenceText }}</strong>
+                <small>{{ evidence.traffic?.latency_ms ? `${Math.round(evidence.traffic.latency_ms)} ms` : '等待电脑摄像头或备用视频流' }}</small>
+              </div>
+              <div class="channel-card">
+                <span>车主摄像头通道</span>
+                <strong>{{ ownerEvidenceText }}</strong>
+                <small>{{ evidence.owner?.latency_ms ? `${Math.round(evidence.owner.latency_ms)} ms` : '等待摄像头输入' }}</small>
+              </div>
             </div>
           </div>
         </article>
 
-        <article class="panel span-12">
-          <OwnerCameraPanel @recognized="handleOwnerEvidence" />
+        <article class="panel fusion-video-span">
+          <header class="panel-title">
+            <div>
+              <p class="eyebrow">LIVE PREVIEW</p>
+              <h2>实时视频画面</h2>
+            </div>
+            <select v-model="livePreviewSourceId" @change="onLivePreviewSourceChange">
+              <option value="">请选择视频源</option>
+              <option v-for="item in livePreviewSources" :key="item.id" :value="item.id">
+                {{ item.name }}
+              </option>
+            </select>
+          </header>
+
+          <div class="live-video-stage" :class="{ offline: streamError }">
+            <!-- WebRTC 模式：iframe 嵌入 MediaMTX 播放器 -->
+            <iframe
+              v-if="liveStreamUrl && !streamError && selectedLivePreviewSource?.protocol === 'webrtc'"
+              :key="`${livePreviewSourceId}_${streamReloadToken}`"
+              :src="liveStreamUrl"
+              class="webrtc-iframe"
+              allow="autoplay; fullscreen"
+              @load="onStreamLoaded"
+              @error="onStreamError"
+            ></iframe>
+            <!-- HLS 模式：HlsVideoPlayer -->
+            <HlsVideoPlayer
+              v-else-if="liveStreamUrl && !streamError && selectedLivePreviewSource?.protocol === 'hls'"
+              :key="`${livePreviewSourceId}_${streamReloadToken}`"
+              :src="liveStreamUrl"
+              @playing="onStreamLoaded"
+              @reconnecting="onStreamReconnecting"
+              @error="onStreamError"
+            />
+            <!-- MJPEG 模式：img -->
+            <img
+              v-else-if="liveStreamUrl && !streamError"
+              :src="liveStreamUrl"
+              @load="onStreamLoaded"
+              @error="onStreamError"
+            />
+            <div v-if="!liveStreamUrl || streamLoading || streamError" class="video-placeholder">
+              <span v-if="!livePreviewSourceId">请在上方选择视频源</span>
+              <span v-else-if="streamLoading">正在连接视频流...</span>
+              <span v-else-if="streamError">视频流连接失败 — 请确认沙盘 RTSP 可访问</span>
+            </div>
+          </div>
+
+          <!-- 推流状态信息条 -->
+          <div class="stream-info-bar">
+            <span :class="['dot', streamError ? 'off' : 'on']"></span>
+            <span>{{ streamStatusText }}</span>
+            <span class="stream-info-sep">|</span>
+            <span>格式：{{ selectedLivePreviewSource?.protocol === 'webrtc' ? 'WebRTC' : selectedLivePreviewSource?.protocol === 'hls' ? 'HLS' : 'MJPEG' }}</span>
+            <span class="stream-info-sep">|</span>
+            <span>帧率：{{ selectedLivePreviewSource?.protocol === 'webrtc' || selectedLivePreviewSource?.protocol === 'hls' ? '实时' : '15 fps' }}</span>
+            <button
+              v-if="selectedLivePreviewSource"
+              class="link"
+              @click="openStreamInNewTab"
+            >
+              新窗口打开
+            </button>
+          </div>
         </article>
 
-        <article class="panel span-5">
+        <!-- Row 2: 风险分析 + 时间线 -->
+        <article class="panel span-6">
           <header class="panel-title">
             <div>
               <p class="eyebrow">RISK ANALYSIS</p>
@@ -216,7 +291,7 @@
           <div v-else class="empty-state">启动融合监控后显示分析结果。</div>
         </article>
 
-        <article class="panel span-7">
+        <article class="panel span-6">
           <header class="panel-title">
             <div>
               <p class="eyebrow">MONITOR TIMELINE</p>
@@ -232,6 +307,15 @@
             <div v-if="!fusionTimeline.length" class="empty-state">暂无监控事件。</div>
           </div>
         </article>
+
+        <!-- Row 3: 两路电脑摄像头。摄像头识别结果只作为当前轮次真实证据。 -->
+        <article class="panel span-12">
+          <TrafficGestureCamera @recognized="handleTrafficEvidence" />
+        </article>
+
+        <article class="panel span-12">
+          <OwnerCameraPanel @recognized="handleOwnerEvidence" />
+        </article>
       </section>
 
       <section v-if="activeView === 'recognition'" class="content-grid">
@@ -241,8 +325,8 @@
               <p class="eyebrow">MODEL TEST CENTER</p>
               <h2>模型测试中心</h2>
               <p>
-                车牌识别与交警手势识别统一使用本地视频上传。系统会连续抽帧、完成时序分析，
-                并展示最佳标注帧、识别结果和性能数据。
+                车牌识别与交警手势识别统一使用本地视频上传。车牌视频默认采用约 12 帧快速 OCR
+                与跨帧聚合，避免批量任务逐帧长时间等待；交警手势继续进行时序分析。
               </p>
             </div>
             <div class="input-mode-badge">
@@ -267,98 +351,193 @@
           <article class="panel span-5">
             <header class="panel-title">
               <div>
-                <p class="eyebrow">PLATE VIDEO</p>
-                <h2>车牌视频上传</h2>
-                <p>支持 MP4、AVI、MOV、MKV、WebM，单次最多读取 300 帧。</p>
+                <p class="eyebrow">PLATE RECOGNITION</p>
+                <h2>车牌文件上传</h2>
+                <p>支持 JPG、PNG、BMP、WebP 图片和 MP4、AVI、MOV、MKV、WebM 视频，自动识别格式。</p>
               </div>
             </header>
 
-            <div
-              class="video-drop-zone"
-              @dragover.prevent
-              @drop.prevent="dropRecognitionFile($event, 'plate')"
-            >
-              <div class="drop-zone-icon">▣</div>
-              <strong>拖入车牌视频，或从本地选择</strong>
-              <span>浏览器将视频上传到后端，不需要填写本地文件路径。</span>
-              <label class="file-select-button">
-                选择车牌视频
-                <input
-                  class="hidden-file-input"
-                  type="file"
-                  accept="video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.m4v"
-                  @change="pickRecognitionFile($event, 'plate')"
-                />
+            <!-- 批量开关 -->
+            <div class="input-mode-row">
+              <div></div>
+              <label class="batch-toggle">
+                <input type="checkbox" v-model="plateBatchMode" @change="clearRecognitionFile('plate')" />
+                <span>批量上传</span>
               </label>
             </div>
 
-            <div v-if="plateUpload.previewUrl" class="local-video-preview">
-              <video
-                :src="plateUpload.previewUrl"
-                controls
-                preload="metadata"
-                @loadedmetadata="captureVideoMetadata($event, 'plate')"
-              ></video>
-            </div>
-
-            <div v-if="plateFile" class="selected-file-card">
-              <div>
-                <span>已选择视频</span>
-                <strong>{{ plateFile.name }}</strong>
-                <small>
-                  {{ formatFileSize(plateFile.size) }}
-                  <template v-if="plateUpload.duration">
-                    · {{ formatDuration(plateUpload.duration) }}
-                  </template>
-                </small>
+            <!-- 单文件模式 -->
+            <template v-if="!plateBatchMode">
+              <div
+                class="video-drop-zone"
+                @dragover.prevent
+                @drop.prevent="dropRecognitionFile($event, 'plate')"
+              >
+                <div class="drop-zone-icon">▣</div>
+                <strong>拖入车牌文件，或从本地选择</strong>
+                <span>支持图片和视频，自动识别格式并调用对应模型。</span>
+                <label class="file-select-button">
+                  选择文件
+                  <input
+                    class="hidden-file-input"
+                    type="file"
+                    accept="image/jpeg,image/png,image/bmp,image/webp,video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.jpg,.jpeg,.png,.bmp,.webp,.m4v"
+                    @change="pickRecognitionFile($event, 'plate')"
+                  />
+                </label>
               </div>
-              <button class="text-button" :disabled="loading.plate" @click="clearRecognitionFile('plate')">
-                移除
+
+              <!-- 图片预览 -->
+              <div v-if="plateFileType === 'image' && plateUpload.previewUrl" class="local-video-preview">
+                <img :src="plateUpload.previewUrl" alt="图片预览" style="max-width:100%;max-height:300px;object-fit:contain;cursor:pointer;" @click="enlargedImage = plateUpload.previewUrl" title="点击放大" />
+              </div>
+              <!-- 视频预览 -->
+              <div v-if="plateFileType === 'video' && plateUpload.previewUrl" class="local-video-preview">
+                <video
+                  :src="plateUpload.previewUrl"
+                  controls
+                  preload="metadata"
+                  @loadedmetadata="captureVideoMetadata($event, 'plate')"
+                ></video>
+              </div>
+
+              <div v-if="plateFile" class="selected-file-card">
+                <div>
+                  <span>已选择{{ plateFileType === 'image' ? '图片' : '视频' }}</span>
+                  <strong>{{ plateFile.name }}</strong>
+                  <small>
+                    {{ formatFileSize(plateFile.size) }}
+                    <template v-if="plateFileType === 'video' && plateUpload.duration">
+                      · {{ formatDuration(plateUpload.duration) }}
+                    </template>
+                  </small>
+                </div>
+                <button class="text-button" :disabled="loading.plate" @click="clearRecognitionFile('plate')">
+                  移除
+                </button>
+              </div>
+
+              <!-- 视频参数（仅视频时显示） -->
+              <div v-if="plateFileType === 'video'" class="recognition-parameter-grid">
+                <label>
+                  <span>最大读取帧数</span>
+                  <input
+                    v-model.number="plateUpload.frameCount"
+                    type="number"
+                    min="20"
+                    max="300"
+                    step="10"
+                  />
+                  <small>建议 120～240 帧</small>
+                </label>
+                <label>
+                  <span>抽帧间隔</span>
+                  <input
+                    v-model.number="plateUpload.sampleInterval"
+                    type="number"
+                    min="1"
+                    max="20"
+                    step="1"
+                  />
+                  <small>建议每 5 帧识别一次</small>
+                </label>
+              </div>
+
+              <button
+                class="primary-action"
+                :disabled="loading.plate || !plateFile"
+                @click="recognizePlate"
+              >
+                {{ loading.plate ? '正在上传并识别...' : `开始车牌${plateFileType === 'image' ? '图片' : '视频'}识别` }}
               </button>
-            </div>
+            </template>
 
-            <div class="recognition-parameter-grid">
-              <label>
-                <span>最大读取帧数</span>
-                <input
-                  v-model.number="plateUpload.frameCount"
-                  type="number"
-                  min="20"
-                  max="300"
-                  step="10"
-                />
-                <small>建议 120～240 帧</small>
-              </label>
-              <label>
-                <span>抽帧间隔</span>
-                <input
-                  v-model.number="plateUpload.sampleInterval"
-                  type="number"
-                  min="1"
-                  max="20"
-                  step="1"
-                />
-                <small>建议每 5 帧识别一次</small>
-              </label>
-            </div>
+            <!-- 批量模式 -->
+            <template v-else>
+              <div
+                class="video-drop-zone"
+                @dragover.prevent
+                @drop.prevent="dropBatchFiles($event, 'plate')"
+              >
+                <div class="drop-zone-icon">▦</div>
+                <strong>拖入文件（支持图片和视频混合），或从本地选择</strong>
+                <span>批量模式支持同时上传图片和视频，逐个识别并展示结果。</span>
+                <label class="file-select-button">
+                  选择文件
+                  <input
+                    class="hidden-file-input"
+                    type="file"
+                    multiple
+                    accept="image/jpeg,image/png,image/bmp,image/webp,video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.jpg,.jpeg,.png,.bmp,.webp,.m4v"
+                    @change="pickBatchFiles($event, 'plate')"
+                  />
+                </label>
+              </div>
 
-            <button
-              class="primary-action"
-              :disabled="loading.plate || !plateFile"
-              @click="recognizePlate"
-            >
-              {{ loading.plate ? '正在上传并识别...' : '开始车牌视频识别' }}
-            </button>
+              <!-- 批量文件列表 -->
+              <div v-if="plateBatchFiles.length" class="batch-file-list">
+                <div class="batch-file-header">
+                  <span>已选择 {{ plateBatchFiles.length }} 个文件</span>
+                  <button class="text-button" @click="clearBatchFiles('plate')">清空</button>
+                </div>
+                <div
+                  v-for="(item, idx) in plateBatchFiles"
+                  :key="item.id"
+                  class="batch-file-item"
+                >
+                  <span class="batch-file-type" :class="item.type">{{ item.type === 'image' ? '图' : '视' }}</span>
+                  <span class="batch-file-name">{{ item.file.name }}</span>
+                  <span class="batch-file-size">{{ formatFileSize(item.file.size) }}</span>
+                  <button class="text-button" @click="removeBatchFile('plate', idx)">✕</button>
+                </div>
+              </div>
+
+              <!-- 视频参数（批量模式共用） -->
+              <div class="recognition-parameter-grid">
+                <label>
+                  <span>最大读取帧数（视频）</span>
+                  <input
+                    v-model.number="plateUpload.frameCount"
+                    type="number"
+                    min="20"
+                    max="300"
+                    step="10"
+                  />
+                  <small>建议 120～240 帧</small>
+                </label>
+                <label>
+                  <span>抽帧间隔（视频）</span>
+                  <input
+                    v-model.number="plateUpload.sampleInterval"
+                    type="number"
+                    min="1"
+                    max="20"
+                    step="1"
+                  />
+                  <small>建议每 5 帧识别一次</small>
+                </label>
+              </div>
+
+              <button
+                class="primary-action"
+                :disabled="plateBatchLoading || !plateBatchFiles.length"
+                @click="recognizePlateBatch"
+              >
+                {{ plateBatchLoading ? '正在批量识别...' : `开始批量识别（${plateBatchFiles.length} 个文件）` }}
+              </button>
+            </template>
 
             <div :class="['recognition-status', `status-${plateUpload.status}`]">
               <span>{{ recognitionStatusLabel(plateUpload.status) }}</span>
               <small>
                 {{
                   plateUpload.status === 'processing'
-                    ? '视频正在上传并进行连续帧识别，请保持页面开启。'
+                    ? '文件正在上传并进行识别，请保持页面开启。'
                     : plateUpload.status === 'success'
                       ? '识别完成，右侧已生成聚合结果。'
-                      : '选择本地视频后即可开始。'
+                      : plateBatchMode
+                        ? '选择需要识别的文件后即可开始。'
+                        : `选择本地${plateFileType === 'image' ? '图片' : '视频'}后即可开始。`
                 }}
               </small>
             </div>
@@ -370,180 +549,421 @@
             <header class="panel-title">
               <div>
                 <p class="eyebrow">PLATE RESULT</p>
-                <h2>车牌视频识别结果</h2>
+                <h2>车牌{{ plateBatchMode ? '批量' : plateFileType === 'image' ? '图片' : '视频' }}识别结果</h2>
               </div>
               <span v-if="plateResult" class="result-success-badge">识别完成</span>
             </header>
 
-            <div v-if="plateResult" class="video-result-stack">
-              <div class="result-summary-grid">
-                <div>
-                  <span>稳定车牌</span>
-                  <strong>{{ plateStats.plateCount }}</strong>
-                  <small>过滤低置信度并合并相似结果</small>
+            <!-- 单文件结果 -->
+            <template v-if="!plateBatchMode || !plateBatchResults.length">
+              <div v-if="plateResult" class="video-result-stack">
+                <div class="result-summary-grid">
+                  <div>
+                    <span>稳定车牌</span>
+                    <strong>{{ plateStats.plateCount }}</strong>
+                    <small>过滤低置信度并合并相似结果</small>
+                  </div>
+                  <div>
+                    <span>读取帧数</span>
+                    <strong>{{ plateStats.framesRead }}</strong>
+                    <small>原始视频帧</small>
+                  </div>
+                  <div>
+                    <span>识别帧数</span>
+                    <strong>{{ plateStats.sampledFrames }}</strong>
+                    <small>实际推理帧</small>
+                  </div>
+                  <div>
+                    <span>处理耗时</span>
+                    <strong>{{ formatMilliseconds(plateStats.processingLatencyMs) }}</strong>
+                    <small>上传后端处理总耗时</small>
+                  </div>
                 </div>
-                <div>
-                  <span>读取帧数</span>
-                  <strong>{{ plateStats.framesRead }}</strong>
-                  <small>原始视频帧</small>
+
+                <div class="result-media-card">
+                  <div>
+                    <span>最佳车牌标注帧</span>
+                    <small>
+                      {{ plateVideoMetadata.width || '-' }} × {{ plateVideoMetadata.height || '-' }}
+                      · {{ formatDuration(plateVideoMetadata.duration_seconds) }}
+                    </small>
+                  </div>
+                  <img
+                    v-if="plateBestOutputImageUrl"
+                    :src="assetUrl(plateBestOutputImageUrl)"
+                    alt="车牌最佳标注帧"
+                    style="cursor:pointer"
+                    @click="enlargedImage = assetUrl(plateBestOutputImageUrl)"
+                    title="点击放大"
+                  />
+                  <div v-else class="empty-state">本次未生成最佳标注帧。</div>
                 </div>
-                <div>
-                  <span>识别帧数</span>
-                  <strong>{{ plateStats.sampledFrames }}</strong>
-                  <small>实际推理帧</small>
+
+                <div class="plate-evidence-heading">
+                  <div>
+                    <span>BEST FRAME EVIDENCE</span>
+                    <strong>最佳帧车牌（与上方标注框一一对应）</strong>
+                  </div>
+                  <b>{{ plateBestFrameList.length }} 个框</b>
                 </div>
-                <div>
-                  <span>处理耗时</span>
-                  <strong>{{ formatMilliseconds(plateStats.processingLatencyMs) }}</strong>
-                  <small>上传后端处理总耗时</small>
+
+                <div class="data-table result-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>车牌号码</th>
+                        <th>颜色</th>
+                        <th>本帧置信度</th>
+                        <th>原始 OCR</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="(plate, index) in plateBestFrameList"
+                        :key="`best_${plate.plate_number || index}_${index}`"
+                      >
+                        <td><strong>{{ plate.plate_number || plate.plate || plate.text || '未解析号码' }}</strong></td>
+                        <td>{{ plate.plate_color || plate.color || '未知' }}</td>
+                        <td>{{ percent(plate.confidence) }}</td>
+                        <td>{{ plate.raw_plate_number || plate.plate_number || '-' }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <div v-if="!plateBestFrameList.length" class="empty-state">
+                    最佳帧中没有通过过滤的车牌框。
+                  </div>
+                </div>
+
+                <div v-if="plateFileType === 'video'" class="plate-evidence-heading video-summary">
+                  <div>
+                    <span>FULL VIDEO SUMMARY</span>
+                    <strong>全视频稳定聚合结果</strong>
+                  </div>
+                  <b>{{ plateAggregatedList.length }} 个稳定车牌</b>
+                </div>
+
+                <div v-if="plateFileType === 'video'" class="data-table result-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>车牌号码</th>
+                        <th>颜色</th>
+                        <th>聚合置信度</th>
+                        <th>出现次数</th>
+                        <th>最佳帧</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="(plate, index) in plateAggregatedList"
+                        :key="`video_${plate.plate_number || index}_${index}`"
+                      >
+                        <td><strong>{{ plate.plate_number || plate.plate || plate.text || '未解析号码' }}</strong></td>
+                        <td>{{ plate.plate_color || plate.color || '未知' }}</td>
+                        <td>{{ percent(plate.confidence) }}</td>
+                        <td>{{ plate.appear_count ?? plate.count ?? 1 }}</td>
+                        <td>{{ plate.best_frame_index ?? '-' }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <div v-if="!plateAggregatedList.length" class="empty-state">
+                    全视频没有形成稳定车牌结果。
+                  </div>
+                </div>
+
+                <div v-if="plateFileType === 'video'" class="plate-filter-summary">
+                  <span>
+                    聚合规则：相似车牌合并为一组，组内只显示最高置信度结果；
+                    低于 {{ percent(plateStats.confidenceThreshold) }} 的候选不写入记录。
+                  </span>
+                  <span v-if="plateStats.discardedCandidates > 0">
+                    本次已过滤 {{ plateStats.discardedCandidates }} 条低置信度或不稳定候选。
+                  </span>
                 </div>
               </div>
 
-              <div class="result-media-card">
-                <div>
-                  <span>最佳车牌标注帧</span>
-                  <small>
-                    {{ plateVideoMetadata.width || '-' }} × {{ plateVideoMetadata.height || '-' }}
-                    · {{ formatDuration(plateVideoMetadata.duration_seconds) }}
-                  </small>
-                </div>
-                <img
-                  v-if="plateResult.output_image_url"
-                  :src="assetUrl(plateResult.output_image_url)"
-                  alt="车牌视频最佳标注帧"
-                />
-                <div v-else class="empty-state">本次未生成最佳标注帧。</div>
+              <div v-else class="empty-state result-empty">
+                上传包含清晰车辆和车牌的本地{{ plateFileType === 'image' ? '图片' : '视频' }}后，这里将显示最佳标注帧、多车牌聚合结果和处理耗时。
               </div>
+            </template>
 
-              <div class="data-table result-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>车牌号码</th>
-                      <th>颜色</th>
-                      <th>置信度</th>
-                      <th>出现次数</th>
-                      <th>最佳帧</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="(plate, index) in plateList" :key="`${plate.plate_number || index}_${index}`">
-                      <td><strong>{{ plate.plate_number || plate.plate || plate.text || '未解析号码' }}</strong></td>
-                      <td>{{ plate.plate_color || plate.color || '未知' }}</td>
-                      <td>{{ percent(plate.confidence) }}</td>
-                      <td>{{ plate.appear_count ?? plate.count ?? 1 }}</td>
-                      <td>{{ plate.best_frame_index ?? '-' }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-                <div v-if="!plateList.length" class="empty-state">
-                  当前视频未检测到车牌。可尝试增加读取帧数、减小抽帧间隔，或更换更清晰的视频。
-                </div>
-              </div>
-
-              <div class="plate-filter-summary">
-                <span>
-                  聚合规则：相似车牌合并为一组，组内只显示最高置信度结果；
-                  低于 {{ percent(plateStats.confidenceThreshold) }} 的候选不写入记录。
+            <!-- 批量结果列表 -->
+            <div v-if="plateBatchMode && plateBatchResults.length" class="batch-results-stack">
+              <div class="batch-results-summary">
+                <span>共 {{ plateBatchResults.length }} 个文件</span>
+                <span>成功 {{ plateBatchResults.filter(r => r.status === 'success').length }} 个</span>
+                <span v-if="plateBatchResults.filter(r => r.status === 'error').length">
+                  失败 {{ plateBatchResults.filter(r => r.status === 'error').length }} 个
                 </span>
-                <span v-if="plateStats.discardedCandidates > 0">
-                  本次已过滤 {{ plateStats.discardedCandidates }} 条低置信度或不稳定候选。
-                </span>
               </div>
-            </div>
+              <div
+                v-for="(br, idx) in plateBatchResults"
+                :key="idx"
+                :class="['batch-result-card', `batch-${br.status}`]"
+              >
+                <div class="batch-result-header">
+                  <span class="batch-result-type" :class="br.file_type">{{ br.file_type === 'image' ? '图片' : '视频' }}</span>
+                  <strong>{{ br.filename }}</strong>
+                  <span v-if="br.status === 'success'" class="batch-result-latency">{{ formatMilliseconds(br.processing_latency_ms) }}</span>
+                  <span v-else class="batch-result-error-tag">失败</span>
+                </div>
+                <div v-if="br.status === 'success'" class="batch-result-body">
+                  <img
+                    v-if="batchBestOutputImageUrl(br)"
+                    :src="assetUrl(batchBestOutputImageUrl(br))"
+                    class="batch-result-thumb"
+                    alt="标注结果"
+                    @click="enlargedImage = assetUrl(batchBestOutputImageUrl(br))"
+                    title="点击放大"
+                  />
+                  <div class="batch-evidence-groups">
+                    <div>
+                      <strong class="batch-evidence-title">
+                        最佳帧车牌 · {{ batchBestFramePlates(br).length }} 个框
+                      </strong>
+                      <div v-if="batchBestFramePlates(br).length" class="batch-plates">
+                        <span
+                          v-for="(p, pIndex) in batchBestFramePlates(br)"
+                          :key="`best_${p.plate_number || pIndex}_${pIndex}`"
+                          class="batch-plate-tag"
+                        >
+                          {{ p.plate_number || p.plate || '?' }}
+                          <small>
+                            {{ p.plate_color || p.color || '未知颜色' }}
+                            · {{ percent(p.confidence) }}
+                          </small>
+                        </span>
+                      </div>
+                      <span v-else class="batch-no-result">
+                        最佳帧未检测到有效车牌框
+                      </span>
+                    </div>
 
-            <div v-else class="empty-state result-empty">
-              上传包含清晰车辆和车牌的本地视频后，这里将显示最佳标注帧、多车牌聚合结果和处理耗时。
+                    <div v-if="br.file_type === 'video'">
+                      <strong class="batch-evidence-title">
+                        全视频汇总 · {{ batchAggregatedPlates(br).length }} 个稳定车牌
+                      </strong>
+                      <div v-if="batchAggregatedPlates(br).length" class="batch-plates">
+                        <span
+                          v-for="(p, pIndex) in batchAggregatedPlates(br)"
+                          :key="`video_${p.plate_number || pIndex}_${pIndex}`"
+                          class="batch-plate-tag aggregate"
+                        >
+                          {{ p.plate_number || p.plate || '?' }}
+                          <small>
+                            {{ p.plate_color || p.color || '未知颜色' }}
+                            · {{ percent(p.confidence) }}
+                            · 出现 {{ p.appear_count ?? 1 }} 次
+                          </small>
+                        </span>
+                      </div>
+                      <span v-else class="batch-no-result">
+                        全视频没有形成稳定车牌
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="batch-result-body">
+                  <span class="batch-result-error">{{ br.error }}</span>
+                </div>
+              </div>
             </div>
           </article>
         </template>
 
         <template v-if="recognitionTab === 'traffic'">
-          <article class="panel span-5">
-            <header class="panel-title">
-              <div>
-                <p class="eyebrow">TRAFFIC GESTURE VIDEO</p>
-                <h2>交警手势视频上传</h2>
-                <p>使用 MediaPipe Pose 与 V6 八类时序规则完成连续动作识别。</p>
-              </div>
-            </header>
-
-            <div
-              class="video-drop-zone"
-              @dragover.prevent
-              @drop.prevent="dropRecognitionFile($event, 'traffic')"
-            >
-              <div class="drop-zone-icon">◎</div>
-              <strong>拖入交警手势视频，或从本地选择</strong>
-              <span>建议人物正面、全身清晰，肩、肘、腕完整可见。</span>
-              <label class="file-select-button">
-                选择交警手势视频
-                <input
-                  class="hidden-file-input"
-                  type="file"
-                  accept="video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.m4v"
-                  @change="pickRecognitionFile($event, 'traffic')"
-                />
-              </label>
-            </div>
-
-            <div v-if="trafficUpload.previewUrl" class="local-video-preview">
-              <video
-                :src="trafficUpload.previewUrl"
-                controls
-                preload="metadata"
-                @loadedmetadata="captureVideoMetadata($event, 'traffic')"
-              ></video>
-            </div>
-
-            <div v-if="trafficFile" class="selected-file-card">
-              <div>
-                <span>已选择视频</span>
-                <strong>{{ trafficFile.name }}</strong>
-                <small>
-                  {{ formatFileSize(trafficFile.size) }}
-                  <template v-if="trafficUpload.duration">
-                    · {{ formatDuration(trafficUpload.duration) }}
-                  </template>
-                </small>
-              </div>
-              <button class="text-button" :disabled="loading.traffic" @click="clearRecognitionFile('traffic')">
-                移除
+          <article class="panel span-12 sub-tab-header">
+            <div class="sub-tabs">
+              <button
+                v-for="item in trafficSubTabs"
+                :key="item.key"
+                :class="{ active: trafficSubTab === item.key }"
+                @click="trafficSubTab = item.key; recognitionError = ''"
+              >
+                {{ item.label }}
               </button>
             </div>
+          </article>
 
-            <div class="recognition-parameter-grid">
-              <label>
-                <span>最大读取帧数</span>
-                <input
-                  v-model.number="trafficUpload.frameCount"
-                  type="number"
-                  min="20"
-                  max="300"
-                  step="10"
-                />
-                <small>建议覆盖完整动作</small>
-              </label>
-              <label>
-                <span>抽帧间隔</span>
-                <input
-                  v-model.number="trafficUpload.sampleInterval"
-                  type="number"
-                  min="1"
-                  max="20"
-                  step="1"
-                />
-                <small>建议每 2 帧识别一次</small>
-              </label>
-            </div>
+          <template v-if="trafficSubTab === 'upload'">
+            <article class="panel span-5">
+              <header class="panel-title">
+                <div>
+                  <p class="eyebrow">TRAFFIC GESTURE</p>
+                  <h2>交警手势文件上传</h2>
+                  <p>支持 JPG、PNG、BMP、WebP 图片和 MP4、AVI、MOV、MKV、WebM 视频，自动识别格式。</p>
+                </div>
+              </header>
 
-            <button
-              class="primary-action"
-              :disabled="loading.traffic || !trafficFile"
-              @click="recognizeTraffic"
-            >
-              {{ loading.traffic ? '正在上传并识别...' : '开始交警手势视频识别' }}
-            </button>
+              <!-- 批量开关 -->
+              <div class="input-mode-row">
+                <div></div>
+                <label class="batch-toggle">
+                  <input type="checkbox" v-model="trafficBatchMode" @change="clearRecognitionFile('traffic')" />
+                  <span>批量上传</span>
+                </label>
+              </div>
+
+              <!-- 单文件模式 -->
+              <template v-if="!trafficBatchMode">
+                <div
+                  class="video-drop-zone"
+                  @dragover.prevent
+                  @drop.prevent="dropRecognitionFile($event, 'traffic')"
+                >
+                  <div class="drop-zone-icon">◎</div>
+                  <strong>拖入交警手势文件，或从本地选择</strong>
+                  <span>支持图片和视频，自动识别格式。建议人物正面、全身清晰。</span>
+                  <label class="file-select-button">
+                    选择文件
+                    <input
+                      class="hidden-file-input"
+                      type="file"
+                      accept="image/jpeg,image/png,image/bmp,image/webp,video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.jpg,.jpeg,.png,.bmp,.webp,.m4v"
+                      @change="pickRecognitionFile($event, 'traffic')"
+                    />
+                  </label>
+                </div>
+
+                <!-- 图片预览 -->
+                <div v-if="trafficFileType === 'image' && trafficUpload.previewUrl" class="local-video-preview">
+                  <img :src="trafficUpload.previewUrl" alt="图片预览" style="max-width:100%;max-height:300px;object-fit:contain;cursor:pointer;" @click="enlargedImage = trafficUpload.previewUrl" title="点击放大" />
+                </div>
+                <!-- 视频预览 -->
+                <div v-if="trafficFileType === 'video' && trafficUpload.previewUrl" class="local-video-preview">
+                  <video
+                    :src="trafficUpload.previewUrl"
+                    controls
+                    preload="metadata"
+                    @loadedmetadata="captureVideoMetadata($event, 'traffic')"
+                  ></video>
+                </div>
+
+                <div v-if="trafficFile" class="selected-file-card">
+                  <div>
+                    <span>已选择{{ trafficFileType === 'image' ? '图片' : '视频' }}</span>
+                    <strong>{{ trafficFile.name }}</strong>
+                    <small>
+                      {{ formatFileSize(trafficFile.size) }}
+                      <template v-if="trafficFileType === 'video' && trafficUpload.duration">
+                        · {{ formatDuration(trafficUpload.duration) }}
+                      </template>
+                    </small>
+                  </div>
+                  <button class="text-button" :disabled="loading.traffic" @click="clearRecognitionFile('traffic')">
+                    移除
+                  </button>
+                </div>
+
+                <!-- 视频参数（仅视频时显示） -->
+                <div v-if="trafficFileType === 'video'" class="recognition-parameter-grid">
+                  <label>
+                    <span>最大读取帧数</span>
+                    <input
+                      v-model.number="trafficUpload.frameCount"
+                      type="number"
+                      min="20"
+                      max="300"
+                      step="10"
+                    />
+                    <small>建议覆盖完整动作</small>
+                  </label>
+                  <label>
+                    <span>抽帧间隔</span>
+                    <input
+                      v-model.number="trafficUpload.sampleInterval"
+                      type="number"
+                      min="1"
+                      max="20"
+                      step="1"
+                    />
+                    <small>建议每 2 帧识别一次</small>
+                  </label>
+                </div>
+
+                <button
+                  class="primary-action"
+                  :disabled="loading.traffic || !trafficFile"
+                  @click="recognizeTraffic"
+                >
+                  {{ loading.traffic ? '正在上传并识别...' : `开始交警手势${trafficFileType === 'image' ? '图片' : '视频'}识别` }}
+                </button>
+              </template>
+
+              <!-- 批量模式 -->
+              <template v-else>
+                <div
+                  class="video-drop-zone"
+                  @dragover.prevent
+                  @drop.prevent="dropBatchFiles($event, 'traffic')"
+                >
+                  <div class="drop-zone-icon">▦</div>
+                  <strong>拖入文件（支持图片和视频混合），或从本地选择</strong>
+                  <span>批量模式支持同时上传图片和视频，逐个识别并展示结果。</span>
+                  <label class="file-select-button">
+                    选择文件
+                    <input
+                      class="hidden-file-input"
+                      type="file"
+                      multiple
+                      accept="image/jpeg,image/png,image/bmp,image/webp,video/mp4,video/avi,video/x-msvideo,video/quicktime,video/x-matroska,video/webm,.jpg,.jpeg,.png,.bmp,.webp,.m4v"
+                      @change="pickBatchFiles($event, 'traffic')"
+                    />
+                  </label>
+                </div>
+
+                <!-- 批量文件列表 -->
+                <div v-if="trafficBatchFiles.length" class="batch-file-list">
+                  <div class="batch-file-header">
+                    <span>已选择 {{ trafficBatchFiles.length }} 个文件</span>
+                    <button class="text-button" @click="clearBatchFiles('traffic')">清空</button>
+                  </div>
+                  <div
+                    v-for="(item, idx) in trafficBatchFiles"
+                    :key="item.id"
+                    class="batch-file-item"
+                  >
+                    <span class="batch-file-type" :class="item.type">{{ item.type === 'image' ? '图' : '视' }}</span>
+                    <span class="batch-file-name">{{ item.file.name }}</span>
+                    <span class="batch-file-size">{{ formatFileSize(item.file.size) }}</span>
+                    <button class="text-button" @click="removeBatchFile('traffic', idx)">✕</button>
+                  </div>
+                </div>
+
+                <!-- 视频参数（批量模式共用） -->
+                <div class="recognition-parameter-grid">
+                  <label>
+                    <span>最大读取帧数（视频）</span>
+                    <input
+                      v-model.number="trafficUpload.frameCount"
+                      type="number"
+                      min="20"
+                      max="300"
+                      step="10"
+                    />
+                    <small>建议覆盖完整动作</small>
+                  </label>
+                  <label>
+                    <span>抽帧间隔（视频）</span>
+                    <input
+                      v-model.number="trafficUpload.sampleInterval"
+                      type="number"
+                      min="1"
+                      max="20"
+                      step="1"
+                    />
+                    <small>建议每 2 帧识别一次</small>
+                  </label>
+                </div>
+
+                <button
+                  class="primary-action"
+                  :disabled="trafficBatchLoading || !trafficBatchFiles.length"
+                  @click="recognizeTrafficBatch"
+                >
+                  {{ trafficBatchLoading ? '正在批量识别...' : `开始批量识别（${trafficBatchFiles.length} 个文件）` }}
+                </button>
+              </template>
 
             <div :class="['recognition-status', `status-${trafficUpload.status}`]">
               <span>{{ recognitionStatusLabel(trafficUpload.status) }}</span>
@@ -565,105 +985,163 @@
             <header class="panel-title">
               <div>
                 <p class="eyebrow">GESTURE RESULT</p>
-                <h2>交警手势识别结果</h2>
+                <h2>交警手势{{ trafficBatchMode ? '批量' : '识别' }}结果</h2>
               </div>
               <span v-if="trafficResult" class="result-success-badge">
                 {{ trafficPayload.rule_version || '时序规则' }}
               </span>
             </header>
 
-            <div v-if="trafficResult" class="video-result-stack">
-              <div class="traffic-primary-result">
-                <div>
-                  <span>识别手势</span>
-                  <strong>{{ trafficPayload.gesture_name || trafficPayload.gesture || '-' }}</strong>
-                  <p>{{ trafficPayload.traffic_command || trafficPayload.command || '暂无交通指令' }}</p>
+            <!-- 单文件结果 -->
+            <template v-if="!trafficBatchMode || !trafficBatchResults.length">
+              <div v-if="trafficResult" class="video-result-stack">
+                <div class="traffic-primary-result">
+                  <div>
+                    <span>识别手势</span>
+                    <strong>{{ trafficPayload.gesture_name || trafficPayload.gesture || '-' }}</strong>
+                    <p>{{ trafficPayload.traffic_command || trafficPayload.command || '暂无交通指令' }}</p>
+                  </div>
+                  <div class="confidence-orbit">
+                    <strong>{{ percent(trafficPayload.confidence) }}</strong>
+                    <span>规则置信度</span>
+                  </div>
                 </div>
-                <div class="confidence-orbit">
-                  <strong>{{ percent(trafficPayload.confidence) }}</strong>
-                  <span>规则置信度</span>
+
+                <div class="result-summary-grid traffic-summary-grid">
+                  <div>
+                    <span>有效姿态帧</span>
+                    <strong>{{ trafficStats.validFrames }}</strong>
+                    <small>检测到人体关键点</small>
+                  </div>
+                  <div>
+                    <span>稳定支持帧</span>
+                    <strong>{{ trafficStats.stableFrames }}</strong>
+                    <small>支持最终类别</small>
+                  </div>
+                  <div>
+                    <span>支持比例</span>
+                    <strong>{{ percent(trafficStats.voteRatio) }}</strong>
+                    <small>稳定帧 / 有效帧</small>
+                  </div>
+                  <div>
+                    <span>处理耗时</span>
+                    <strong>{{ formatMilliseconds(trafficStats.processingLatencyMs) }}</strong>
+                    <small>连续帧处理总耗时</small>
+                  </div>
+                </div>
+
+                <div class="result-media-card">
+                  <div>
+                    <span>最佳骨架标注帧</span>
+                    <small>
+                      最佳帧 {{ trafficPayload.best_frame_index ?? '-' }}
+                      · {{ trafficVideoMetadata.width || '-' }} × {{ trafficVideoMetadata.height || '-' }}
+                    </small>
+                  </div>
+                  <img
+                    v-if="trafficResult.output_image_url"
+                    :src="assetUrl(trafficResult.output_image_url)"
+                    alt="交警手势最佳骨架标注帧"
+                    style="cursor:pointer"
+                    @click="enlargedImage = assetUrl(trafficResult.output_image_url)"
+                    title="点击放大"
+                  />
+                  <div v-else class="empty-state">本次未生成最佳标注帧。</div>
+                </div>
+
+                <div class="rule-detail-grid">
+                  <div>
+                    <span>内部类别</span>
+                    <strong>{{ trafficPayload.gesture || '-' }}</strong>
+                  </div>
+                  <div>
+                    <span>命中规则</span>
+                    <strong>{{ trafficPayload.matched_rule || '-' }}</strong>
+                  </div>
+                  <div>
+                    <span>规则版本</span>
+                    <strong>{{ trafficPayload.rule_version || '-' }}</strong>
+                  </div>
+                  <div>
+                    <span>识别策略</span>
+                    <strong>{{ trafficPayload.classifier_type || 'rule_based_temporal' }}</strong>
+                  </div>
+                </div>
+
+                <div class="signature-panel">
+                  <div>
+                    <span>V6 动作签名</span>
+                    <small>高亮项表示本次视频满足对应的互斥动作结构。</small>
+                  </div>
+                  <div class="signature-grid">
+                    <span
+                      v-for="item in trafficSignatureItems"
+                      :key="item.key"
+                      :class="{ matched: item.matched }"
+                    >
+                      {{ item.label }}
+                    </span>
+                  </div>
                 </div>
               </div>
 
-              <div class="result-summary-grid traffic-summary-grid">
-                <div>
-                  <span>有效姿态帧</span>
-                  <strong>{{ trafficStats.validFrames }}</strong>
-                  <small>检测到人体关键点</small>
-                </div>
-                <div>
-                  <span>稳定支持帧</span>
-                  <strong>{{ trafficStats.stableFrames }}</strong>
-                  <small>支持最终类别</small>
-                </div>
-                <div>
-                  <span>支持比例</span>
-                  <strong>{{ percent(trafficStats.voteRatio) }}</strong>
-                  <small>稳定帧 / 有效帧</small>
-                </div>
-                <div>
-                  <span>处理耗时</span>
-                  <strong>{{ formatMilliseconds(trafficStats.processingLatencyMs) }}</strong>
-                  <small>连续帧处理总耗时</small>
-                </div>
+              <div v-else class="empty-state result-empty">
+                上传完整交警动作{{ trafficFileType === 'image' ? '图片' : '视频' }}后，这里将显示手势类别、交通指令、稳定支持帧、规则版本和最佳骨架帧。
               </div>
+            </template>
 
-              <div class="result-media-card">
-                <div>
-                  <span>最佳骨架标注帧</span>
-                  <small>
-                    最佳帧 {{ trafficPayload.best_frame_index ?? '-' }}
-                    · {{ trafficVideoMetadata.width || '-' }} × {{ trafficVideoMetadata.height || '-' }}
-                  </small>
-                </div>
-                <img
-                  v-if="trafficResult.output_image_url"
-                  :src="assetUrl(trafficResult.output_image_url)"
-                  alt="交警手势最佳骨架标注帧"
-                />
-                <div v-else class="empty-state">本次未生成最佳标注帧。</div>
+            <!-- 批量结果列表 -->
+            <div v-if="trafficBatchMode && trafficBatchResults.length" class="batch-results-stack">
+              <div class="batch-results-summary">
+                <span>共 {{ trafficBatchResults.length }} 个文件</span>
+                <span>成功 {{ trafficBatchResults.filter(r => r.status === 'success').length }} 个</span>
+                <span v-if="trafficBatchResults.filter(r => r.status === 'error').length">
+                  失败 {{ trafficBatchResults.filter(r => r.status === 'error').length }} 个
+                </span>
               </div>
-
-              <div class="rule-detail-grid">
-                <div>
-                  <span>内部类别</span>
-                  <strong>{{ trafficPayload.gesture || '-' }}</strong>
+              <div
+                v-for="(br, idx) in trafficBatchResults"
+                :key="idx"
+                :class="['batch-result-card', `batch-${br.status}`]"
+              >
+                <div class="batch-result-header">
+                  <span class="batch-result-type" :class="br.file_type">{{ br.file_type === 'image' ? '图片' : '视频' }}</span>
+                  <strong>{{ br.filename }}</strong>
+                  <span v-if="br.status === 'success'" class="batch-result-latency">{{ formatMilliseconds(br.processing_latency_ms) }}</span>
+                  <span v-else class="batch-result-error-tag">失败</span>
                 </div>
-                <div>
-                  <span>命中规则</span>
-                  <strong>{{ trafficPayload.matched_rule || '-' }}</strong>
-                </div>
-                <div>
-                  <span>规则版本</span>
-                  <strong>{{ trafficPayload.rule_version || '-' }}</strong>
-                </div>
-                <div>
-                  <span>识别策略</span>
-                  <strong>{{ trafficPayload.classifier_type || 'rule_based_temporal' }}</strong>
-                </div>
-              </div>
-
-              <div class="signature-panel">
-                <div>
-                  <span>V6 动作签名</span>
-                  <small>高亮项表示本次视频满足对应的互斥动作结构。</small>
-                </div>
-                <div class="signature-grid">
-                  <span
-                    v-for="item in trafficSignatureItems"
-                    :key="item.key"
-                    :class="{ matched: item.matched }"
-                  >
-                    {{ item.label }}
+                <div v-if="br.status === 'success'" class="batch-result-body">
+                  <img
+                    v-if="br.output_image_url"
+                    :src="assetUrl(br.output_image_url)"
+                    class="batch-result-thumb"
+                    alt="标注结果"
+                    @click="enlargedImage = assetUrl(br.output_image_url)"
+                    title="点击放大"
+                  />
+                  <div class="batch-gesture-info">
+                    <span class="batch-gesture-name">
+                      {{ br.result?.gesture_name || br.result?.gesture || '未知手势' }}
+                    </span>
+                    <small v-if="br.result?.confidence">{{ percent(br.result.confidence) }}</small>
+                  </div>
+                  <span v-if="br.result?.traffic_command || br.result?.command" class="batch-command">
+                    {{ br.result.traffic_command || br.result.command }}
                   </span>
                 </div>
+                <div v-else class="batch-result-body">
+                  <span class="batch-result-error">{{ br.error }}</span>
+                </div>
               </div>
             </div>
-
-            <div v-else class="empty-state result-empty">
-              上传完整交警动作视频后，这里将显示手势类别、交通指令、稳定支持帧、规则版本和最佳骨架帧。
-            </div>
           </article>
+          </template>
+
+          <template v-if="trafficSubTab === 'camera'">
+            <article class="panel span-12">
+              <TrafficGestureCamera />
+            </article>
+          </template>
         </template>
 
         <template v-if="recognitionTab === 'owner'">
@@ -678,28 +1156,150 @@
           <header class="panel-title">
             <div>
               <p class="eyebrow">VIDEO SOURCES</p>
-              <h2>可用视频源</h2>
-              <p>用户端仅负责选择和检测视频源；新增、编辑、删除由管理员后台完成。</p>
+              <h2>我的视频源与系统共享源</h2>
+              <p>
+                普通用户可以新增、编辑、启停和删除自己的视频源；
+                系统共享源所有用户可用，但只能由管理员修改。
+              </p>
             </div>
+            <button class="primary-action compact" @click="openNewSourceEditor">
+              新增我的视频源
+            </button>
           </header>
+
+          <div v-if="sourceEditorOpen" class="user-source-editor">
+            <div class="source-editor-heading">
+              <div>
+                <span>{{ editingSourceId ? 'EDIT SOURCE' : 'NEW SOURCE' }}</span>
+                <h3>{{ editingSourceId ? '编辑我的视频源' : '新增我的视频源' }}</h3>
+              </div>
+              <button class="text-button" @click="closeSourceEditor">关闭</button>
+            </div>
+
+            <div class="user-source-form-grid">
+              <label>
+                <span>名称</span>
+                <input v-model.trim="userSourceForm.name" placeholder="例如：我的车牌 RTSP 流" />
+              </label>
+              <label>
+                <span>用途</span>
+                <select v-model="userSourceForm.source_type">
+                  <option value="plate">车牌识别</option>
+                  <option value="traffic_gesture">交警手势</option>
+                  <option value="owner_gesture">车主手势</option>
+                  <option value="general">通用视频源</option>
+                </select>
+              </label>
+              <label>
+                <span>协议</span>
+                <select v-model="userSourceForm.protocol">
+                  <option value="rtsp">RTSP</option>
+                  <option value="mediamtx">MediaMTX</option>
+                  <option value="hls">HLS</option>
+                  <option value="webrtc">WebRTC</option>
+                  <option value="mjpeg">MJPEG</option>
+                  <option value="demo">Demo</option>
+                  <option value="mock">Mock</option>
+                </select>
+              </label>
+              <label>
+                <span>源 ID</span>
+                <input v-model.trim="userSourceForm.source_id" placeholder="例如：my_plate_stream" />
+              </label>
+              <label class="source-form-wide">
+                <span>视频流地址</span>
+                <input
+                  v-model.trim="userSourceForm.source_url"
+                  placeholder="rtsp://127.0.0.1:8554/my_stream"
+                />
+              </label>
+              <label>
+                <span>Demo 文件</span>
+                <input v-model.trim="userSourceForm.demo_file" placeholder="可选，例如 traffic.png" />
+              </label>
+              <label>
+                <span>最大读取帧数</span>
+                <input v-model.number="userSourceForm.frame_count" type="number" min="5" max="300" />
+              </label>
+              <label>
+                <span>抽帧间隔</span>
+                <input v-model.number="userSourceForm.sample_interval" type="number" min="1" max="60" />
+              </label>
+              <label>
+                <span>预热帧数</span>
+                <input v-model.number="userSourceForm.warmup_frames" type="number" min="0" max="30" />
+              </label>
+              <label class="source-form-wide">
+                <span>说明</span>
+                <textarea v-model.trim="userSourceForm.description" rows="3"></textarea>
+              </label>
+            </div>
+
+            <div class="source-form-options">
+              <label>
+                <input v-model="userSourceForm.use_mock_frame" type="checkbox" />
+                使用 Mock / Demo 输入
+              </label>
+              <label>
+                <input v-model="userSourceForm.enabled" type="checkbox" />
+                启用视频源
+              </label>
+            </div>
+
+            <div class="source-form-buttons">
+              <button class="text-button" @click="closeSourceEditor">取消</button>
+              <button
+                class="primary-action compact"
+                :disabled="sourceSaving"
+                @click="saveUserSource"
+              >
+                {{ sourceSaving ? '保存中...' : editingSourceId ? '保存修改' : '创建视频源' }}
+              </button>
+            </div>
+          </div>
 
           <div class="source-list">
             <article v-for="item in videoSources" :key="item.id">
-              <div>
-                <span>{{ sourceTypeLabel(item.source_type) }}</span>
+              <div class="source-main-info">
+                <div class="source-badges">
+                  <span>{{ sourceTypeLabel(item.source_type) }}</span>
+                  <span :class="['source-owner-badge', item.is_global ? 'shared' : 'mine']">
+                    {{ item.is_global ? '系统共享' : item.is_mine ? '我的视频源' : `用户：${item.owner_username || item.user_id}` }}
+                  </span>
+                  <span :class="['source-enabled-badge', item.enabled ? 'enabled' : 'disabled']">
+                    {{ item.enabled ? '已启用' : '已停用' }}
+                  </span>
+                </div>
                 <h3>{{ item.name }}</h3>
                 <p>{{ maskUrl(item.source_url || item.demo_file || item.source_id || '-') }}</p>
+                <small v-if="item.description">{{ item.description }}</small>
               </div>
+
               <div class="source-actions">
                 <strong :class="{ online: sourceChecks[item.id]?.online }">
                   {{ sourceChecks[item.id] ? (sourceChecks[item.id].online ? '可用' : '不可用') : '未检测' }}
                 </strong>
-                <button :disabled="checkingSourceId === item.id" @click="checkSource(item)">
+                <button
+                  :disabled="checkingSourceId === item.id"
+                  @click="checkSource(item)"
+                >
                   {{ checkingSourceId === item.id ? '检测中...' : '检测连接' }}
                 </button>
+                <template v-if="item.can_manage">
+                  <button @click="editUserSource(item)">编辑</button>
+                  <button @click="toggleUserSource(item)">
+                    {{ item.enabled ? '停用' : '启用' }}
+                  </button>
+                  <button class="danger-button" @click="removeUserSource(item)">
+                    删除
+                  </button>
+                </template>
               </div>
             </article>
-            <div v-if="!videoSources.length" class="empty-state">暂无已启用视频源。</div>
+
+            <div v-if="!videoSources.length" class="empty-state">
+              暂无可用视频源。
+            </div>
           </div>
         </article>
       </section>
@@ -926,13 +1526,30 @@
       </article>
     </div>
   </div>
+
+  <!-- 图片放大灯箱 -->
+  <Teleport to="body">
+    <div v-if="enlargedImage" class="image-lightbox" @click="enlargedImage = null">
+      <button class="lightbox-close" @click="enlargedImage = null">✕</button>
+      <img :src="enlargedImage" @click.stop alt="放大查看" />
+    </div>
+  </Teleport>
 </template>
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import OwnerCameraPanel from './components/OwnerCameraPanel.vue'
-import { API_BASE, apiGet, apiPost, uploadFile } from './api'
+import TrafficGestureCamera from './components/TrafficGestureCamera.vue'
+import HlsVideoPlayer from './components/HlsVideoPlayer.vue'
+import {
+  API_BASE,
+  apiDelete,
+  apiGet,
+  apiPost,
+  apiPut,
+  uploadFile,
+} from './api'
 import { useAuth } from './useAuth'
 
 const router = useRouter()
@@ -953,8 +1570,14 @@ const recognitionTabs = [
   { key: 'owner', label: '车主手势控车' },
 ]
 
+const trafficSubTabs = [
+  { key: 'upload', label: '视频上传' },
+  { key: 'camera', label: '实时摄像头' },
+]
+
 const activeView = ref('overview')
 const recognitionTab = ref('plate')
+const trafficSubTab = ref('upload')
 const globalError = ref('')
 const recognitionError = ref('')
 
@@ -980,6 +1603,25 @@ const retryingAlertId = ref(null)
 const videoSources = ref([])
 const latestDecisionRaw = ref(null)
 
+const sourceEditorOpen = ref(false)
+const sourceSaving = ref(false)
+const editingSourceId = ref(null)
+const userSourceForm = reactive({
+  source_key: '',
+  name: '',
+  source_type: 'plate',
+  source_id: '',
+  source_url: '',
+  protocol: 'rtsp',
+  use_mock_frame: false,
+  demo_file: '',
+  frame_count: 20,
+  sample_interval: 5,
+  warmup_frames: 3,
+  enabled: true,
+  description: '',
+})
+
 const selectedPlateSourceId = ref('')
 const selectedTrafficSourceId = ref('')
 const sourceChecks = reactive({})
@@ -993,8 +1635,9 @@ const trafficResult = ref(null)
 const plateUpload = reactive({
   previewUrl: '',
   duration: 0,
-  frameCount: 240,
-  sampleInterval: 5,
+  // 后端会进一步限制为约 12 次 OCR；前端默认参数也避免全量抽帧。
+  frameCount: 90,
+  sampleInterval: 10,
   status: 'idle',
 })
 
@@ -1006,6 +1649,19 @@ const trafficUpload = reactive({
   status: 'idle',
 })
 
+// ---- 模型测试中心：批量上传 & 图片放大 ----
+const plateFileType = ref('')       // 'image' | 'video' 自动检测
+const trafficFileType = ref('')     // 'image' | 'video' 自动检测
+const plateBatchMode = ref(false)
+const trafficBatchMode = ref(false)
+const plateBatchFiles = ref([])       // { file, id, previewUrl, type }[]
+const trafficBatchFiles = ref([])
+const plateBatchResults = ref([])     // per-file recognition results
+const trafficBatchResults = ref([])
+const plateBatchLoading = ref(false)
+const trafficBatchLoading = ref(false)
+const enlargedImage = ref(null)       // 点击放大的图片 URL
+
 const fusionMonitor = reactive({
   running: false,
   intervalSeconds: 5,
@@ -1013,6 +1669,11 @@ const fusionMonitor = reactive({
 })
 
 const fusionTimer = ref(null)
+let fusionCycleController = null
+let fusionRunToken = 0
+const FUSION_CHANNEL_TIMEOUT_MS = 10000
+const FUSION_DECISION_TIMEOUT_MS = 6000
+
 const evidence = reactive({
   plate: null,
   traffic: null,
@@ -1021,6 +1682,279 @@ const evidence = reactive({
 
 const currentDecisionRaw = ref(null)
 const fusionTimeline = ref([])
+const lastFusionEvent = reactive({ message: '', at: 0 })
+const lastCameraEvent = reactive({
+  traffic: { signature: '', at: 0 },
+  owner: { signature: '', at: 0 },
+})
+const FUSION_CAMERA_EVIDENCE_MAX_AGE_MS = 3500
+
+// ---- Live video stream state ----
+const livePreviewSourceId = ref('')
+const streamLoading = ref(false)
+const streamError = ref(false)
+const streamReloadToken = ref(0)
+const streamRecoveryAttempt = ref(0)
+const streamStatusText = ref('未连接')
+const sandboxStreams = ref([]) // 来自 GET /api/streaming/sandbox/list
+
+let streamRecoveryTimer = null
+let streamHealthTimer = null
+
+// 沙盘车牌识别
+const loadingPlateRecognize = ref(false)
+
+async function recognizeSandboxPlate() {
+  if (!livePreviewSourceId.value) return
+  loadingPlateRecognize.value = true
+  try {
+    const res = await apiPost('/api/fusion/monitor/sandbox/plate/recognize', {
+      camera_id: livePreviewSourceId.value,
+      frame_count: 60,
+      sample_interval: 5,
+      warmup_frames: 3,
+    })
+    if (res.status === 'success' && res.data) {
+      evidence.plate = res.data
+      addFusionEvent(`车牌识别完成: ${res.data.best_plate || '未检测到车牌'} (${res.data.latency_ms}ms)`)
+    } else {
+      addFusionEvent(`车牌识别失败: ${res.detail || '未知错误'}`)
+    }
+  } catch (e) {
+    addFusionEvent('车牌识别失败: ' + (e.message || '网络错误'))
+  } finally {
+    loadingPlateRecognize.value = false
+  }
+}
+
+const livePreviewSources = computed(() => {
+  // 合并沙盘 HLS 流和现有视频源
+  const sandbox = sandboxStreams.value.map((s) => ({
+    id: s.id,
+    source_id: s.id,
+    name: `沙盘 - ${s.name}`,
+    source_url: s.hls_url,
+    hls_url: s.hls_url,
+    webrtc_url: s.webrtc_url,
+    protocol: 'hls',
+    enabled: true,
+  }))
+  const existing = videoSources.value.filter((item) => item.enabled !== false)
+  // 去重
+  const seen = new Set(sandbox.map((s) => s.source_id))
+  const filtered = existing.filter((item) => !seen.has(item.source_id))
+  return [...sandbox, ...filtered]
+})
+
+const selectedLivePreviewSource = computed(() => {
+  // 先查沙盘流
+  const sandbox = sandboxStreams.value.find((s) => s.id === livePreviewSourceId.value)
+  if (sandbox) {
+    return {
+      source_id: sandbox.id,
+      name: `沙盘 - ${sandbox.name}`,
+      source_url: sandbox.hls_url,
+      hls_url: sandbox.hls_url,
+      webrtc_url: sandbox.webrtc_url,
+      protocol: 'hls',
+    }
+  }
+  // 再查 video_sources 表
+  return videoSources.value.find(
+    (item) => String(item.source_id) === String(livePreviewSourceId.value),
+  )
+})
+
+const liveStreamUrl = computed(() => {
+  if (!livePreviewSourceId.value) return ''
+  const src = selectedLivePreviewSource.value
+  if (!src) return ''
+
+  // WebRTC / HLS 沙盘流：直接返回播放地址
+  if ((src.protocol === 'webrtc' || src.protocol === 'hls') && src.source_url) {
+    return src.source_url
+  }
+
+  // source_id 以 live 开头：尝试转为 MediaMTX HLS
+  const sourceId = src.source_id || livePreviewSourceId.value
+  if (sourceId && sourceId.startsWith('live')) {
+    return `http://127.0.0.1:8888/${sourceId}/index.m3u8`
+  }
+
+  // fallback: 旧 MJPEG 端点
+  const params = new URLSearchParams({ fps: '15' })
+  const url = src.source_url || ''
+  if (url) {
+    params.set('source_url', url)
+  } else {
+    params.set('source_id', sourceId)
+  }
+  return `${API_BASE}/api/video/stream?${params}`
+})
+
+function clearStreamTimers() {
+  if (streamRecoveryTimer) {
+    window.clearTimeout(streamRecoveryTimer)
+    streamRecoveryTimer = null
+  }
+  if (streamHealthTimer) {
+    window.clearInterval(streamHealthTimer)
+    streamHealthTimer = null
+  }
+}
+
+function selectedSandboxStream() {
+  return sandboxStreams.value.find(
+    (item) =>
+      String(item.id) === String(livePreviewSourceId.value),
+  )
+}
+
+async function ensureSandboxRelay({
+  forceRestart = false,
+} = {}) {
+  const sandbox = selectedSandboxStream()
+  if (!sandbox) return false
+
+  const response = await apiPost('/api/streaming/ffmpeg/start', {
+    camera_id: sandbox.id,
+    mode: 'copy',
+    fps: 15,
+    force_restart: forceRestart,
+  })
+
+  return Boolean(
+    response?.running
+    || response?.data?.running,
+  )
+}
+
+function startStreamHealthMonitor() {
+  if (streamHealthTimer) {
+    window.clearInterval(streamHealthTimer)
+  }
+
+  streamHealthTimer = window.setInterval(async () => {
+    const sandbox = selectedSandboxStream()
+    if (!sandbox) return
+
+    try {
+      const status = await apiGet(
+        `/api/streaming/ffmpeg/status?camera_id=${encodeURIComponent(sandbox.id)}`,
+      )
+      const running = Boolean(status?.data?.running)
+
+      if (!running) {
+        streamStatusText.value = '转发中断，正在恢复'
+        await ensureSandboxRelay({ forceRestart: true })
+        await sleep(1200)
+        streamReloadToken.value += 1
+      }
+    } catch {
+      // 短暂状态查询失败不立刻终止播放器。
+    }
+  }, 4000)
+}
+
+async function onLivePreviewSourceChange() {
+  clearStreamTimers()
+  streamRecoveryAttempt.value = 0
+  streamError.value = false
+  streamLoading.value = Boolean(livePreviewSourceId.value)
+  streamStatusText.value = (
+    livePreviewSourceId.value ? '正在连接' : '未连接'
+  )
+
+  if (!livePreviewSourceId.value) return
+
+  const sandbox = selectedSandboxStream()
+
+  if (!sandbox) {
+    streamReloadToken.value += 1
+    return
+  }
+
+  try {
+    await ensureSandboxRelay()
+    await sleep(1400)
+    streamReloadToken.value += 1
+    streamError.value = false
+    startStreamHealthMonitor()
+  } catch (error) {
+    streamLoading.value = false
+    streamError.value = true
+    streamStatusText.value = '视频转发启动失败'
+    globalError.value = (
+      `沙盘视频转发启动失败：${error.message}。`
+      + '请确认 MediaMTX 已启动、ffmpeg 可用且老师 RTSP 在线。'
+    )
+  }
+}
+
+function scheduleAppStreamRecovery() {
+  if (streamRecoveryTimer || !selectedSandboxStream()) return
+
+  streamRecoveryAttempt.value += 1
+
+  if (streamRecoveryAttempt.value > 6) {
+    streamError.value = true
+    streamLoading.value = false
+    streamStatusText.value = '多次重连失败'
+    return
+  }
+
+  const delay = Math.min(
+    8000,
+    1000 * streamRecoveryAttempt.value,
+  )
+
+  streamStatusText.value = (
+    `自动重连中 ${streamRecoveryAttempt.value}/6`
+  )
+  streamLoading.value = true
+  streamError.value = false
+
+  streamRecoveryTimer = window.setTimeout(async () => {
+    streamRecoveryTimer = null
+
+    try {
+      await ensureSandboxRelay({
+        forceRestart: streamRecoveryAttempt.value >= 2,
+      })
+      await sleep(1200)
+      streamReloadToken.value += 1
+    } catch {
+      scheduleAppStreamRecovery()
+    }
+  }, delay)
+}
+
+function onStreamReconnecting(payload) {
+  streamLoading.value = true
+  streamError.value = false
+  streamStatusText.value = (
+    `播放器重连中 ${payload?.attempt || ''}`
+  )
+}
+
+function onStreamError() {
+  scheduleAppStreamRecovery()
+}
+
+function onStreamLoaded() {
+  streamRecoveryAttempt.value = 0
+  streamError.value = false
+  streamLoading.value = false
+  streamStatusText.value = '已连接'
+}
+
+function openStreamInNewTab() {
+  const src = selectedLivePreviewSource.value
+  const url = src?.webrtc_url || liveStreamUrl.value
+  if (url) {
+    window.open(url, '_blank')
+  }
+}
 
 const currentNav = computed(
   () => navItems.find((item) => item.key === activeView.value) || navItems[0],
@@ -1062,13 +1996,85 @@ const platePayload = computed(() =>
   plateResult.value?.result || plateResult.value || {},
 )
 
-const plateList = computed(() => {
+const plateAggregatedList = computed(() => {
   const payload = platePayload.value
-  if (Array.isArray(payload.plates)) return payload.plates
-  if (payload.plate_number || payload.plate || payload.text) return [payload]
+
+  if (Array.isArray(payload.aggregated_plates)) {
+    return payload.aggregated_plates
+  }
+  if (Array.isArray(payload.video_plates)) {
+    return payload.video_plates
+  }
+  if (Array.isArray(payload.plates)) {
+    return payload.plates
+  }
+  if (payload.plate_number || payload.plate || payload.text) {
+    return [payload]
+  }
   return []
 })
 
+const plateBestFrameList = computed(() => {
+  const payload = platePayload.value
+
+  if (Array.isArray(payload.best_frame_plates)) {
+    return payload.best_frame_plates
+  }
+
+  // 图片识别没有“全视频”概念，结果本身就是当前帧证据。
+  if (plateFileType.value === 'image') {
+    return plateAggregatedList.value
+  }
+
+  return []
+})
+
+const plateList = plateAggregatedList
+
+const plateBestOutputImageUrl = computed(() =>
+  plateResult.value?.output_image_url ||
+  platePayload.value?.best_frame_output_image_url ||
+  platePayload.value?.best_output_image_url ||
+  '',
+)
+function batchBestOutputImageUrl(item) {
+  return (
+    item?.output_image_url
+    || item?.result?.best_frame_output_image_url
+    || item?.result?.best_output_image_url
+    || ''
+  )
+}
+
+function batchBestFramePlates(item) {
+  const result = item?.result || {}
+
+  if (Array.isArray(result.best_frame_plates)) {
+    return result.best_frame_plates
+  }
+
+  if (item?.file_type === 'image' && Array.isArray(result.plates)) {
+    return result.plates
+  }
+
+  return []
+}
+
+function batchAggregatedPlates(item) {
+  const result = item?.result || {}
+
+  if (Array.isArray(result.aggregated_plates)) {
+    return result.aggregated_plates
+  }
+  if (Array.isArray(result.video_plates)) {
+    return result.video_plates
+  }
+  if (Array.isArray(result.plates)) {
+    return result.plates
+  }
+
+  return []
+}
 const trafficPayload = computed(() =>
   trafficResult.value?.result || trafficResult.value || {},
 )
@@ -1181,13 +2187,17 @@ const overviewMetrics = computed(() => [
 ])
 
 const plateEvidenceText = computed(() => {
-  const payload = evidence.plate?.result || evidence.plate || {}
-  const plates = payload.plates || []
+  const payload = evidence.plate?.result || evidence.plate?.data || evidence.plate || {}
+  const plates = payload.plates || payload.stable_plates || []
+  const explicitBest = payload.best_plate || payload.best_plate_text || payload.plate_number
+  if (explicitBest) return explicitBest
   if (Array.isArray(plates) && plates.length) {
-    const first = plates[0]
-    return first.plate || first.plate_number || first.text || `检测到 ${plates.length} 个车牌`
+    const best = [...plates].sort(
+      (a, b) => Number(b.confidence || b.avg_confidence || 0) - Number(a.confidence || a.avg_confidence || 0),
+    )[0]
+    return best?.plate || best?.plate_number || best?.text || `检测到 ${plates.length} 个车牌`
   }
-  return payload.plate_number || payload.plate || '未检测到车牌'
+  return '未检测到车牌'
 })
 
 const trafficEvidenceText = computed(() => {
@@ -1208,10 +2218,13 @@ function recordResultSummary(item) {
   const result = item.result || {}
   if (item.task_type === 'plate') {
     const plates = Array.isArray(result.plates) ? result.plates : []
-    const numbers = plates
-      .map((plate) => plate.plate_number || plate.plate || plate.text)
-      .filter(Boolean)
-    return numbers.length ? numbers.slice(0, 3).join('、') : '未识别到有效车牌'
+    const values = plates.map((plate) => {
+      const number = plate.plate_number || plate.plate || plate.text
+      if (!number) return ''
+      const color = plate.plate_color || plate.color || '未知颜色'
+      return `${number}（${color}）`
+    }).filter(Boolean)
+    return values.length ? values.slice(0, 3).join('、') : '未识别到有效车牌'
   }
 
   if (item.task_type === 'traffic_gesture') {
@@ -1397,7 +2410,7 @@ async function refreshAll() {
     apiGet('/api/dashboard/summary'),
     apiGet('/api/records?limit=30'),
     apiGet('/api/alerts?limit=30'),
-    apiGet('/api/video-sources?enabled_only=true'),
+    apiGet('/api/video-sources?enabled_only=false'),
     apiGet('/api/fusion/monitor/latest'),
   ])
 
@@ -1427,6 +2440,14 @@ async function refreshAll() {
     }
   }
 
+  // 获取沙盘 HLS 流列表（不影响其他数据加载）
+  try {
+    const sandboxData = await apiGet('/api/streaming/sandbox/list')
+    sandboxStreams.value = sandboxData?.streams || []
+  } catch {
+    sandboxStreams.value = []
+  }
+
   if (decisionData.status === 'fulfilled') {
     latestDecisionRaw.value = decisionData.value
   }
@@ -1438,6 +2459,16 @@ function isVideoFile(file) {
   if (!file) return false
   if (file.type?.startsWith('video/')) return true
   return /\.(mp4|avi|mov|mkv|webm|m4v)$/i.test(file.name || '')
+}
+
+function isImageFile(file) {
+  if (!file) return false
+  if (file.type?.startsWith('image/')) return true
+  return /\.(jpg|jpeg|png|bmp|webp)$/i.test(file.name || '')
+}
+
+function isBatchFile(file) {
+  return isImageFile(file) || isVideoFile(file)
 }
 
 function revokePreviewUrl(uploadState) {
@@ -1452,13 +2483,14 @@ function applyRecognitionFile(file, type) {
 
   if (!file) return
 
-  if (!isVideoFile(file)) {
-    recognitionError.value = '请选择 MP4、AVI、MOV、MKV、WebM 或 M4V 视频文件'
+  // 自动检测文件类型
+  if (!isBatchFile(file)) {
+    recognitionError.value = '请选择 JPG/PNG/BMP/WebP 图片或 MP4/AVI/MOV/MKV/WebM 视频文件'
     return
   }
 
   if (file.size > 500 * 1024 * 1024) {
-    recognitionError.value = '单个视频不能超过 500 MB'
+    recognitionError.value = '单个文件不能超过 500 MB'
     return
   }
 
@@ -1466,6 +2498,13 @@ function applyRecognitionFile(file, type) {
   const targetFile = isPlate ? plateFile : trafficFile
   const targetResult = isPlate ? plateResult : trafficResult
   const targetUpload = isPlate ? plateUpload : trafficUpload
+  const detectedType = isImageFile(file) ? 'image' : 'video'
+
+  if (isPlate) {
+    plateFileType.value = detectedType
+  } else {
+    trafficFileType.value = detectedType
+  }
 
   revokePreviewUrl(targetUpload)
   targetFile.value = file
@@ -1497,13 +2536,134 @@ function clearRecognitionFile(type) {
   const targetFile = isPlate ? plateFile : trafficFile
   const targetResult = isPlate ? plateResult : trafficResult
   const targetUpload = isPlate ? plateUpload : trafficUpload
+  const targetBatchFiles = isPlate ? plateBatchFiles : trafficBatchFiles
+  const targetBatchResults = isPlate ? plateBatchResults : trafficBatchResults
 
   revokePreviewUrl(targetUpload)
   targetFile.value = null
   targetResult.value = null
   targetUpload.duration = 0
   targetUpload.status = 'idle'
+  targetBatchFiles.value = []
+  targetBatchResults.value = []
+  if (isPlate) plateFileType.value = ''
+  else trafficFileType.value = ''
   recognitionError.value = ''
+}
+
+// ---- 批量文件处理 ----
+
+function pickBatchFiles(event, type) {
+  const files = Array.from(event.target.files || [])
+  addBatchFiles(files, type)
+  event.target.value = ''
+}
+
+function dropBatchFiles(event, type) {
+  const files = Array.from(event.dataTransfer?.files || [])
+  addBatchFiles(files, type)
+}
+
+function addBatchFiles(files, type) {
+  recognitionError.value = ''
+  const isPlate = type === 'plate'
+  const targetBatchFiles = isPlate ? plateBatchFiles : trafficBatchFiles
+
+  for (const file of files) {
+    if (!isBatchFile(file)) {
+      recognitionError.value = '包含不支持的文件类型，已跳过（仅支持 JPG/PNG/BMP/WebP 图片和 MP4/AVI/MOV/MKV/WebM 视频）'
+      continue
+    }
+    if (file.size > 500 * 1024 * 1024) {
+      recognitionError.value = `"${file.name}" 超过 500MB，已跳过`
+      continue
+    }
+    targetBatchFiles.value.push({
+      id: Date.now() + Math.random().toString(36).slice(2),
+      file,
+      previewUrl: URL.createObjectURL(file),
+      type: isImageFile(file) ? 'image' : 'video',
+    })
+  }
+}
+
+function removeBatchFile(type, index) {
+  const isPlate = type === 'plate'
+  const targetBatchFiles = isPlate ? plateBatchFiles : trafficBatchFiles
+  const item = targetBatchFiles.value[index]
+  if (item?.previewUrl) URL.revokeObjectURL(item.previewUrl)
+  targetBatchFiles.value.splice(index, 1)
+}
+
+function clearBatchFiles(type) {
+  const isPlate = type === 'plate'
+  const targetBatchFiles = isPlate ? plateBatchFiles : trafficBatchFiles
+  const targetBatchResults = isPlate ? plateBatchResults : trafficBatchResults
+  for (const item of targetBatchFiles.value) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+  }
+  targetBatchFiles.value = []
+  targetBatchResults.value = []
+  recognitionError.value = ''
+}
+
+async function recognizePlateBatch() {
+  if (!plateBatchFiles.value.length) {
+    recognitionError.value = '请先选择需要识别的文件'
+    return
+  }
+  await runBatchRecognition('plate', plateBatchFiles, plateBatchResults, plateBatchLoading)
+}
+
+async function recognizeTrafficBatch() {
+  if (!trafficBatchFiles.value.length) {
+    recognitionError.value = '请先选择需要识别的文件'
+    return
+  }
+  await runBatchRecognition('traffic', trafficBatchFiles, trafficBatchResults, trafficBatchLoading)
+}
+
+async function runBatchRecognition(type, batchFilesRef, batchResultsRef, loadingRef) {
+  loadingRef.value = true
+  recognitionError.value = ''
+  batchResultsRef.value = []
+
+  const formData = new FormData()
+  for (const item of batchFilesRef.value) {
+    formData.append('files', item.file)
+  }
+
+  const taskType = type === 'plate' ? 'plate' : 'traffic_gesture'
+  const uploadState = type === 'plate' ? plateUpload : trafficUpload
+  const { frameCount, sampleInterval } = normalizeRecognitionParameters(uploadState)
+
+  try {
+    const res = await apiPost(
+      `/api/recognition/batch?task_type=${encodeURIComponent(taskType)}` +
+      `&frame_count=${encodeURIComponent(frameCount)}&sample_interval=${encodeURIComponent(sampleInterval)}`,
+      formData
+    )
+    if (res.status === 'success' && res.results) {
+      batchResultsRef.value = res.results
+      if (type === 'plate') {
+        plateUpload.status = 'success'
+        // Set single result view to the first successful result for backward compat
+        const firstSuccess = res.results.find(r => r.status === 'success')
+        if (firstSuccess) plateResult.value = firstSuccess
+      } else {
+        trafficUpload.status = 'success'
+        const firstSuccess = res.results.find(r => r.status === 'success')
+        if (firstSuccess) trafficResult.value = firstSuccess
+      }
+      await refreshAll()
+    }
+  } catch (error) {
+    if (type === 'plate') plateUpload.status = 'error'
+    else trafficUpload.status = 'error'
+    recognitionError.value = error.message
+  } finally {
+    loadingRef.value = false
+  }
 }
 
 function normalizeRecognitionParameters(uploadState) {
@@ -1515,22 +2675,27 @@ function normalizeRecognitionParameters(uploadState) {
 
 async function recognizePlate() {
   if (!plateFile.value) {
-    recognitionError.value = '请先选择车牌视频'
+    recognitionError.value = '请先选择车牌文件'
     return
   }
 
-  const { frameCount, sampleInterval } = normalizeRecognitionParameters(plateUpload)
-  plateUpload.frameCount = frameCount
-  plateUpload.sampleInterval = sampleInterval
+  const isImage = plateFileType.value === 'image'
   plateUpload.status = 'processing'
   loading.plate = true
   recognitionError.value = ''
 
   try {
-    const path =
-      `/api/plate/video?frame_count=${encodeURIComponent(frameCount)}` +
-      `&sample_interval=${encodeURIComponent(sampleInterval)}`
-    plateResult.value = await uploadFile(path, plateFile.value)
+    if (isImage) {
+      plateResult.value = await uploadFile('/api/plate/image', plateFile.value)
+    } else {
+      const { frameCount, sampleInterval } = normalizeRecognitionParameters(plateUpload)
+      plateUpload.frameCount = frameCount
+      plateUpload.sampleInterval = sampleInterval
+      const path =
+        `/api/plate/video?frame_count=${encodeURIComponent(frameCount)}` +
+        `&sample_interval=${encodeURIComponent(sampleInterval)}`
+      plateResult.value = await uploadFile(path, plateFile.value)
+    }
     plateUpload.status = 'success'
     await refreshAll()
   } catch (error) {
@@ -1543,22 +2708,27 @@ async function recognizePlate() {
 
 async function recognizeTraffic() {
   if (!trafficFile.value) {
-    recognitionError.value = '请先选择交警手势视频'
+    recognitionError.value = '请先选择交警手势文件'
     return
   }
 
-  const { frameCount, sampleInterval } = normalizeRecognitionParameters(trafficUpload)
-  trafficUpload.frameCount = frameCount
-  trafficUpload.sampleInterval = sampleInterval
+  const isImage = trafficFileType.value === 'image'
   trafficUpload.status = 'processing'
   loading.traffic = true
   recognitionError.value = ''
 
   try {
-    const path =
-      `/api/gesture/traffic/video?frame_count=${encodeURIComponent(frameCount)}` +
-      `&sample_interval=${encodeURIComponent(sampleInterval)}`
-    trafficResult.value = await uploadFile(path, trafficFile.value)
+    if (isImage) {
+      trafficResult.value = await uploadFile('/api/gesture/traffic/image', trafficFile.value)
+    } else {
+      const { frameCount, sampleInterval } = normalizeRecognitionParameters(trafficUpload)
+      trafficUpload.frameCount = frameCount
+      trafficUpload.sampleInterval = sampleInterval
+      const path =
+        `/api/gesture/traffic/video?frame_count=${encodeURIComponent(frameCount)}` +
+        `&sample_interval=${encodeURIComponent(sampleInterval)}`
+      trafficResult.value = await uploadFile(path, trafficFile.value)
+    }
     trafficUpload.status = 'success'
     await refreshAll()
   } catch (error) {
@@ -1571,25 +2741,166 @@ async function recognizeTraffic() {
 
 function sourceToPayload(source, taskType) {
   return {
-    source_id: source?.source_id || '',
-    source_url: source?.source_url || '',
+    source_id: source?.source_id || source?.id || '',
+    source_url: source?.source_url || source?.url || '',
     task_type: taskType,
-    use_mock_frame: Boolean(source?.use_mock_frame),
-    demo_file: source?.demo_file || '',
-    frame_count: Number(source?.frame_count || 20),
-    sample_interval: Number(source?.sample_interval || 5),
-    warmup_frames: Number(source?.warmup_frames || 3),
+    use_mock_frame: false,
+    frame_count: Number(
+      source?.frame_count
+      || (taskType === 'plate' ? 18 : 12),
+    ),
+    sample_interval: Number(
+      source?.sample_interval
+      || (taskType === 'plate' ? 2 : 2),
+    ),
+    warmup_frames: Number(
+      source?.warmup_frames
+      ?? 1,
+    ),
   }
 }
 
-function addFusionEvent(message) {
+function isAbortLikeError(error) {
+  return (
+    error?.name === 'AbortError'
+    || /aborted|abort|取消|超时/i.test(
+      String(error?.message || ''),
+    )
+  )
+}
+
+function createChildAbortController(
+  rootSignal,
+  timeoutMs,
+) {
+  const controller = new AbortController()
+  let timedOut = false
+
+  const abortFromRoot = () => {
+    if (!controller.signal.aborted) {
+      controller.abort('fusion_monitor_stopped')
+    }
+  }
+
+  if (rootSignal) {
+    if (rootSignal.aborted) {
+      abortFromRoot()
+    } else {
+      rootSignal.addEventListener(
+        'abort',
+        abortFromRoot,
+        { once: true },
+      )
+    }
+  }
+
+  const timer = window.setTimeout(() => {
+    timedOut = true
+    if (!controller.signal.aborted) {
+      controller.abort('request_timeout')
+    }
+  }, Math.max(1000, Number(timeoutMs || 10000)))
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      window.clearTimeout(timer)
+      rootSignal?.removeEventListener(
+        'abort',
+        abortFromRoot,
+      )
+    },
+  }
+}
+
+async function apiPostWithFusionTimeout(
+  path,
+  body,
+  rootSignal,
+  timeoutMs,
+) {
+  const child = createChildAbortController(
+    rootSignal,
+    timeoutMs,
+  )
+
+  try {
+    return await apiPost(
+      path,
+      body,
+      { signal: child.signal },
+    )
+  } catch (error) {
+    if (child.didTimeout()) {
+      const timeoutError = new Error(
+        `请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`,
+      )
+      timeoutError.name = 'FusionRequestTimeoutError'
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    child.cleanup()
+  }
+}
+
+function addFusionEvent(message, options = {}) {
+  const normalized = String(message || '').trim()
+  if (!normalized) return
+
+  const now = Date.now()
+  const dedupeWindow = Number(options.dedupeWindow ?? 2500)
+  if (
+    !options.force &&
+    lastFusionEvent.message === normalized &&
+    now - lastFusionEvent.at < dedupeWindow
+  ) {
+    return
+  }
+
+  lastFusionEvent.message = normalized
+  lastFusionEvent.at = now
   fusionTimeline.value.unshift({
-    id: `${Date.now()}_${Math.random()}`,
-    time: new Date().toLocaleTimeString(),
-    message,
+    id: `${now}_${Math.random()}`,
+    time: new Date(now).toLocaleTimeString(),
+    message: normalized,
   })
 
-  fusionTimeline.value = fusionTimeline.value.slice(0, 20)
+  fusionTimeline.value = fusionTimeline.value.slice(0, 30)
+}
+
+function channelPayload(channel) {
+  return channel?.result || channel?.data || channel || {}
+}
+
+function isFreshCameraEvidence(channel) {
+  if (!channel) return false
+  const timeValue = channel.captured_at || channel.created_at || channel.received_at
+  const timestamp = timeValue ? Date.parse(timeValue) : Number(channel.received_at_ms || 0)
+  return Number.isFinite(timestamp) && Date.now() - timestamp <= FUSION_CAMERA_EVIDENCE_MAX_AGE_MS
+}
+
+function isValidTrafficEvidence(channel) {
+  const payload = channelPayload(channel)
+  const gesture = String(payload.gesture || '')
+  return !['', 'unknown', 'no_pose', 'none'].includes(gesture)
+}
+
+function isValidOwnerEvidence(channel) {
+  const payload = channelPayload(channel)
+  const gesture = String(payload.gesture || '')
+  return !['', 'unknown', 'no_hand', 'none'].includes(gesture)
+}
+
+function plateResultMessage(channel) {
+  const payload = channelPayload(channel)
+  const plate = payload.best_plate || payload.best_plate_text || plateEvidenceText.value
+  const plateColor = payload.best_plate_color || payload.plates?.[0]?.plate_color || payload.stable_plates?.[0]?.plate_color || ''
+  const sampled = channel?.sampled_frames ?? payload.sampled_frames
+  return plate && plate !== '未检测到车牌'
+    ? `车牌通道真实检测：${plate}${plateColor ? `（${plateColor}）` : ''}${sampled ? `（抽样 ${sampled} 帧）` : ''}`
+    : `车牌通道本轮未检测到有效车牌${sampled ? `（抽样 ${sampled} 帧）` : ''}`
 }
 
 async function runFusionCycle() {
@@ -1598,66 +2909,257 @@ async function runFusionCycle() {
   loading.fusion = true
   fusionMonitor.cycle += 1
 
+  const cycleNumber = fusionMonitor.cycle
+  const runToken = fusionRunToken
+  const rootController = new AbortController()
+  fusionCycleController = rootController
+
+  const cycleEvidence = {
+    plate: null,
+    traffic: null,
+    owner: null,
+  }
+  const channelErrors = {
+    plate: '',
+    traffic: '',
+  }
+
+  let currentPlateSource = null
+  let trafficBackupExpected = false
+
+  const isCurrentRun = () => (
+    fusionMonitor.running
+    && runToken === fusionRunToken
+    && !rootController.signal.aborted
+  )
+
   try {
-    const tasks = []
+    currentPlateSource = selectedPlateSource.value || (
+      livePreviewSourceId.value
+        ? {
+            source_id: livePreviewSourceId.value,
+            source_url: '',
+            name: selectedLivePreviewSource.value?.name,
+          }
+        : null
+    )
 
-    if (selectedPlateSource.value) {
-      tasks.push(
-        apiPost(
+    const platePromise = currentPlateSource
+      ? apiPostWithFusionTimeout(
           '/api/fusion/monitor/channel/recognize',
-          sourceToPayload(selectedPlateSource.value, 'plate'),
-        ).then((data) => {
-          evidence.plate = data
-          addFusionEvent(`车牌通道：${plateEvidenceText.value}`)
-        }),
+          sourceToPayload(currentPlateSource, 'plate'),
+          rootController.signal,
+          FUSION_CHANNEL_TIMEOUT_MS,
+        )
+      : Promise.resolve(null)
+
+    let trafficPromise = Promise.resolve(null)
+
+    if (
+      isFreshCameraEvidence(evidence.traffic)
+      && isValidTrafficEvidence(evidence.traffic)
+    ) {
+      trafficPromise = Promise.resolve(evidence.traffic)
+    } else if (selectedTrafficSource.value) {
+      trafficBackupExpected = true
+      trafficPromise = apiPostWithFusionTimeout(
+        '/api/fusion/monitor/channel/recognize',
+        sourceToPayload(
+          selectedTrafficSource.value,
+          'traffic_gesture',
+        ),
+        rootController.signal,
+        FUSION_CHANNEL_TIMEOUT_MS,
       )
     }
 
-    if (selectedTrafficSource.value) {
-      tasks.push(
-        apiPost(
-          '/api/fusion/monitor/channel/recognize',
-          sourceToPayload(selectedTrafficSource.value, 'traffic_gesture'),
-        ).then((data) => {
-          evidence.traffic = data
-          addFusionEvent(`交警通道：${trafficEvidenceText.value}`)
-        }),
-      )
+    // 车牌和交警备用通道并行执行，不再串行累加等待时间。
+    const [plateSettled, trafficSettled] = (
+      await Promise.allSettled([
+        platePromise,
+        trafficPromise,
+      ])
+    )
+
+    if (!isCurrentRun()) return
+
+    if (plateSettled.status === 'fulfilled') {
+      cycleEvidence.plate = plateSettled.value
+      if (cycleEvidence.plate) {
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] ${plateResultMessage(cycleEvidence.plate)}`,
+        )
+      }
+    } else {
+      const error = plateSettled.reason
+      if (!isAbortLikeError(error)) {
+        channelErrors.plate = (
+          error?.message || String(error)
+        )
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] 车牌通道读取失败：${channelErrors.plate}`,
+          { force: true },
+        )
+      }
     }
 
-    await Promise.allSettled(tasks)
+    if (trafficSettled.status === 'fulfilled') {
+      cycleEvidence.traffic = trafficSettled.value
 
-    const data = await apiPost('/api/fusion/monitor/decision', {
-      save: true,
-      evidence: {
-        plate: evidence.plate,
-        traffic: evidence.traffic,
-        owner: evidence.owner,
+      if (
+        cycleEvidence.traffic
+        && trafficBackupExpected
+      ) {
+        const payload = channelPayload(
+          cycleEvidence.traffic,
+        )
+        const text = isValidTrafficEvidence(
+          cycleEvidence.traffic,
+        )
+          ? `交警备用视频流真实识别：${payload.gesture_name || payload.gesture}`
+          : '交警备用视频流本轮未识别到明确手势'
+
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] ${text}`,
+        )
+      }
+    } else {
+      const error = trafficSettled.reason
+      if (!isAbortLikeError(error)) {
+        channelErrors.traffic = (
+          error?.message || String(error)
+        )
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] 交警备用视频流读取失败：${channelErrors.traffic}`,
+          { force: true },
+        )
+      }
+    }
+
+    if (!isCurrentRun()) return
+
+    if (
+      isFreshCameraEvidence(evidence.owner)
+      && isValidOwnerEvidence(evidence.owner)
+    ) {
+      cycleEvidence.owner = evidence.owner
+    }
+
+    evidence.plate = cycleEvidence.plate
+    evidence.traffic = cycleEvidence.traffic
+    evidence.owner = cycleEvidence.owner
+
+    const data = await apiPostWithFusionTimeout(
+      '/api/fusion/monitor/decision',
+      {
+        save: true,
+        cycle: cycleNumber,
+        evidence: cycleEvidence,
+        monitor_context: {
+          plate_expected: Boolean(currentPlateSource),
+          plate_source_id: (
+            currentPlateSource?.source_id
+            || currentPlateSource?.id
+            || livePreviewSourceId.value
+            || 'plate_source'
+          ),
+          plate_source_name: (
+            currentPlateSource?.name
+            || selectedLivePreviewSource.value?.name
+            || '车牌视频源'
+          ),
+          plate_error: channelErrors.plate,
+          traffic_source_expected: trafficBackupExpected,
+          traffic_source_id: (
+            selectedTrafficSource.value?.source_id
+            || selectedTrafficSource.value?.id
+            || 'traffic_source'
+          ),
+          traffic_source_name: (
+            selectedTrafficSource.value?.name
+            || '交警备用视频源'
+          ),
+          traffic_error: channelErrors.traffic,
+        },
       },
+      rootController.signal,
+      FUSION_DECISION_TIMEOUT_MS,
+    )
+
+    if (!isCurrentRun()) return
+
+    const createdAlerts = (
+      data?.monitor_alerts?.created || []
+    )
+
+    createdAlerts.forEach((item) => {
+      const label = (
+        item.anomaly_type === 'plate_not_detected'
+          ? '连续未检测到车牌'
+          : item.anomaly_type === 'plate_source_failed'
+            ? '车牌视频源连续读取失败'
+            : '交警备用视频源连续读取失败'
+      )
+
+      addFusionEvent(
+        `[第 ${cycleNumber} 轮] 已生成告警并进入邮件通知队列：${label}（告警 ID ${item.alert_id}）`,
+        { force: true },
+      )
     })
 
     currentDecisionRaw.value = data?.decision || data
+
+    const decision = currentDecision.value || {}
+    const validCount = Number(
+      decision.evidence_integrity?.valid_channel_count
+      || 0,
+    )
+
     addFusionEvent(
-      `融合分析：${riskLabel(currentDecision.value?.risk_level)}，${currentDecision.value?.scenario || '完成'}`,
+      `[第 ${cycleNumber} 轮] 融合结论：${decision.scenario || '本轮无有效事件'}；有效通道 ${validCount}`,
+      { force: true },
     )
   } catch (error) {
-    addFusionEvent(`融合监控异常：${error.message}`)
+    if (
+      isCurrentRun()
+      && !isAbortLikeError(error)
+    ) {
+      addFusionEvent(
+        `[第 ${cycleNumber} 轮] 融合监控异常：${error.message}`,
+        { force: true },
+      )
+    }
   } finally {
-    loading.fusion = false
+    if (fusionCycleController === rootController) {
+      fusionCycleController = null
+    }
+
+    if (runToken === fusionRunToken) {
+      loading.fusion = false
+    }
   }
 }
 
 function startFusionMonitor() {
-  if (!selectedPlateSourceId.value || !selectedTrafficSourceId.value) {
-    globalError.value = '请先选择车牌视频源和交警手势视频源'
+  if (!selectedPlateSourceId.value && !livePreviewSourceId.value) {
+    globalError.value = '请先选择车牌视频源或沙盘实时预览；交警手势可直接使用下方电脑摄像头'
     return
   }
 
   globalError.value = ''
   stopFusionMonitor()
+  fusionRunToken += 1
   fusionMonitor.running = true
   fusionMonitor.cycle = 0
-  addFusionEvent('融合监控已启动')
+
+  if (selectedPlateSourceId.value && !livePreviewSourceId.value) {
+    const plateSrc = selectedPlateSource.value
+    livePreviewSourceId.value = plateSrc?.source_id || ''
+    streamError.value = false
+    streamLoading.value = true
+  }
+
+  addFusionEvent('融合监控已启动：时间线只记录当前轮次真实接口结果', { force: true })
   runFusionCycle()
 
   fusionTimer.value = window.setInterval(
@@ -1672,17 +3174,218 @@ function stopFusionMonitor() {
     fusionTimer.value = null
   }
 
-  if (fusionMonitor.running) {
-    addFusionEvent('融合监控已停止')
+  const wasRunning = fusionMonitor.running
+
+  fusionRunToken += 1
+  fusionMonitor.running = false
+
+  if (fusionCycleController) {
+    fusionCycleController.abort(
+      'fusion_monitor_stopped',
+    )
+    fusionCycleController = null
   }
 
-  fusionMonitor.running = false
+  loading.fusion = false
+  evidence.plate = null
+
+  if (wasRunning) {
+    addFusionEvent(
+      '融合监控已停止：当前轮次请求已取消',
+      { force: true },
+    )
+  }
+}
+
+function emitCameraTimelineEvent(channelName, payload, type) {
+  const resultPayload = channelPayload(payload)
+  const gesture = String(resultPayload.gesture || '')
+  const valid = type === 'traffic'
+    ? isValidTrafficEvidence(payload)
+    : isValidOwnerEvidence(payload)
+
+  if (!valid) return
+
+  const signature = `${gesture}:${resultPayload.action || ''}`
+  const state = lastCameraEvent[type]
+  const now = Date.now()
+  if (state.signature === signature && now - state.at < 3000) return
+
+  state.signature = signature
+  state.at = now
+  addFusionEvent(
+    `${channelName}真实识别：${resultPayload.gesture_name || gesture}${resultPayload.traffic_command ? `；${resultPayload.traffic_command}` : ''}`,
+  )
+}
+
+function handleTrafficEvidence(payload) {
+  const normalized = {
+    ...payload,
+    captured_at: payload?.captured_at || new Date().toISOString(),
+    received_at_ms: Date.now(),
+  }
+  evidence.traffic = normalized
+  emitCameraTimelineEvent('交警电脑摄像头', normalized, 'traffic')
 }
 
 function handleOwnerEvidence(payload) {
-  evidence.owner = payload
-  addFusionEvent(`车主摄像头：${ownerEvidenceText.value}`)
+  const normalized = {
+    ...payload,
+    captured_at: payload?.captured_at || payload?.created_at || new Date().toISOString(),
+    received_at_ms: Date.now(),
+  }
+  evidence.owner = normalized
+  emitCameraTimelineEvent('车主电脑摄像头', normalized, 'owner')
 }
+
+
+function resetUserSourceForm() {
+  Object.assign(userSourceForm, {
+    source_key: '',
+    name: '',
+    source_type: 'plate',
+    source_id: '',
+    source_url: '',
+    protocol: 'rtsp',
+    use_mock_frame: false,
+    demo_file: '',
+    frame_count: 20,
+    sample_interval: 5,
+    warmup_frames: 3,
+    enabled: true,
+    description: '',
+  })
+}
+
+function openNewSourceEditor() {
+  editingSourceId.value = null
+  resetUserSourceForm()
+  sourceEditorOpen.value = true
+}
+
+function closeSourceEditor() {
+  sourceEditorOpen.value = false
+  editingSourceId.value = null
+  resetUserSourceForm()
+}
+
+function editUserSource(item) {
+  if (!item?.can_manage) return
+
+  editingSourceId.value = item.id
+  sourceEditorOpen.value = true
+
+  Object.assign(userSourceForm, {
+    source_key: item.source_key || '',
+    name: item.name || '',
+    source_type: item.source_type || 'plate',
+    source_id: item.source_id || '',
+    source_url: item.source_url || '',
+    protocol: item.protocol || 'rtsp',
+    use_mock_frame: Boolean(item.use_mock_frame),
+    demo_file: item.demo_file || '',
+    frame_count: Number(item.frame_count || 20),
+    sample_interval: Number(item.sample_interval || 5),
+    warmup_frames: Number(item.warmup_frames || 3),
+    enabled: item.enabled !== false,
+    description: item.description || '',
+  })
+}
+
+function userSourcePayload() {
+  return {
+    source_key: userSourceForm.source_key,
+    name: userSourceForm.name,
+    source_type: userSourceForm.source_type,
+    source_id: userSourceForm.source_id,
+    source_url: userSourceForm.source_url,
+    protocol: userSourceForm.protocol,
+    use_mock_frame: userSourceForm.use_mock_frame,
+    demo_file: userSourceForm.demo_file,
+    frame_count: Number(userSourceForm.frame_count || 20),
+    sample_interval: Number(
+      userSourceForm.sample_interval || 5,
+    ),
+    warmup_frames: Number(userSourceForm.warmup_frames || 3),
+    enabled: userSourceForm.enabled,
+    description: userSourceForm.description,
+  }
+}
+
+async function saveUserSource() {
+  if (
+    !userSourceForm.name
+    || (
+      !userSourceForm.source_id
+      && !userSourceForm.source_url
+      && !userSourceForm.demo_file
+    )
+  ) {
+    globalError.value = (
+      '视频源名称不能为空，源 ID、流地址或 Demo 文件至少填写一项'
+    )
+    return
+  }
+
+  sourceSaving.value = true
+  globalError.value = ''
+
+  try {
+    const payload = userSourcePayload()
+
+    if (editingSourceId.value) {
+      await apiPut(
+        `/api/video-sources/${editingSourceId.value}`,
+        payload,
+      )
+    } else {
+      await apiPost('/api/video-sources', payload)
+    }
+
+    closeSourceEditor()
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  } finally {
+    sourceSaving.value = false
+  }
+}
+
+async function toggleUserSource(item) {
+  if (!item?.can_manage) return
+
+  try {
+    await apiPut(
+      `/api/video-sources/${item.id}`,
+      {
+        enabled: !item.enabled,
+      },
+    )
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  }
+}
+
+async function removeUserSource(item) {
+  if (!item?.can_manage) return
+
+  if (
+    !window.confirm(
+      `确定删除视频源“${item.name}”吗？`,
+    )
+  ) {
+    return
+  }
+
+  try {
+    await apiDelete(`/api/video-sources/${item.id}`)
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  }
+}
+
 
 async function checkSource(item) {
   checkingSourceId.value = item.id
@@ -1799,6 +3502,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopFusionMonitor()
+  clearStreamTimers()
   revokePreviewUrl(plateUpload)
   revokePreviewUrl(trafficUpload)
 })
@@ -1976,12 +3680,24 @@ onBeforeUnmount(() => {
   grid-column: span 12;
 }
 
+.span-8 {
+  grid-column: span 8;
+}
+
 .span-7 {
   grid-column: span 7;
 }
 
+.span-6 {
+  grid-column: span 6;
+}
+
 .span-5 {
   grid-column: span 5;
+}
+
+.span-4 {
+  grid-column: span 4;
 }
 
 .panel,
@@ -1995,6 +3711,150 @@ onBeforeUnmount(() => {
 
 .panel {
   padding: 18px;
+}
+
+/* ---- Fusion Monitor Layout ---- */
+
+.fusion-ctrl-span {
+  grid-column: span 4;
+}
+
+.fusion-video-span {
+  grid-column: span 8;
+}
+
+.fusion-ctrl-body {
+  display: grid;
+  gap: 12px;
+}
+
+.fusion-ctrl-body label {
+  display: grid;
+  gap: 6px;
+  color: #94a3b8;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.fusion-ctrl-body select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  background: #0b1729;
+  color: #e2e8f0;
+}
+
+.fusion-ctrl-actions {
+  display: flex;
+  gap: 9px;
+}
+
+.fusion-ctrl-actions button {
+  flex: 1;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: #0891b2;
+  color: #ffffff;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.fusion-ctrl-actions button.secondary {
+  background: #334155;
+}
+
+.fusion-ctrl-actions button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.fusion-channel-cards {
+  display: grid;
+  gap: 9px;
+}
+
+.fusion-channel-cards .channel-card {
+  padding: 11px 13px;
+  border: 1px solid #26354d;
+  border-radius: 12px;
+  background: #0b1729;
+}
+
+.fusion-channel-cards .channel-card span,
+.fusion-channel-cards .channel-card small {
+  display: block;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.fusion-channel-cards .channel-card strong {
+  display: block;
+  margin: 4px 0;
+  color: #f8fafc;
+  font-size: 15px;
+}
+
+/* ---- Stream Info Bar (below video) ---- */
+
+.stream-info-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-radius: 11px;
+  background: rgba(11, 23, 41, 0.76);
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.stream-info-bar .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.stream-info-bar .dot.on {
+  background: #6ee7b7;
+  box-shadow: 0 0 8px rgba(94, 234, 212, 0.5);
+}
+
+.stream-info-bar .dot.off {
+  background: #ef4444;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.4);
+}
+
+.stream-info-sep {
+  color: #334155;
+}
+
+.stream-info-bar button.link {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  background: transparent;
+  color: #67e8f9;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.stream-info-bar button.link:hover {
+  border-color: #67e8f9;
+  background: rgba(103, 232, 249, 0.08);
+}
+
+/* ---- WebRTC iframe (MediaMTX player) ---- */
+
+.webrtc-iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
 }
 
 .hero-card {
@@ -2486,6 +4346,335 @@ button.secondary {
   color: #fca5a5;
 }
 
+/* ---- 输入模式切换 & 批量上传 ---- */
+
+.input-mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.mode-switch {
+  display: flex;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mode-switch button {
+  padding: 5px 14px;
+  border: none;
+  background: #0f172a;
+  color: #94a3b8;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mode-switch button.active {
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.batch-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.batch-toggle input[type="checkbox"] {
+  accent-color: #1d4ed8;
+}
+
+.batch-file-list {
+  margin-top: 10px;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #0f172a;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.batch-file-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid #1e293b;
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.batch-file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #0f172a;
+}
+
+.batch-file-item:last-child {
+  border-bottom: none;
+}
+
+.batch-file-type {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.batch-file-type.image {
+  background: rgba(34, 211, 238, 0.15);
+  color: #67e8f9;
+}
+
+.batch-file-type.video {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+}
+
+.batch-file-name {
+  flex: 1;
+  font-size: 13px;
+  color: #e2e8f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-file-size {
+  font-size: 11px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+/* ---- 批量结果 ---- */
+
+.batch-results-stack {
+  display: grid;
+  gap: 10px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.batch-results-summary {
+  display: flex;
+  gap: 16px;
+  padding: 8px 12px;
+  background: #0f172a;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.batch-result-card {
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  background: #0f172a;
+  overflow: hidden;
+}
+
+.batch-result-card.batch-error {
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.batch-result-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1e293b;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.batch-result-type {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 20px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.batch-result-type.image {
+  background: rgba(34, 211, 238, 0.15);
+  color: #67e8f9;
+}
+
+.batch-result-type.video {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+}
+
+.batch-result-header strong {
+  flex: 1;
+  font-size: 13px;
+  color: #e2e8f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-result-latency {
+  font-size: 11px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.batch-result-error-tag {
+  font-size: 11px;
+  color: #fca5a5;
+  font-weight: 700;
+}
+
+.batch-result-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.batch-result-thumb {
+  width: 120px;
+  height: auto;
+  border-radius: 6px;
+  border: 1px solid #1e293b;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.batch-plates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.batch-plate-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: rgba(34, 211, 238, 0.1);
+  color: #67e8f9;
+  font-size: 14px;
+  font-weight: 700;
+  font-family: monospace;
+}
+
+.batch-plate-tag small {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.batch-no-result {
+  color: #64748b;
+  font-size: 13px;
+  font-style: italic;
+}
+
+.batch-result-error {
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+.batch-gesture-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.batch-gesture-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+
+.batch-gesture-info small {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.batch-command {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* ---- 图片放大灯箱 ---- */
+
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+  animation: lightboxFadeIn 0.15s ease;
+}
+
+@keyframes lightboxFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.image-lightbox img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 0 60px rgba(0, 0, 0, 0.5);
+  cursor: default;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 20px;
+  right: 28px;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 22px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+  z-index: 1;
+}
+
+.lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
 .result-success-badge {
   display: inline-flex;
   max-width: 260px;
@@ -2806,6 +4995,167 @@ button.secondary {
   color: #6ee7b7;
 }
 
+.user-source-editor {
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 14px;
+  background: rgba(8, 47, 73, 0.18);
+}
+
+.source-editor-heading,
+.source-form-buttons,
+.source-form-options,
+.source-badges {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.source-editor-heading,
+.source-form-buttons {
+  justify-content: space-between;
+}
+
+.source-editor-heading h3 {
+  margin: 4px 0 14px;
+}
+
+.source-editor-heading span,
+.plate-evidence-heading span {
+  color: #22d3ee;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.user-source-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.user-source-form-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+.user-source-form-grid input,
+.user-source-form-grid select,
+.user-source-form-grid textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 11px;
+  border: 1px solid #26354d;
+  border-radius: 9px;
+  background: #07111f;
+  color: #e2e8f0;
+}
+
+.source-form-wide {
+  grid-column: span 2;
+}
+
+.source-form-options {
+  margin-top: 12px;
+}
+
+.source-form-options label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.source-form-buttons {
+  margin-top: 14px;
+  justify-content: flex-end;
+}
+
+.source-main-info {
+  min-width: 0;
+}
+
+.source-main-info small {
+  display: block;
+  margin-top: 7px;
+  color: #94a3b8;
+}
+
+.source-owner-badge,
+.source-enabled-badge {
+  padding: 3px 7px;
+  border-radius: 999px;
+}
+
+.source-owner-badge.shared {
+  background: rgba(59, 130, 246, 0.13);
+  color: #93c5fd;
+}
+
+.source-owner-badge.mine {
+  background: rgba(16, 185, 129, 0.13);
+  color: #6ee7b7;
+}
+
+.source-enabled-badge.enabled {
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
+}
+
+.source-enabled-badge.disabled {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+}
+
+.danger-button {
+  border-color: rgba(248, 113, 113, 0.4) !important;
+  color: #fca5a5 !important;
+}
+
+.primary-action.compact {
+  width: auto;
+  padding: 9px 14px;
+}
+
+.plate-evidence-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0 8px;
+}
+
+.plate-evidence-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.plate-evidence-heading b {
+  color: #67e8f9;
+}
+
+.plate-evidence-heading.video-summary {
+  margin-top: 22px;
+}
+
+.batch-evidence-groups {
+  display: grid;
+  gap: 12px;
+  flex: 1;
+}
+
+.batch-evidence-title {
+  display: block;
+  margin-bottom: 7px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.batch-plate-tag.aggregate {
+  border-color: rgba(99, 102, 241, 0.28);
+  background: rgba(79, 70, 229, 0.12);
+}
+
 .alert-summary {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-bottom: 14px;
@@ -2894,13 +5244,26 @@ th {
     grid-column: span 6;
   }
 
+  .fusion-ctrl-span,
+  .fusion-video-span,
+  .span-8,
   .span-7,
-  .span-5 {
+  .span-6,
+  .span-5,
+  .span-4 {
     grid-column: span 12;
   }
 }
 
 @media (max-width: 720px) {
+  .user-source-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .source-form-wide {
+    grid-column: span 1;
+  }
+
   .user-main {
     padding: 15px;
   }

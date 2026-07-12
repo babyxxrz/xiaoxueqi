@@ -51,6 +51,3 @@ Thumbs.db
 .idea/
 
 backend/.env
-.env
-demo/*.mp4
-demo/traffic_rule_results/

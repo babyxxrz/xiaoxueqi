@@ -5,7 +5,7 @@ from typing import Callable
 
 PLATE_VIDEO_MIN_CONFIDENCE = 0.80
 PLATE_VIDEO_MIN_STABLE_APPEARANCES = 2
-PLATE_VIDEO_SINGLE_FRAME_HIGH_CONFIDENCE = 0.95
+PLATE_VIDEO_SINGLE_FRAME_HIGH_CONFIDENCE = 0.99
 PLATE_VIDEO_CLUSTER_SIMILARITY = 0.80
 
 
@@ -64,6 +64,125 @@ def plate_text_similarity(left: str, right: str) -> float:
     )
 
     return round(max(full_similarity, suffix_similarity), 4)
+
+
+
+def is_plausible_plate_number(value: str) -> bool:
+    """
+    中国大陆常规车牌通常为 7 位，新能源车牌通常为 8 位。
+    这里只做长度级别的保守过滤，避免单帧高置信度误识别直接进入稳定结果。
+    """
+    text = normalize_plate_text(value)
+    return len(text) in {7, 8}
+
+
+def match_plate_to_stable_index(
+    plate_number: str,
+    stable_plates: list[dict],
+) -> tuple[int | None, float]:
+    best_index = None
+    best_similarity = 0.0
+
+    for index, stable_plate in enumerate(stable_plates):
+        similarity = plate_text_similarity(
+            plate_number,
+            stable_plate.get("plate_number", ""),
+        )
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_index = index
+
+    if (
+        best_index is None
+        or best_similarity < PLATE_VIDEO_CLUSTER_SIMILARITY
+    ):
+        return None, best_similarity
+
+    return best_index, best_similarity
+
+
+def build_best_frame_plate_evidence(
+    best: dict,
+    stable_plates: list[dict],
+) -> list[dict]:
+    """
+    返回与“最佳标注帧”上的车牌框一一对应的结果。
+
+    全视频稳定结果可能来自不同时间点，不能直接放在单张最佳帧下方。
+    """
+    evidence: list[dict] = []
+    matched_stable_indices: set[int] = set()
+
+    raw_plates = (
+        best.get("result", {}).get("plates", [])
+        if isinstance(best.get("result"), dict)
+        else []
+    ) or []
+
+    for plate in raw_plates:
+        if not isinstance(plate, dict):
+            continue
+
+        number = normalize_plate_text(
+            plate.get("plate_number")
+            or plate.get("plate")
+            or plate.get("text")
+        )
+        confidence = float(plate.get("confidence", 0) or 0)
+
+        if (
+            not number
+            or confidence < PLATE_VIDEO_MIN_CONFIDENCE
+        ):
+            continue
+
+        stable_index, similarity = match_plate_to_stable_index(
+            number,
+            stable_plates,
+        )
+
+        # 有全视频稳定结果时，最佳帧只保留能对应到稳定聚类的框。
+        if stable_plates and stable_index is None:
+            continue
+
+        item = dict(plate)
+        item["plate_number"] = number
+        item["confidence"] = round(confidence, 4)
+        item["frame_index"] = best.get("frame_index")
+        item["evidence_scope"] = "best_frame"
+
+        if stable_index is not None:
+            if stable_index in matched_stable_indices:
+                continue
+
+            matched_stable_indices.add(stable_index)
+            stable = stable_plates[stable_index]
+
+            # 显示聚合后代表号码，但保留最佳帧原始 OCR 供审查。
+            item["raw_plate_number"] = number
+            item["plate_number"] = stable.get(
+                "plate_number",
+                number,
+            )
+            item["plate_color"] = (
+                stable.get("plate_color")
+                or item.get("plate_color")
+                or item.get("color")
+                or "未知颜色"
+            )
+            item["appear_count"] = stable.get("appear_count", 1)
+            item["candidate_variants"] = stable.get(
+                "candidate_variants",
+                [],
+            )
+            item["aggregation_similarity"] = round(
+                similarity,
+                4,
+            )
+
+        evidence.append(item)
+
+    return evidence
 
 
 def cluster_plate_candidates(candidates: list[dict]) -> list[dict]:
@@ -230,9 +349,16 @@ def aggregate_plate_frame_results_v2(
         stable_plate = build_stable_plate_from_cluster(cluster)
         appear_count = int(stable_plate.get("appear_count", 0))
         confidence = float(stable_plate.get("confidence", 0) or 0)
+        representative_number = stable_plate.get(
+            "plate_number",
+            "",
+        )
         is_stable = (
             appear_count >= PLATE_VIDEO_MIN_STABLE_APPEARANCES
-            or confidence >= PLATE_VIDEO_SINGLE_FRAME_HIGH_CONFIDENCE
+            or (
+                confidence >= PLATE_VIDEO_SINGLE_FRAME_HIGH_CONFIDENCE
+                and is_plausible_plate_number(representative_number)
+            )
         )
 
         if not is_stable:
@@ -308,11 +434,30 @@ def aggregate_plate_frame_results_v2(
         )
         filtered_frame_results.append(compact)
 
+    best_frame_plates = build_best_frame_plate_evidence(
+        best,
+        stable_plates,
+    )
+
+    if isinstance(best.get("result"), dict):
+        # 标注图和“最佳帧车牌列表”使用完全相同的框与结果。
+        best["result"]["plates"] = best_frame_plates
+        best["result"]["plate_count"] = len(best_frame_plates)
+        best["result"]["plates_count"] = len(best_frame_plates)
+
     final_result = dict(best.get("result", {}))
     final_result["model"] = final_result.get("model", "HyperLPR3")
+
+    # 兼容旧接口：plates 仍表示全视频稳定聚合结果。
     final_result["plates"] = stable_plates
+    final_result["aggregated_plates"] = stable_plates
+    final_result["video_plates"] = stable_plates
+    final_result["best_frame_plates"] = best_frame_plates
+
     final_result["plate_count"] = len(stable_plates)
+    final_result["video_plate_count"] = len(stable_plates)
     final_result["stable_plate_count"] = len(stable_plates)
+    final_result["best_frame_plate_count"] = len(best_frame_plates)
     final_result["raw_candidate_count"] = raw_candidate_count
     final_result["accepted_candidate_count"] = len(accepted_candidates)
     final_result["discarded_low_confidence_count"] = (
@@ -327,13 +472,16 @@ def aggregate_plate_frame_results_v2(
         PLATE_VIDEO_SINGLE_FRAME_HIGH_CONFIDENCE
     )
     final_result["stream_strategy"] = (
-        "连续帧抽样 + 低置信度过滤 + 相似车牌聚类 + 组内最高置信度"
+        "连续帧抽样 + 低置信度过滤 + 严格单帧候选 + "
+        "相似车牌聚类 + 最佳帧证据分离"
     )
     final_result["aggregation_version"] = (
-        "plate_video_v2_confidence_cluster"
+        "plate_video_v3_evidence_aligned"
     )
     final_result["best_frame_index"] = best.get("frame_index")
-    final_result["best_frame_plate_count"] = best_frame_score(best)[0]
+    final_result["best_frame_matched_cluster_count"] = (
+        best_frame_score(best)[0]
+    )
     final_result["sampled_frames"] = len(frame_results)
     final_result["frame_results"] = filtered_frame_results
 

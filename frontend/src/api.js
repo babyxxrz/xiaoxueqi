@@ -1,4 +1,4 @@
-/**
+﻿/**
  * HTTP 客户端 - 全局唯一 API 请求模块
  * 自动附加 Authorization 头，支持 401 自动刷新 token 并重试。
  */
@@ -148,28 +148,44 @@ async function requestJson(path, options = {}) {
   }
 }
 
-function apiGet(path) {
-  return requestJson(path, { method: 'GET' })
+function apiGet(path, options = {}) {
+  return requestJson(path, {
+    ...options,
+    method: 'GET',
+  })
 }
 
-function apiPost(path, body = {}) {
+function apiPost(path, body = {}, options = {}) {
   return requestJson(path, {
+    ...options,
     method: 'POST',
     body: body instanceof FormData ? body : JSON.stringify(body),
-    headers: body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
+    headers: {
+      ...(body instanceof FormData
+        ? {}
+        : { 'Content-Type': 'application/json' }),
+      ...(options.headers || {}),
+    },
   })
 }
 
-function apiPut(path, body = {}) {
+function apiPut(path, body = {}, options = {}) {
   return requestJson(path, {
+    ...options,
     method: 'PUT',
     body: JSON.stringify(body),
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
   })
 }
 
-function apiDelete(path) {
-  return requestJson(path, { method: 'DELETE' })
+function apiDelete(path, options = {}) {
+  return requestJson(path, {
+    ...options,
+    method: 'DELETE',
+  })
 }
 
 function uploadFile(path, file, fieldName = 'file') {

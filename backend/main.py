@@ -18,10 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from algorithm.plate_recognizer import recognize_plate_real
+from algorithm.plate_recognizer import (
+    draw_plate_annotations,
+    recognize_plate_frame,
+    recognize_plate_real,
+)
 from algorithm.plate_video_aggregator import aggregate_plate_frame_results_v2
 from algorithm.owner_gesture_recognizer import recognize_owner_gesture_image
 from algorithm.traffic_gesture_recognizer import (
+    recognize_traffic_gesture_frame,
     recognize_traffic_gesture_image,
     aggregate_traffic_gesture_sequence,
 )
@@ -53,6 +58,17 @@ from alert_email_notifier import (
     retry_all_failed_notifications,
     schedule_alert_notifications,
     start_alert_notification_worker,
+)
+
+from stream_manager import (
+    SANDBOX_CAMERAS,
+    SANDBOX_RTSP_BASE,
+    build_ffmpeg_cmd,
+    get_all_streams_status,
+    get_stream_status,
+    start_stream,
+    stop_all_streams,
+    stop_stream,
 )
 
 # --- AlertAgent 全局实例 ---
@@ -169,6 +185,8 @@ class StreamRecognizeRequest(BaseModel):
     frame_count: int = 50
     sample_interval: int = 5
     use_mock_frame: bool = False
+    # 视频批量和融合监控可开启快速模式，跳过标注图绘制与磁盘写入。
+    fast_mode: bool = False
     # 保留旧字段，兼容现有前端。
     custom_rtsp_url: str | None = None
     # 新字段同时支持 RTSP、HTTP 视频、本地视频路径和摄像头编号。
@@ -813,28 +831,58 @@ def get_result_confidence(task_type: str, result: dict) -> float:
     return float(result.get("confidence", 0) or 0)
 
 
-def recognize_single_sampled_frame(frame_info: dict, task_type: str) -> dict:
+def recognize_single_sampled_frame(
+    frame_info: dict,
+    task_type: str,
+    fast_mode: bool = False,
+) -> dict:
+    """识别一张抽样帧；快速模式不生成标注图，显著减少批量处理耗时。"""
     started = time.perf_counter()
     input_path = frame_info["saved_path"]
-    output_filename = f"annotated_{task_type}_{frame_info['saved_filename']}"
-    output_path = OUTPUT_DIR / output_filename
+    output_filename = ""
+    output_path = None
+
+    if not fast_mode:
+        output_filename = f"annotated_{task_type}_{frame_info['saved_filename']}"
+        output_path = OUTPUT_DIR / output_filename
 
     if task_type == "plate":
-        result = create_annotated_plate_image(
-            input_path=input_path,
-            output_path=output_path,
-            confidence=0.92,
-        )
+        if fast_mode:
+            image_bgr = cv2.imread(str(input_path))
+            if image_bgr is None:
+                raise RuntimeError("抽样帧读取失败")
+            result = recognize_plate_frame(
+                image_bgr=image_bgr,
+                output_path=None,
+                draw_annotation=False,
+            )
+        else:
+            result = create_annotated_plate_image(
+                input_path=input_path,
+                output_path=output_path,
+                confidence=0.92,
+            )
     elif task_type == "owner_gesture":
         result = recognize_owner_gesture_image(
             input_path=input_path,
             output_path=output_path,
         )
     elif task_type == "traffic_gesture":
-        result = recognize_traffic_gesture_image(
-            input_path=input_path,
-            output_path=output_path,
-        )
+        if fast_mode:
+            image_bgr = cv2.imread(str(input_path))
+            if image_bgr is None:
+                raise RuntimeError("抽样帧读取失败")
+            result = recognize_traffic_gesture_frame(
+                image_bgr=image_bgr,
+                output_path=None,
+                static_image_mode=True,
+                draw_annotation=False,
+            )
+        else:
+            result = recognize_traffic_gesture_image(
+                input_path=input_path,
+                output_path=output_path,
+            )
     else:
         raise HTTPException(status_code=400, detail="不支持的连续帧识别任务类型")
 
@@ -848,9 +896,10 @@ def recognize_single_sampled_frame(frame_info: dict, task_type: str) -> dict:
         "saved_filename": frame_info["saved_filename"],
         "image_url": frame_info["image_url"],
         "output_filename": output_filename,
-        "output_image_url": f"/outputs/{output_filename}",
+        "output_image_url": f"/outputs/{output_filename}" if output_filename else "",
         "confidence": confidence,
         "latency_ms": latency_ms,
+        "fast_mode": bool(fast_mode),
         "result": result,
     }
 
@@ -896,6 +945,59 @@ def aggregate_plate_frame_results(frame_results: list[dict]) -> dict:
         frame_results=frame_results,
         compact_frame_result_fn=compact_frame_result,
     )
+
+def ensure_plate_best_frame_annotation(
+    best: dict,
+    final_result: dict,
+    *,
+    prefix: str,
+) -> tuple[str, str]:
+    """快速视频识别结束后，只为最佳帧生成一张标注图。"""
+    existing_url = str(best.get("output_image_url") or "").strip()
+    existing_name = str(best.get("output_filename") or "").strip()
+    if existing_url:
+        final_result["best_frame_image_url"] = best.get("image_url", "")
+        final_result["best_frame_output_image_url"] = existing_url
+        return existing_name, existing_url
+
+    saved_filename = str(best.get("saved_filename") or "").strip()
+    if not saved_filename:
+        return "", ""
+    input_path = UPLOAD_DIR / saved_filename
+    image_bgr = cv2.imread(str(input_path))
+    if image_bgr is None:
+        return "", ""
+
+    output_filename = f"annotated_plate_best_{prefix}_{uuid4().hex}.jpg"
+    output_path = OUTPUT_DIR / output_filename
+    result = (
+        best.get("result")
+        if isinstance(best.get("result"), dict)
+        else {}
+    )
+    best_frame_plates = (
+        final_result.get("best_frame_plates")
+        or result.get("plates")
+        or []
+    )
+
+    draw_plate_annotations(
+        image_bgr=image_bgr,
+        plates=best_frame_plates,
+        output_path=output_path,
+    )
+
+    output_url = f"/outputs/{output_filename}"
+    best["output_filename"] = output_filename
+    best["output_image_url"] = output_url
+    final_result["best_frame_index"] = final_result.get("best_frame_index") if final_result.get("best_frame_index") is not None else best.get("frame_index")
+    final_result["best_frame_image_url"] = best.get("image_url", "")
+    final_result["best_frame_output_image_url"] = output_url
+    for item in final_result.get("plates", []) or []:
+        if isinstance(item, dict) and (item.get("best_frame_index") is None or item.get("best_frame_index") == best.get("frame_index")):
+            item["best_output_image_url"] = output_url
+    return output_filename, output_url
+
 
 def aggregate_gesture_frame_results(task_type: str, frame_results: list[dict]) -> dict:
     if task_type == "traffic_gesture":
@@ -973,7 +1075,11 @@ def aggregate_gesture_frame_results(task_type: str, frame_results: list[dict]) -
     }
 
 
-def recognize_stream_for_task(task_type: str, sampled_frames: list[dict]) -> dict:
+def recognize_stream_for_task(
+    task_type: str,
+    sampled_frames: list[dict],
+    fast_mode: bool = False,
+) -> dict:
     frame_results = []
 
     for frame_info in sampled_frames:
@@ -982,6 +1088,7 @@ def recognize_stream_for_task(task_type: str, sampled_frames: list[dict]) -> dic
                 recognize_single_sampled_frame(
                     frame_info=frame_info,
                     task_type=task_type,
+                    fast_mode=fast_mode,
                 )
             )
         except Exception as error:
@@ -1094,21 +1201,19 @@ def summarize_recognition_result(task_type: str, result: dict) -> str:
 
     if task_type == "plate":
         plates = result.get("plates") or []
-        numbers = [
-            str(
-                item.get("plate_number")
-                or item.get("plate")
-                or item.get("text")
-                or ""
-            ).strip()
-            for item in plates
-            if isinstance(item, dict)
-        ]
-        numbers = [item for item in numbers if item]
-        if numbers:
-            preview = "、".join(numbers[:3])
-            if len(numbers) > 3:
-                preview += f" 等 {len(numbers)} 个"
+        values = []
+        for item in plates:
+            if not isinstance(item, dict):
+                continue
+            number = str(item.get("plate_number") or item.get("plate") or item.get("text") or "").strip()
+            if not number:
+                continue
+            color = str(item.get("plate_color") or item.get("color") or "未知颜色").strip()
+            values.append(f"{number}（{color}）")
+        if values:
+            preview = "、".join(values[:3])
+            if len(values) > 3:
+                preview += f" 等 {len(values)} 个"
             return preview
         return "未识别到有效车牌"
 
@@ -1373,6 +1478,13 @@ def apply_owner_gesture(gesture: str) -> dict:
 
     update_vehicle_state(state)
 
+    event_id = int(
+        dynamic_result.get("event_id") or 0
+    ) if dynamic_result else 0
+
+    if triggered and dynamic_phase == "idle":
+        event_id = _oc_next_event_id()
+
     return {
         "gesture": gesture,
         "gesture_name": gesture_map[gesture],
@@ -1450,6 +1562,12 @@ def recognize_traffic_gesture(gesture: str) -> dict:
 def on_startup():
     init_db()
     start_alert_notification_worker(DB_PATH)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    """停止所有 ffmpeg 推流进程。"""
+    stop_all_streams()
 
 
 @app.get("/")
@@ -1661,6 +1779,7 @@ def process_stream_recognition_job(
     sample_interval: int,
     use_mock_frame: bool,
     log_action: str = "stream_frame_recognition",
+    fast_plate_mode: bool = False,
 ) -> dict:
     started = time.perf_counter()
     supported_tasks = {"plate", "traffic_gesture", "owner_gesture", "all"}
@@ -1692,6 +1811,7 @@ def process_stream_recognition_job(
         task_outputs[task] = recognize_stream_for_task(
             task_type=task,
             sampled_frames=sampled_frames,
+            fast_mode=bool(fast_plate_mode and task == "plate"),
         )
 
     source_mode = "mock_frame" if use_mock_frame else (
@@ -2038,6 +2158,7 @@ def recognize_stream_frames(request: StreamRecognizeRequest):
         sample_interval=request.sample_interval,
         use_mock_frame=request.use_mock_frame,
         log_action="stream_frame_recognition",
+        fast_plate_mode=bool(request.fast_mode),
     )
 
 
@@ -2213,6 +2334,9 @@ def process_uploaded_video_recognition(
     final_result["processing_latency_ms"] = processing_latency_ms
     final_result["input_mode"] = "uploaded_video"
 
+    if task_type == "plate":
+        ensure_plate_best_frame_annotation(best, final_result, prefix="single_video")
+
     best_image_url = best.get("image_url", "")
     best_output_image_url = best.get("output_image_url", "")
     best_saved_filename = best.get("saved_filename", "")
@@ -2222,7 +2346,7 @@ def process_uploaded_video_recognition(
         input_type="video_upload",
         original_filename=upload_info["original_filename"],
         saved_filename=upload_info["saved_filename"],
-        image_url=upload_info["video_url"],
+        image_url=best_image_url or upload_info["video_url"],
         output_image_url=best_output_image_url,
         result=final_result,
     )
@@ -2320,6 +2444,282 @@ def recognize_traffic_gesture_from_video(
         sample_interval=sample_interval,
         log_action="traffic_gesture_video_recognition",
     )
+
+
+# ---------------------------------------------------------------------------
+# 批量上传识别：支持图片和视频混合上传
+# ---------------------------------------------------------------------------
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+BATCH_MAX_FILES = 50
+BATCH_MAX_TOTAL_BYTES = 1024 * 1024 * 1024  # 1GB total
+
+
+def _is_image_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in IMAGE_SUFFIXES
+
+
+def _is_video_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in VIDEO_UPLOAD_SUFFIXES
+
+
+def _process_single_uploaded_file(
+    file: UploadFile,
+    task_type: str,
+    frame_count: int,
+    sample_interval: int,
+) -> dict:
+    """处理单个上传文件：自动判断图片/视频，调用对应识别管线。"""
+    original_name = file.filename or ""
+    file_type = "image" if _is_image_file(original_name) else "video"
+    started = time.perf_counter()
+
+    try:
+        if file_type == "image":
+            # --- 图片识别 ---
+            suffix = Path(original_name).suffix.lower()
+            saved_filename = f"batch_{task_type}_{uuid4().hex}{suffix}"
+            saved_path = UPLOAD_DIR / saved_filename
+
+            with saved_path.open("wb") as buffer:
+                shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+
+            image_url = f"/uploads/{saved_filename}"
+            output_filename = f"annotated_{saved_filename}"
+            output_path = OUTPUT_DIR / output_filename
+            output_image_url = f"/outputs/{output_filename}"
+
+            if task_type == "plate":
+                result = create_annotated_plate_image(
+                    input_path=saved_path,
+                    output_path=output_path,
+                    confidence=0.92,
+                )
+            elif task_type == "traffic_gesture":
+                result = recognize_traffic_gesture_image(
+                    input_path=saved_path,
+                    output_path=output_path,
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"不支持的任务类型: {task_type}")
+
+            processing_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            result.setdefault("latency_ms", processing_latency_ms)
+
+            record_id = insert_recognition_record(
+                task_type=task_type,
+                input_type="image",
+                original_filename=original_name,
+                saved_filename=saved_filename,
+                image_url=image_url,
+                output_image_url=output_image_url,
+                result=result,
+            )
+
+            return {
+                "filename": original_name,
+                "file_type": "image",
+                "status": "success",
+                "record_id": record_id,
+                "image_url": image_url,
+                "output_image_url": output_image_url,
+                "processing_latency_ms": processing_latency_ms,
+                "result": result,
+            }
+
+        else:
+            # --- 视频识别 ---
+            upload_info = _save_uploaded_recognition_video(file, task_type)
+            video_metadata = _read_uploaded_video_metadata(upload_info["saved_path"])
+
+            source = {
+                "id": f"batch_{task_type}_{uuid4().hex[:8]}",
+                "name": upload_info["original_filename"] or "批量上传视频",
+                "url": str(upload_info["saved_path"]),
+                "kind": "local_video",
+            }
+
+            requested_frame_count = frame_count
+            requested_sample_interval = sample_interval
+
+            # 车牌视频不再默认执行几十次 OCR。最多抽取约 12 帧，且跳过
+            # 每帧标注图绘制与写盘；最终仍通过跨帧聚合返回稳定结果。
+            if task_type == "plate":
+                frame_count = min(frame_count, 120)
+                target_samples = 12
+                sample_interval = max(
+                    sample_interval,
+                    max(1, frame_count // target_samples),
+                )
+
+            sampled_frames, frames_read = capture_stream_sampled_frames(
+                source=source,
+                frame_count=frame_count,
+                sample_interval=sample_interval,
+                use_mock_frame=False,
+            )
+
+            recognition_output = recognize_stream_for_task(
+                task_type=task_type,
+                sampled_frames=sampled_frames,
+                fast_mode=(task_type == "plate"),
+            )
+
+            best = recognition_output["best"]
+            final_result = recognition_output["final_result"]
+            processing_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+            final_result["source"] = {
+                "id": source["id"],
+                "name": source["name"],
+                "kind": "uploaded_video",
+                "video_url": upload_info["video_url"],
+            }
+            final_result["video_metadata"] = video_metadata
+            final_result["frame_count_requested"] = requested_frame_count
+            final_result["sample_interval_requested"] = requested_sample_interval
+            final_result["frame_count_effective"] = frame_count
+            final_result["frames_read"] = frames_read
+            final_result["sample_interval"] = sample_interval
+            final_result["fast_mode"] = task_type == "plate"
+            final_result["sampled_frames"] = len(sampled_frames)
+            final_result["processing_latency_ms"] = processing_latency_ms
+            final_result["input_mode"] = "uploaded_video"
+
+            if task_type == "plate":
+                ensure_plate_best_frame_annotation(best, final_result, prefix="batch_video")
+
+            best_image_url = best.get("image_url", "")
+            best_output_image_url = best.get("output_image_url", "")
+
+            record_id = insert_recognition_record(
+                task_type=task_type,
+                input_type="video_upload",
+                original_filename=upload_info["original_filename"],
+                saved_filename=upload_info["saved_filename"],
+                image_url=best_image_url or upload_info["video_url"],
+                output_image_url=best_output_image_url,
+                result=final_result,
+            )
+
+            return {
+                "filename": original_name,
+                "file_type": "video",
+                "status": "success",
+                "record_id": record_id,
+                "video_url": upload_info["video_url"],
+                "image_url": best_image_url,
+                "output_image_url": best_output_image_url,
+                "frames_read": frames_read,
+                "sampled_frames": len(sampled_frames),
+                "processing_latency_ms": processing_latency_ms,
+                "video_metadata": video_metadata,
+                "result": final_result,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        return {
+            "filename": original_name,
+            "file_type": file_type,
+            "status": "error",
+            "error": str(error),
+        }
+
+
+@app.post("/api/recognition/batch")
+def recognize_batch_files(
+    files: list[UploadFile] = File(...),
+    task_type: str = Query("plate", description="plate 或 traffic_gesture"),
+    frame_count: int = Query(120, ge=5, le=300),
+    sample_interval: int = Query(5, ge=1, le=60),
+):
+    """
+    批量上传识别接口：支持图片和视频混合上传。
+
+    - 自动根据文件扩展名判断图片/视频
+    - 图片调用单帧识别管线（HyperLPR3 / MediaPipe）
+    - 视频调用连续帧抽帧识别管线
+    - 返回每个文件的独立识别结果
+
+    限制：最多 50 个文件，总大小不超过 1GB。
+    """
+    if task_type not in {"plate", "traffic_gesture"}:
+        raise HTTPException(
+            status_code=400,
+            detail="task_type 只支持 plate 或 traffic_gesture",
+        )
+
+    if len(files) > BATCH_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次批量上传最多 {BATCH_MAX_FILES} 个文件",
+        )
+
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件")
+
+    frame_count = clamp_int(frame_count, 5, 300)
+    sample_interval = clamp_int(sample_interval, 1, 60)
+
+    # 预检文件类型
+    for f in files:
+        original_name = f.filename or ""
+        suffix = Path(original_name).suffix.lower()
+        if suffix not in IMAGE_SUFFIXES and suffix not in VIDEO_UPLOAD_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件类型: {original_name}（仅支持图片和视频格式）",
+            )
+
+    started = time.perf_counter()
+    results = []
+
+    for f in files:
+        try:
+            file_result = _process_single_uploaded_file(
+                file=f,
+                task_type=task_type,
+                frame_count=frame_count,
+                sample_interval=sample_interval,
+            )
+        except HTTPException:
+            raise
+        except Exception as error:
+            file_result = {
+                "filename": f.filename or "unknown",
+                "file_type": "unknown",
+                "status": "error",
+                "error": str(error),
+            }
+        results.append(file_result)
+
+    total_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+    success_count = sum(1 for r in results if r.get("status") == "success")
+    error_count = sum(1 for r in results if r.get("status") == "error")
+
+    insert_operation_log(
+        action="batch_recognition",
+        detail={
+            "task_type": task_type,
+            "total_files": len(files),
+            "success_count": success_count,
+            "error_count": error_count,
+            "total_latency_ms": total_latency_ms,
+        },
+    )
+
+    return {
+        "status": "success",
+        "task_type": task_type,
+        "total_files": len(files),
+        "success_count": success_count,
+        "error_count": error_count,
+        "total_latency_ms": total_latency_ms,
+        "results": results,
+    }
 
 
 @app.post("/api/monitor/start")
@@ -6076,15 +6476,53 @@ import numpy as _oc_np
 
 _OC_MP = None
 _OC_HANDS = None
+_OC_HANDS_INIT_LOCK = threading.RLock()
+_OC_HANDS_PROCESS_LOCK = threading.RLock()
 _OC_HISTORY = []
-_OC_HISTORY_MAX_SECONDS = 3.0
+_OC_HISTORY_MAX_SECONDS = 2.6
 
-# 静态手势至少连续两帧稳定后才触发控制，降低误操作。
+# 动态轨迹状态：
+# - 容忍摄像头运动模糊造成的短暂丢手，避免一次丢帧清空整段轨迹。
+# - 动态手势识别后短暂保持显示，避免下一帧立即退回“手掌张开”。
+_OC_MISSING_HAND_FRAMES = 0
+_OC_MISSING_HAND_RESET_AFTER = 3
+_OC_DYNAMIC_LOCK_UNTIL = 0.0
+_OC_DYNAMIC_HOLD = {
+    "gesture": "",
+    "gesture_name": "",
+    "confidence": 0.0,
+    "until": 0.0,
+}
+_OC_DYNAMIC_HOLD_SECONDS = 1.45
+_OC_DYNAMIC_LOCK_SECONDS = 0.45
+
+# 摄像头预览属于镜像交互：
+# 用户实际向右移动，在摄像头原始坐标中表现为向左。
+_OC_CAMERA_MIRROR_DIRECTIONS = True
+
+# 动态动作只触发一次。完成后必须先静止复位或移出画面，
+# 才允许识别下一次动态动作。
+_OC_DYNAMIC_REARM_REQUIRED = False
+_OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+_OC_DYNAMIC_REARM_STILL_SECONDS = 0.72
+_OC_DYNAMIC_EVENT_SEQUENCE = 0
+_OC_LAST_DYNAMIC_EVENT_ID = 0
+
+# 静态手势确认与锁存：
+# open_palm 延迟确认，给左右滑和挥手留出轨迹采集时间；
+# 同一静态姿势持续保持时只触发一次。
 _OC_STABLE_TRACK = {
     "gesture": "",
     "count": 0,
 }
-_OC_STATIC_STABLE_FRAMES = 2
+_OC_STATIC_STABLE_FRAMES = 3
+_OC_STATIC_REQUIRED_FRAMES = {
+    "open_palm": 6,
+    "fist": 3,
+    "thumb_up": 3,
+    "thumb_down": 3,
+}
+_OC_STATIC_LATCH_GESTURE = ""
 
 # 同一控制动作设置冷却时间，避免 400ms 摄像头轮询导致音量连续暴增。
 _OC_ACTION_COOLDOWN_SECONDS = 1.2
@@ -6098,7 +6536,7 @@ _OC_FUNCTION_ORDER = [
     "navigation",
 ]
 
-_OC_GESTURE_MAPPING_VERSION = "owner_gesture_v2_teacher_aligned"
+_OC_GESTURE_MAPPING_VERSION = "owner_gesture_v4_mirror_commit_state"
 _OC_GESTURE_MAPPING = [
     {
         "gesture": "open_palm",
@@ -6200,16 +6638,20 @@ def _oc_output_dir() -> _OCPath:
 def _oc_get_hands():
     global _OC_MP, _OC_HANDS
 
-    if _OC_HANDS is None:
-        import mediapipe as _mp
-        _OC_MP = _mp
-        _OC_HANDS = _mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            model_complexity=0,
-            min_detection_confidence=0.55,
-            min_tracking_confidence=0.50,
-        )
+    if _OC_HANDS is not None:
+        return _OC_HANDS
+
+    with _OC_HANDS_INIT_LOCK:
+        if _OC_HANDS is None:
+            import mediapipe as _mp
+            _OC_MP = _mp
+            _OC_HANDS = _mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                model_complexity=0,
+                min_detection_confidence=0.55,
+                min_tracking_confidence=0.50,
+            )
 
     return _OC_HANDS
 
@@ -6253,23 +6695,132 @@ def _oc_finger_extended(lms, tip: int, pip: int, mcp: int, wrist: int = 0) -> bo
     return bool((y_extended and distance_extended) or (distance_extended and long_enough and tip_lm.y < mcp_lm.y + 0.02))
 
 
-def _oc_reset_tracking() -> None:
+def _oc_reset_tracking(
+    *,
+    clear_dynamic_hold: bool = True,
+) -> None:
+    global _OC_MISSING_HAND_FRAMES
+    global _OC_DYNAMIC_LOCK_UNTIL
+    global _OC_DYNAMIC_REARM_REQUIRED
+    global _OC_DYNAMIC_REARM_STILL_SINCE
+    global _OC_STATIC_LATCH_GESTURE
+
     _OC_HISTORY.clear()
     _OC_STABLE_TRACK["gesture"] = ""
     _OC_STABLE_TRACK["count"] = 0
+    _OC_MISSING_HAND_FRAMES = 0
+    _OC_DYNAMIC_LOCK_UNTIL = 0.0
+    _OC_DYNAMIC_REARM_REQUIRED = False
+    _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+    _OC_STATIC_LATCH_GESTURE = ""
+
+    if clear_dynamic_hold:
+        _OC_DYNAMIC_HOLD.update({
+            "gesture": "",
+            "gesture_name": "",
+            "confidence": 0.0,
+            "until": 0.0,
+        })
 
 
-def _oc_update_history(hand_center: dict, static_gesture: str) -> None:
+def _oc_note_missing_hand() -> bool:
+    """
+    返回是否已经真正清空轨迹。
+
+    动态动作中出现一两帧运动模糊非常常见，不能一丢手就重置。
+    """
+    global _OC_MISSING_HAND_FRAMES
+
+    _OC_MISSING_HAND_FRAMES += 1
+
+    if _OC_MISSING_HAND_FRAMES >= _OC_MISSING_HAND_RESET_AFTER:
+        _oc_reset_tracking()
+        return True
+
+    return False
+
+
+def _oc_note_hand_detected() -> None:
+    global _OC_MISSING_HAND_FRAMES
+    _OC_MISSING_HAND_FRAMES = 0
+
+
+def _oc_palm_center(hand_landmarks) -> dict:
+    """
+    使用腕点和四个 MCP 关节计算掌心。
+
+    不能使用全部 21 点平均值：手指弯曲或张开会改变全点中心，
+    容易把“手型变化”误当成“手掌移动”。
+    """
+    lms = hand_landmarks.landmark
+    ids = (0, 5, 9, 13, 17)
+
+    return {
+        "x": round(
+            sum(float(lms[index].x) for index in ids)
+            / len(ids),
+            4,
+        ),
+        "y": round(
+            sum(float(lms[index].y) for index in ids)
+            / len(ids),
+            4,
+        ),
+    }
+
+
+def _oc_index_tip(hand_landmarks) -> dict:
+    tip = hand_landmarks.landmark[8]
+    return {
+        "x": round(float(tip.x), 4),
+        "y": round(float(tip.y), 4),
+    }
+
+
+def _oc_update_history(
+    hand_center: dict,
+    static_gesture: str,
+    index_tip: dict,
+) -> None:
     now = _oc_time.time()
+    raw_x = float(hand_center["x"])
+    raw_y = float(hand_center["y"])
+
+    # 轻量指数平滑，降低 MediaPipe 单点抖动造成的假方向变化。
+    if (
+        _OC_HISTORY
+        and now - float(_OC_HISTORY[-1].get("t") or now) < 0.65
+    ):
+        previous = _OC_HISTORY[-1]
+        alpha = 0.58
+        smooth_x = (
+            alpha * raw_x
+            + (1.0 - alpha) * float(previous["x"])
+        )
+        smooth_y = (
+            alpha * raw_y
+            + (1.0 - alpha) * float(previous["y"])
+        )
+    else:
+        smooth_x = raw_x
+        smooth_y = raw_y
 
     _OC_HISTORY.append({
         "t": now,
-        "x": float(hand_center["x"]),
-        "y": float(hand_center["y"]),
+        "x": smooth_x,
+        "y": smooth_y,
+        "raw_x": raw_x,
+        "raw_y": raw_y,
+        "index_x": float(index_tip["x"]),
+        "index_y": float(index_tip["y"]),
         "gesture": static_gesture,
     })
 
-    while _OC_HISTORY and now - _OC_HISTORY[0]["t"] > _OC_HISTORY_MAX_SECONDS:
+    while (
+        _OC_HISTORY
+        and now - float(_OC_HISTORY[0]["t"])
+        > _OC_HISTORY_MAX_SECONDS
+    ):
         _OC_HISTORY.pop(0)
 
 
@@ -6277,7 +6828,7 @@ def _oc_recent_history(seconds: float) -> list[dict]:
     if not _OC_HISTORY:
         return []
 
-    now = _OC_HISTORY[-1]["t"]
+    now = float(_OC_HISTORY[-1]["t"])
     return [
         item
         for item in _OC_HISTORY
@@ -6285,189 +6836,781 @@ def _oc_recent_history(seconds: float) -> list[dict]:
     ]
 
 
-def _oc_direction_change_count(values: list[float], min_delta: float = 0.02) -> int:
+def _oc_direction_signs(
+    values: list[float],
+    min_delta: float = 0.009,
+) -> list[int]:
     signs: list[int] = []
 
     for index in range(1, len(values)):
         delta = values[index] - values[index - 1]
         if abs(delta) < min_delta:
             continue
-        signs.append(1 if delta > 0 else -1)
 
+        sign = 1 if delta > 0 else -1
+        if not signs or signs[-1] != sign:
+            signs.append(sign)
+
+    return signs
+
+
+def _oc_direction_change_count(
+    values: list[float],
+    min_delta: float = 0.009,
+) -> int:
+    signs = _oc_direction_signs(
+        values,
+        min_delta=min_delta,
+    )
+    return max(0, len(signs) - 1)
+
+
+def _oc_path_length(
+    xs: list[float],
+    ys: list[float],
+) -> float:
     return sum(
-        1
-        for index in range(1, len(signs))
-        if signs[index] != signs[index - 1]
+        _oc_math.sqrt(
+            (xs[index] - xs[index - 1]) ** 2
+            + (ys[index] - ys[index - 1]) ** 2
+        )
+        for index in range(1, len(xs))
     )
 
 
-def _oc_detect_wave() -> bool:
-    """
-    张开手掌做水平往返运动。
-    与单向滑动的区别：挥手需要至少两次方向变化。
-    """
-    history = _oc_recent_history(2.2)
-    if len(history) < 5:
-        return False
+def _oc_open_ratio(history: list[dict]) -> float:
+    if not history:
+        return 0.0
 
-    open_like = [
-        item
+    open_count = sum(
+        1
         for item in history
-        if item.get("gesture") in {"open_palm", "wave"}
-    ]
-    if len(open_like) < 4:
-        return False
+        if item.get("gesture") in {
+            "open_palm",
+            "wave",
+            "swipe_left",
+            "swipe_right",
+        }
+    )
+    return open_count / len(history)
 
-    xs = [float(item["x"]) for item in open_like]
-    ys = [float(item["y"]) for item in open_like]
+
+def _oc_detect_swipe() -> tuple[str | None, dict]:
+    """
+    单向滑动检测。
+
+    关键变化：
+    - 阈值由 0.22 降到约 0.13；
+    - 使用轨迹效率和方向一致性抑制挥手误判；
+    - 支持“移动后短暂停顿”作为滑动结束信号。
+    """
+    history = _oc_recent_history(1.15)
+    debug = {
+        "kind": "swipe",
+        "frame_count": len(history),
+    }
+
+    if len(history) < 4:
+        return None, debug
+
+    xs = [float(item["x"]) for item in history]
+    ys = [float(item["y"]) for item in history]
+    times = [float(item["t"]) for item in history]
+
+    dx = xs[-1] - xs[0]
+    dy = ys[-1] - ys[0]
+    path_length = _oc_path_length(xs, ys)
+    horizontal_path = sum(
+        abs(xs[index] - xs[index - 1])
+        for index in range(1, len(xs))
+    )
+    duration = max(0.001, times[-1] - times[0])
+    efficiency = abs(dx) / max(horizontal_path, 1e-6)
+    sign_changes = _oc_direction_change_count(
+        xs,
+        min_delta=0.010,
+    )
+    open_ratio = _oc_open_ratio(history)
+
+    recent_deltas = [
+        abs(xs[index] - xs[index - 1])
+        for index in range(
+            max(1, len(xs) - 2),
+            len(xs),
+        )
+    ]
+    terminal_slow = (
+        bool(recent_deltas)
+        and sum(recent_deltas) / len(recent_deltas) < 0.018
+    )
+
+    debug.update({
+        "dx": round(dx, 4),
+        "dy": round(dy, 4),
+        "duration": round(duration, 4),
+        "path_length": round(path_length, 4),
+        "horizontal_path": round(horizontal_path, 4),
+        "efficiency": round(efficiency, 4),
+        "sign_changes": sign_changes,
+        "open_ratio": round(open_ratio, 4),
+        "terminal_slow": terminal_slow,
+    })
+
+    if abs(dx) < 0.13:
+        return None, debug
+    if abs(dy) > 0.15:
+        return None, debug
+    if open_ratio < 0.55:
+        return None, debug
+    if efficiency < 0.68:
+        return None, debug
+    if sign_changes > 1:
+        return None, debug
+    if duration < 0.22:
+        return None, debug
+
+    # 较短位移要求动作末端有停顿；大幅滑动可直接确认。
+    if abs(dx) < 0.19 and not terminal_slow:
+        return None, debug
 
     return (
-        max(xs) - min(xs) >= 0.18
-        and max(ys) - min(ys) <= 0.28
-        and _oc_direction_change_count(xs, min_delta=0.025) >= 2
+        "swipe_right" if dx > 0 else "swipe_left",
+        debug,
     )
 
 
-def _oc_detect_swipe() -> str | None:
+def _oc_detect_wave() -> tuple[bool, dict]:
     """
-    张开手掌做一次明显的单向水平移动：
-    - 向左滑动：切换到上一功能
-    - 向右滑动：切换到下一功能
+    挥手要求至少一次明确往返。
+
+    与滑动的区别：
+    - 横向路径明显大于净位移；
+    - 至少一次方向反转；
+    - 最终位置接近起点或轨迹效率较低。
     """
-    history = _oc_recent_history(1.25)
-    if len(history) < 4:
-        return None
+    history = _oc_recent_history(1.95)
+    debug = {
+        "kind": "wave",
+        "frame_count": len(history),
+    }
 
-    open_like = [
-        item
-        for item in history
-        if item.get("gesture") in {"open_palm", "swipe_left", "swipe_right"}
-    ]
-    if len(open_like) < 3:
-        return None
+    if len(history) < 5:
+        return False, debug
 
-    xs = [float(item["x"]) for item in open_like]
-    ys = [float(item["y"]) for item in open_like]
-    displacement = xs[-1] - xs[0]
+    xs = [float(item["x"]) for item in history]
+    ys = [float(item["y"]) for item in history]
 
-    if abs(displacement) < 0.22:
-        return None
-    if max(ys) - min(ys) > 0.18:
-        return None
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    net_dx = xs[-1] - xs[0]
+    horizontal_path = sum(
+        abs(xs[index] - xs[index - 1])
+        for index in range(1, len(xs))
+    )
+    efficiency = abs(net_dx) / max(horizontal_path, 1e-6)
+    sign_changes = _oc_direction_change_count(
+        xs,
+        min_delta=0.012,
+    )
+    open_ratio = _oc_open_ratio(history)
 
-    direction = 1 if displacement > 0 else -1
-    directional_steps = 0
-    significant_steps = 0
+    debug.update({
+        "x_span": round(x_span, 4),
+        "y_span": round(y_span, 4),
+        "net_dx": round(net_dx, 4),
+        "horizontal_path": round(horizontal_path, 4),
+        "efficiency": round(efficiency, 4),
+        "sign_changes": sign_changes,
+        "open_ratio": round(open_ratio, 4),
+    })
 
-    for index in range(1, len(xs)):
-        delta = xs[index] - xs[index - 1]
-        if abs(delta) < 0.015:
-            continue
-        significant_steps += 1
-        if (delta > 0 and direction > 0) or (delta < 0 and direction < 0):
-            directional_steps += 1
+    detected = (
+        x_span >= 0.12
+        and y_span <= 0.24
+        and horizontal_path >= 0.24
+        and sign_changes >= 1
+        and open_ratio >= 0.60
+        and (
+            abs(net_dx) <= 0.10
+            or efficiency <= 0.48
+        )
+    )
 
-    if significant_steps == 0:
-        return None
-
-    consistency = directional_steps / significant_steps
-    if consistency < 0.75:
-        return None
-
-    return "swipe_right" if displacement > 0 else "swipe_left"
+    return detected, debug
 
 
-def _oc_detect_circle() -> str | None:
+def _oc_detect_circle() -> tuple[str | None, dict]:
     """
-    单指画圈检测。
-
-    使用最近轨迹相对于轨迹中心的累计转角：
-    - 图像坐标 y 轴向下，因此累计角为正时近似顺时针。
-    - 轨迹需要同时具备横向和纵向跨度，避免把直线移动误判为画圈。
+    单指画圈使用食指指尖轨迹，而不是掌心轨迹。
     """
-    history = _oc_recent_history(2.8)
+    history = _oc_recent_history(2.4)
     one_items = [
         item
         for item in history
-        if item.get("gesture") in {"one", "circle_clockwise", "circle_counterclockwise"}
+        if item.get("gesture") in {
+            "one",
+            "circle_clockwise",
+            "circle_counterclockwise",
+        }
     ]
 
+    debug = {
+        "kind": "circle",
+        "frame_count": len(one_items),
+    }
+
     if len(one_items) < 6:
-        return None
+        return None, debug
 
-    xs = [float(item["x"]) for item in one_items]
-    ys = [float(item["y"]) for item in one_items]
+    xs = [float(item["index_x"]) for item in one_items]
+    ys = [float(item["index_y"]) for item in one_items]
 
-    if max(xs) - min(xs) < 0.10 or max(ys) - min(ys) < 0.10:
-        return None
+    x_range = max(xs) - min(xs)
+    y_range = max(ys) - min(ys)
+
+    debug.update({
+        "x_range": round(x_range, 4),
+        "y_range": round(y_range, 4),
+    })
+
+    if x_range < 0.09 or y_range < 0.09:
+        return None, debug
 
     center_x = sum(xs) / len(xs)
     center_y = sum(ys) / len(ys)
 
     angles: list[float] = []
+
     for x, y in zip(xs, ys):
-        radius = _oc_math.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
-        if radius < 0.035:
+        radius = _oc_math.sqrt(
+            (x - center_x) ** 2
+            + (y - center_y) ** 2
+        )
+        if radius < 0.028:
             continue
-        angles.append(_oc_math.atan2(y - center_y, x - center_x))
+        angles.append(
+            _oc_math.atan2(
+                y - center_y,
+                x - center_x,
+            )
+        )
 
     if len(angles) < 5:
-        return None
+        return None, debug
 
     total_angle = 0.0
+
     for index in range(1, len(angles)):
         delta = angles[index] - angles[index - 1]
+
         while delta > _oc_math.pi:
             delta -= 2 * _oc_math.pi
         while delta < -_oc_math.pi:
             delta += 2 * _oc_math.pi
 
-        if abs(delta) <= 1.45:
+        if abs(delta) <= 1.55:
             total_angle += delta
-
-    if abs(total_angle) < 4.0:
-        return None
 
     start_end_distance = _oc_math.sqrt(
         (xs[-1] - xs[0]) ** 2
         + (ys[-1] - ys[0]) ** 2
     )
-    if start_end_distance > 0.22:
-        return None
+
+    debug.update({
+        "total_angle": round(total_angle, 4),
+        "start_end_distance": round(
+            start_end_distance,
+            4,
+        ),
+    })
+
+    if abs(total_angle) < 4.15:
+        return None, debug
+    if start_end_distance > 0.20:
+        return None, debug
 
     return (
-        "circle_clockwise"
-        if total_angle > 0
-        else "circle_counterclockwise"
+        (
+            "circle_clockwise"
+            if total_angle > 0
+            else "circle_counterclockwise"
+        ),
+        debug,
     )
+
+
+def _oc_motion_pending_debug() -> tuple[bool, dict]:
+    history = _oc_recent_history(0.95)
+    debug = {
+        "kind": "pending",
+        "frame_count": len(history),
+    }
+
+    if len(history) < 3:
+        return False, debug
+
+    xs = [float(item["x"]) for item in history]
+    ys = [float(item["y"]) for item in history]
+
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    path_length = _oc_path_length(xs, ys)
+    open_ratio = _oc_open_ratio(history)
+
+    debug.update({
+        "x_span": round(x_span, 4),
+        "y_span": round(y_span, 4),
+        "path_length": round(path_length, 4),
+        "open_ratio": round(open_ratio, 4),
+    })
+
+    pending = (
+        open_ratio >= 0.50
+        and x_span >= 0.045
+        and path_length >= 0.065
+        and y_span <= 0.25
+    )
+
+    return pending, debug
+
+
+
+def _oc_mirror_camera_dynamic_gesture(
+    gesture: str,
+) -> str:
+    """
+    将摄像头原始坐标中的方向转换成用户在镜像预览中的实际方向。
+    """
+    if not _OC_CAMERA_MIRROR_DIRECTIONS:
+        return gesture
+
+    mirror_mapping = {
+        "swipe_left": "swipe_right",
+        "swipe_right": "swipe_left",
+        "circle_clockwise": "circle_counterclockwise",
+        "circle_counterclockwise": "circle_clockwise",
+    }
+    return mirror_mapping.get(gesture, gesture)
+
+
+def _oc_next_event_id() -> int:
+    global _OC_DYNAMIC_EVENT_SEQUENCE
+
+    _OC_DYNAMIC_EVENT_SEQUENCE += 1
+    return _OC_DYNAMIC_EVENT_SEQUENCE
+
+
+def _oc_waiting_next_result() -> dict:
+    return {
+        "gesture": "waiting_next",
+        "gesture_name": "等待下一个动作",
+        "confidence": 0.0,
+        "phase": "waiting",
+        "is_event": False,
+        "event_id": _OC_LAST_DYNAMIC_EVENT_ID,
+        "debug": {
+            "rearm_required": True,
+        },
+    }
+
+
+def _oc_try_rearm_dynamic(
+    static_gesture: str,
+) -> bool:
+    """
+    动态动作完成后，手掌需要短暂静止，才重新允许下一次识别。
+
+    这样连续挥动过程中不会反复触发：
+    挥手 → 判定中 → 挥手 → 判定中。
+    """
+    global _OC_DYNAMIC_REARM_REQUIRED
+    global _OC_DYNAMIC_REARM_STILL_SINCE
+
+    if not _OC_DYNAMIC_REARM_REQUIRED:
+        return True
+
+    history = _oc_recent_history(0.50)
+
+    if len(history) < 3:
+        _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+        return False
+
+    xs = [float(item["x"]) for item in history]
+    ys = [float(item["y"]) for item in history]
+
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    now = _oc_time.time()
+
+    # 允许张开手掌或单指姿势在动作结束后静止复位。
+    valid_reset_pose = static_gesture in {
+        "open_palm",
+        "one",
+        "unknown",
+    }
+    is_still = (
+        valid_reset_pose
+        and x_span <= 0.025
+        and y_span <= 0.030
+    )
+
+    if not is_still:
+        _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+        return False
+
+    if _OC_DYNAMIC_REARM_STILL_SINCE <= 0:
+        _OC_DYNAMIC_REARM_STILL_SINCE = now
+        return False
+
+    if (
+        now - _OC_DYNAMIC_REARM_STILL_SINCE
+        < _OC_DYNAMIC_REARM_STILL_SECONDS
+    ):
+        return False
+
+    _OC_DYNAMIC_REARM_REQUIRED = False
+    _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+    _OC_HISTORY.clear()
+    _OC_STABLE_TRACK["gesture"] = ""
+    _OC_STABLE_TRACK["count"] = 0
+    return True
+
+
+def _oc_register_dynamic_event(
+    gesture: str,
+    gesture_name: str,
+    confidence: float,
+) -> int:
+    global _OC_DYNAMIC_LOCK_UNTIL
+    global _OC_DYNAMIC_REARM_REQUIRED
+    global _OC_DYNAMIC_REARM_STILL_SINCE
+    global _OC_LAST_DYNAMIC_EVENT_ID
+
+    now = _oc_time.time()
+    event_id = _oc_next_event_id()
+    _OC_LAST_DYNAMIC_EVENT_ID = event_id
+
+    _OC_DYNAMIC_LOCK_UNTIL = (
+        now + _OC_DYNAMIC_LOCK_SECONDS
+    )
+    _OC_DYNAMIC_REARM_REQUIRED = True
+    _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
+
+    _OC_DYNAMIC_HOLD.update({
+        "gesture": gesture,
+        "gesture_name": gesture_name,
+        "confidence": confidence,
+        "event_id": event_id,
+        "until": now + _OC_DYNAMIC_HOLD_SECONDS,
+    })
+
+    # 动态事件已经结束，清空旧轨迹，避免同一次动作连续触发。
+    _OC_HISTORY.clear()
+    _OC_STABLE_TRACK["gesture"] = ""
+    _OC_STABLE_TRACK["count"] = 0
+    return event_id
+
+
+def _oc_dynamic_hold_result() -> dict | None:
+    now = _oc_time.time()
+
+    if (
+        _OC_DYNAMIC_HOLD.get("gesture")
+        and now < float(_OC_DYNAMIC_HOLD.get("until") or 0)
+    ):
+        return {
+            "gesture": _OC_DYNAMIC_HOLD["gesture"],
+            "gesture_name": _OC_DYNAMIC_HOLD["gesture_name"],
+            "confidence": float(
+                _OC_DYNAMIC_HOLD.get("confidence") or 0
+            ),
+            "phase": "hold",
+            "is_event": False,
+            "event_id": int(
+                _OC_DYNAMIC_HOLD.get("event_id") or 0
+            ),
+            "debug": {
+                "hold_remaining_ms": max(
+                    0,
+                    int(
+                        (
+                            float(_OC_DYNAMIC_HOLD["until"])
+                            - now
+                        )
+                        * 1000
+                    ),
+                ),
+            },
+        }
+
+    return None
 
 
 def _oc_detect_dynamic_gesture(
     hand_center: dict,
     static_gesture: str,
-) -> tuple[str | None, str | None, float]:
-    _oc_update_history(hand_center, static_gesture)
+    index_tip: dict,
+) -> dict | None:
+    _oc_update_history(
+        hand_center,
+        static_gesture,
+        index_tip,
+    )
 
-    circle = _oc_detect_circle()
-    if circle:
-        return (
+    # 已确认的动作保持显示，不重复分析同一段轨迹。
+    hold = _oc_dynamic_hold_result()
+    if hold:
+        return hold
+
+    # 保持结束后先等待手掌静止复位，再开始下一次动作识别。
+    if _OC_DYNAMIC_REARM_REQUIRED:
+        if not _oc_try_rearm_dynamic(static_gesture):
+            return _oc_waiting_next_result()
+
+        # 本帧只完成复位，不立即拿旧姿势开始新动作。
+        return {
+            "gesture": "waiting_next",
+            "gesture_name": "等待下一个动作",
+            "confidence": 0.0,
+            "phase": "ready",
+            "is_event": False,
+            "event_id": _OC_LAST_DYNAMIC_EVENT_ID,
+            "debug": {
+                "rearmed": True,
+            },
+        }
+
+    circle_raw, circle_debug = _oc_detect_circle()
+    if circle_raw:
+        circle = _oc_mirror_camera_dynamic_gesture(
+            circle_raw
+        )
+        name = (
+            "单指顺时针画圈"
+            if circle == "circle_clockwise"
+            else "单指逆时针画圈"
+        )
+        circle_debug.update({
+            "raw_gesture": circle_raw,
+            "mirror_corrected_gesture": circle,
+        })
+        event_id = _oc_register_dynamic_event(
             circle,
-            "单指顺时针画圈" if circle == "circle_clockwise" else "单指逆时针画圈",
+            name,
             0.88,
         )
+        return {
+            "gesture": circle,
+            "gesture_name": name,
+            "confidence": 0.88,
+            "phase": "event",
+            "is_event": True,
+            "event_id": event_id,
+            "debug": circle_debug,
+        }
 
-    if _oc_detect_wave():
-        return "wave", "挥手", 0.87
-
-    swipe = _oc_detect_swipe()
-    if swipe:
-        return (
+    # 单向滑动先判断。检测到的是摄像头原始坐标方向，
+    # 对外返回前进行镜像方向校正。
+    swipe_raw, swipe_debug = _oc_detect_swipe()
+    if swipe_raw:
+        swipe = _oc_mirror_camera_dynamic_gesture(
+            swipe_raw
+        )
+        name = (
+            "向左滑动"
+            if swipe == "swipe_left"
+            else "向右滑动"
+        )
+        swipe_debug.update({
+            "raw_gesture": swipe_raw,
+            "mirror_corrected_gesture": swipe,
+        })
+        event_id = _oc_register_dynamic_event(
             swipe,
-            "向左滑动" if swipe == "swipe_left" else "向右滑动",
-            0.86,
+            name,
+            0.88,
+        )
+        return {
+            "gesture": swipe,
+            "gesture_name": name,
+            "confidence": 0.88,
+            "phase": "event",
+            "is_event": True,
+            "event_id": event_id,
+            "debug": swipe_debug,
+        }
+
+    wave, wave_debug = _oc_detect_wave()
+    if wave:
+        event_id = _oc_register_dynamic_event(
+            "wave",
+            "挥手",
+            0.89,
+        )
+        return {
+            "gesture": "wave",
+            "gesture_name": "挥手",
+            "confidence": 0.89,
+            "phase": "event",
+            "is_event": True,
+            "event_id": event_id,
+            "debug": wave_debug,
+        }
+
+    pending, pending_debug = _oc_motion_pending_debug()
+    if pending:
+        return {
+            "gesture": "motion_pending",
+            "gesture_name": "内部轨迹采集中",
+            "confidence": 0.55,
+            "phase": "pending",
+            "is_event": False,
+            "event_id": 0,
+            "debug": pending_debug,
+        }
+
+    return None
+
+
+
+def _oc_resolve_camera_gesture(
+    hand_landmarks,
+) -> dict:
+    static_gesture, static_name, confidence, features = (
+        _oc_classify_static_hand(hand_landmarks)
+    )
+
+    hand_center = _oc_palm_center(hand_landmarks)
+    index_tip = _oc_index_tip(hand_landmarks)
+
+    dynamic_result = _oc_detect_dynamic_gesture(
+        hand_center,
+        static_gesture,
+        index_tip,
+    )
+
+    dynamic_phase = (
+        dynamic_result.get("phase")
+        if dynamic_result
+        else "idle"
+    )
+    dynamic_is_event = bool(
+        dynamic_result
+        and dynamic_result.get("is_event")
+    )
+
+    if dynamic_result:
+        gesture = str(dynamic_result["gesture"])
+        gesture_name = str(
+            dynamic_result["gesture_name"]
+        )
+        confidence = float(
+            dynamic_result.get("confidence") or confidence
+        )
+    else:
+        gesture = static_gesture
+        gesture_name = static_name
+
+    if dynamic_phase == "event":
+        confirmed = True
+        stable_count = 1
+        required_stable_frames = 1
+    elif dynamic_phase in {
+        "pending",
+        "hold",
+        "waiting",
+        "ready",
+    }:
+        confirmed = False
+        stable_count = 0
+        required_stable_frames = 1
+    else:
+        (
+            confirmed,
+            stable_count,
+            required_stable_frames,
+        ) = _oc_confirm_gesture(
+            gesture,
+            dynamic=False,
         )
 
-    return None, None, 0.0
+    if dynamic_phase == "pending":
+        action = "none"
+        description = "内部正在采集动作轨迹"
+        vehicle_state = dict(_OC_VEHICLE_STATE)
+        triggered = False
+        cooldown_remaining_ms = 0
+    elif dynamic_phase == "hold":
+        action = "none"
+        description = "动作已确认，结果保持中"
+        vehicle_state = dict(_OC_VEHICLE_STATE)
+        triggered = False
+        cooldown_remaining_ms = 0
+    elif dynamic_phase in {"waiting", "ready"}:
+        action = "none"
+        description = "等待下一个完整动作"
+        vehicle_state = dict(_OC_VEHICLE_STATE)
+        triggered = False
+        cooldown_remaining_ms = 0
+    else:
+        (
+            action,
+            description,
+            vehicle_state,
+            triggered,
+            cooldown_remaining_ms,
+        ) = _oc_apply_vehicle_action(
+            gesture,
+            confirmed=confirmed,
+            dynamic=dynamic_is_event,
+            stable_count=stable_count,
+            required_stable_frames=required_stable_frames,
+        )
+
+    return {
+        "gesture": gesture,
+        "gesture_name": gesture_name,
+        "static_gesture": static_gesture,
+        "static_gesture_name": static_name,
+        "confidence": round(float(confidence), 4),
+        "features": features,
+        "hand_center": hand_center,
+        "index_tip": index_tip,
+        "action": action,
+        "description": description,
+        "vehicle_state": vehicle_state,
+        "triggered": triggered,
+        "stable_count": stable_count,
+        "required_stable_frames": required_stable_frames,
+        "dynamic_gesture": (
+            gesture
+            if dynamic_phase in {"event", "hold"}
+            else ""
+        ),
+        "dynamic_phase": dynamic_phase,
+        "event_id": event_id,
+        "display_committed": bool(
+            triggered or dynamic_phase == "event"
+        ),
+        "camera_mirror_corrected": (
+            _OC_CAMERA_MIRROR_DIRECTIONS
+        ),
+        "motion_state": (
+            "tracking"
+            if dynamic_phase == "pending"
+            else (
+                "waiting"
+                if dynamic_phase in {"waiting", "ready"}
+                else dynamic_phase
+            )
+        ),
+        "motion_debug": (
+            dynamic_result.get("debug", {})
+            if dynamic_result
+            else {}
+        ),
+        "cooldown_remaining_ms": cooldown_remaining_ms,
+    }
 
 
 def _oc_confirm_gesture(
@@ -6475,10 +7618,28 @@ def _oc_confirm_gesture(
     *,
     dynamic: bool = False,
 ) -> tuple[bool, int, int]:
-    if gesture in {"", "unknown", "no_hand", "one", "two", "ok"}:
+    global _OC_STATIC_LATCH_GESTURE
+
+    required_frames = int(
+        _OC_STATIC_REQUIRED_FRAMES.get(
+            gesture,
+            _OC_STATIC_STABLE_FRAMES,
+        )
+    )
+
+    if gesture in {
+        "",
+        "unknown",
+        "no_hand",
+        "motion_pending",
+        "waiting_next",
+        "one",
+        "two",
+        "ok",
+    }:
         _OC_STABLE_TRACK["gesture"] = gesture
         _OC_STABLE_TRACK["count"] = 0
-        return False, 0, _OC_STATIC_STABLE_FRAMES
+        return False, 0, required_frames
 
     if dynamic:
         _OC_STABLE_TRACK["gesture"] = gesture
@@ -6486,17 +7647,25 @@ def _oc_confirm_gesture(
         return True, 1, 1
 
     if _OC_STABLE_TRACK.get("gesture") == gesture:
-        _OC_STABLE_TRACK["count"] = int(_OC_STABLE_TRACK.get("count") or 0) + 1
+        _OC_STABLE_TRACK["count"] = (
+            int(_OC_STABLE_TRACK.get("count") or 0) + 1
+        )
     else:
         _OC_STABLE_TRACK["gesture"] = gesture
         _OC_STABLE_TRACK["count"] = 1
 
     stable_count = int(_OC_STABLE_TRACK["count"])
-    return (
-        stable_count >= _OC_STATIC_STABLE_FRAMES,
-        stable_count,
-        _OC_STATIC_STABLE_FRAMES,
-    )
+
+    if stable_count < required_frames:
+        return False, stable_count, required_frames
+
+    # 同一个姿势一直保持时只确认一次。
+    if _OC_STATIC_LATCH_GESTURE == gesture:
+        return False, stable_count, required_frames
+
+    _OC_STATIC_LATCH_GESTURE = gesture
+    return True, stable_count, required_frames
+
 
 
 def _oc_next_function(direction: int) -> str:
@@ -6739,6 +7908,13 @@ def get_owner_gesture_mapping():
             "static_stable_frames": _OC_STATIC_STABLE_FRAMES,
             "action_cooldown_seconds": _OC_ACTION_COOLDOWN_SECONDS,
             "dynamic_trajectory_window_seconds": _OC_HISTORY_MAX_SECONDS,
+            "missing_hand_tolerance_frames": _OC_MISSING_HAND_RESET_AFTER - 1,
+            "dynamic_result_hold_seconds": _OC_DYNAMIC_HOLD_SECONDS,
+            "camera_mirror_direction_correction": _OC_CAMERA_MIRROR_DIRECTIONS,
+            "dynamic_rearm_still_seconds": _OC_DYNAMIC_REARM_STILL_SECONDS,
+            "display_policy": "动作确认后才更新结果面板；确认后等待静止复位",
+            "swipe_policy": "镜像校正后输出用户实际方向；单向横移并停顿",
+            "wave_policy": "张开手掌至少完成一次横向往返；一次动作只触发一次",
         },
     }
 
@@ -6800,13 +7976,15 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
         _oc_cv2.imwrite(str(saved_path), image_bgr)
 
         image_rgb = _oc_cv2.cvtColor(image_bgr, _oc_cv2.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
         hands = _oc_get_hands()
-        result = hands.process(image_rgb)
+        with _OC_HANDS_PROCESS_LOCK:
+            result = hands.process(image_rgb)
 
         annotated = image_bgr.copy()
 
         if not result.multi_hand_landmarks:
-            _oc_reset_tracking()
+            tracking_reset = _oc_note_missing_hand()
             latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
             _oc_cv2.imwrite(str(output_path), annotated)
 
@@ -6830,48 +8008,41 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
                     "landmarks": [],
                     "hand_center": None,
                     "camera_mode": True,
+                    "motion_state": (
+                        "reset"
+                        if tracking_reset
+                        else "temporarily_lost"
+                    ),
+                    "missing_hand_frames": _OC_MISSING_HAND_FRAMES,
                 },
             }
 
         hand_landmarks = result.multi_hand_landmarks[0]
+        _oc_note_hand_detected()
 
-        static_gesture, static_name, confidence, features = _oc_classify_static_hand(hand_landmarks)
-
-        xs = [lm.x for lm in hand_landmarks.landmark]
-        ys = [lm.y for lm in hand_landmarks.landmark]
-        hand_center = {
-            "x": round(sum(xs) / len(xs), 4),
-            "y": round(sum(ys) / len(ys), 4),
-        }
-
-        dynamic_gesture, dynamic_name, dynamic_confidence = _oc_detect_dynamic_gesture(
-            hand_center,
-            static_gesture,
+        resolved = _oc_resolve_camera_gesture(
+            hand_landmarks,
         )
 
-        gesture = dynamic_gesture or static_gesture
-        gesture_name = dynamic_name or static_name
-        if dynamic_gesture:
-            confidence = dynamic_confidence
-
-        confirmed, stable_count, required_stable_frames = _oc_confirm_gesture(
-            gesture,
-            dynamic=bool(dynamic_gesture),
-        )
-
-        (
-            action,
-            description,
-            vehicle_state,
-            triggered,
-            cooldown_remaining_ms,
-        ) = _oc_apply_vehicle_action(
-            gesture,
-            confirmed=confirmed,
-            dynamic=bool(dynamic_gesture),
-            stable_count=stable_count,
-            required_stable_frames=required_stable_frames,
-        )
+        gesture = resolved["gesture"]
+        gesture_name = resolved["gesture_name"]
+        static_gesture = resolved["static_gesture"]
+        static_name = resolved["static_gesture_name"]
+        confidence = resolved["confidence"]
+        features = resolved["features"]
+        hand_center = resolved["hand_center"]
+        action = resolved["action"]
+        description = resolved["description"]
+        vehicle_state = resolved["vehicle_state"]
+        triggered = resolved["triggered"]
+        stable_count = resolved["stable_count"]
+        required_stable_frames = resolved[
+            "required_stable_frames"
+        ]
+        dynamic_gesture = resolved["dynamic_gesture"]
+        cooldown_remaining_ms = resolved[
+            "cooldown_remaining_ms"
+        ]
 
         if _OC_MP is not None:
             _OC_MP.solutions.drawing_utils.draw_landmarks(
@@ -6913,12 +8084,21 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
                 "stable_count": stable_count,
                 "required_stable_frames": required_stable_frames,
                 "dynamic_gesture": dynamic_gesture or "",
+                "dynamic_phase": resolved["dynamic_phase"],
+                "event_id": resolved["event_id"],
+                "display_committed": resolved["display_committed"],
+                "camera_mirror_corrected": resolved[
+                    "camera_mirror_corrected"
+                ],
+                "motion_state": resolved["motion_state"],
+                "motion_debug": resolved["motion_debug"],
+                "index_tip": resolved["index_tip"],
                 "cooldown_remaining_ms": cooldown_remaining_ms,
                 "gesture_mapping_version": _OC_GESTURE_MAPPING_VERSION,
                 "supported_gestures": _OC_GESTURE_MAPPING,
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
-                "dynamic_policy": "连续帧轨迹识别画圈、左右滑动和挥手；静态手势连续两帧确认",
+                "dynamic_policy": "V4：摄像头镜像方向校正；动作确认后单次触发并等待复位",
             },
         }
 
@@ -6958,13 +8138,15 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
         height, width = image_bgr.shape[:2]
 
         image_rgb = _oc_cv2.cvtColor(image_bgr, _oc_cv2.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
         hands = _oc_get_hands()
-        result = hands.process(image_rgb)
+        with _OC_HANDS_PROCESS_LOCK:
+            result = hands.process(image_rgb)
 
         latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
 
         if not result.multi_hand_landmarks:
-            _oc_reset_tracking()
+            tracking_reset = _oc_note_missing_hand()
 
             return {
                 "status": "success",
@@ -6984,49 +8166,41 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
                     "hand_center": None,
                     "camera_mode": True,
                     "fast_mode": True,
+                    "motion_state": (
+                        "reset"
+                        if tracking_reset
+                        else "temporarily_lost"
+                    ),
+                    "missing_hand_frames": _OC_MISSING_HAND_FRAMES,
                 },
             }
 
         hand_landmarks = result.multi_hand_landmarks[0]
+        _oc_note_hand_detected()
 
-        static_gesture, static_name, confidence, features = _oc_classify_static_hand(hand_landmarks)
-
-        xs = [lm.x for lm in hand_landmarks.landmark]
-        ys = [lm.y for lm in hand_landmarks.landmark]
-
-        hand_center = {
-            "x": round(sum(xs) / len(xs), 4),
-            "y": round(sum(ys) / len(ys), 4),
-        }
-
-        dynamic_gesture, dynamic_name, dynamic_confidence = _oc_detect_dynamic_gesture(
-            hand_center,
-            static_gesture,
+        resolved = _oc_resolve_camera_gesture(
+            hand_landmarks,
         )
 
-        gesture = dynamic_gesture or static_gesture
-        gesture_name = dynamic_name or static_name
-        if dynamic_gesture:
-            confidence = dynamic_confidence
-
-        confirmed, stable_count, required_stable_frames = _oc_confirm_gesture(
-            gesture,
-            dynamic=bool(dynamic_gesture),
-        )
-
-        (
-            action,
-            description,
-            vehicle_state,
-            triggered,
-            cooldown_remaining_ms,
-        ) = _oc_apply_vehicle_action(
-            gesture,
-            confirmed=confirmed,
-            dynamic=bool(dynamic_gesture),
-            stable_count=stable_count,
-            required_stable_frames=required_stable_frames,
-        )
+        gesture = resolved["gesture"]
+        gesture_name = resolved["gesture_name"]
+        static_gesture = resolved["static_gesture"]
+        static_name = resolved["static_gesture_name"]
+        confidence = resolved["confidence"]
+        features = resolved["features"]
+        hand_center = resolved["hand_center"]
+        action = resolved["action"]
+        description = resolved["description"]
+        vehicle_state = resolved["vehicle_state"]
+        triggered = resolved["triggered"]
+        stable_count = resolved["stable_count"]
+        required_stable_frames = resolved[
+            "required_stable_frames"
+        ]
+        dynamic_gesture = resolved["dynamic_gesture"]
+        cooldown_remaining_ms = resolved[
+            "cooldown_remaining_ms"
+        ]
 
         return {
             "status": "success",
@@ -7054,13 +8228,22 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
                 "stable_count": stable_count,
                 "required_stable_frames": required_stable_frames,
                 "dynamic_gesture": dynamic_gesture or "",
+                "dynamic_phase": resolved["dynamic_phase"],
+                "event_id": resolved["event_id"],
+                "display_committed": resolved["display_committed"],
+                "camera_mirror_corrected": resolved[
+                    "camera_mirror_corrected"
+                ],
+                "motion_state": resolved["motion_state"],
+                "motion_debug": resolved["motion_debug"],
+                "index_tip": resolved["index_tip"],
                 "cooldown_remaining_ms": cooldown_remaining_ms,
                 "gesture_mapping_version": _OC_GESTURE_MAPPING_VERSION,
                 "supported_gestures": _OC_GESTURE_MAPPING,
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
                 "fast_mode": True,
-                "dynamic_policy": "快速模式：连续帧轨迹识别画圈、左右滑动和挥手；静态手势连续两帧确认",
+                "dynamic_policy": "V4 快速模式：内部采集不刷新结果面板；确认后输出一次并等待下一个动作",
             },
         }
 
@@ -7068,6 +8251,66 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
         raise
     except Exception as exc:
         raise _OCHTTPException(status_code=500, detail=f"摄像头快速手势识别失败：{exc}")
+
+
+# TRAFFIC_GESTURE_CAMERA_FAST_ENDPOINT_V1
+# 交警手势：电脑摄像头实时帧接口
+@app.post("/api/gesture/traffic/camera-fast-frame")
+def recognize_traffic_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)):
+    """
+    交警手势电脑摄像头快速识别接口。
+
+    接收前端摄像头抽帧图片，调用 MediaPipe Pose 进行全身姿态检测，
+    通过规则引擎识别 8 类交警手势（停止/直行/左转/右转/变道/左转待转/减速/靠边停车）。
+
+    与 /api/gesture/traffic/image 的区别：
+    - 不保存上传图片
+    - 不保存标注图片（前端自行绘制骨架）
+    - 只返回姿态关键点、手势结果和延迟
+    - 适合前端高频实时识别（~400ms 间隔）
+    """
+    start_time = _oc_time.perf_counter()
+
+    try:
+        content = file.file.read()
+
+        if not content:
+            raise _OCHTTPException(status_code=400, detail="上传图片为空。")
+
+        image_array = _oc_np.frombuffer(content, dtype=_oc_np.uint8)
+        image_bgr = _oc_cv2.imdecode(image_array, _oc_cv2.IMREAD_COLOR)
+
+        if image_bgr is None:
+            raise _OCHTTPException(status_code=400, detail="无法解析摄像头帧图片。")
+
+        # 调用交警手势识别（不保存标注图片，前端自己画骨架）
+        # static_image_mode=False 启用 MediaPipe 帧间平滑
+        result_data = recognize_traffic_gesture_frame(
+            image_bgr,
+            output_path=None,
+            static_image_mode=False,
+            draw_annotation=False,
+        )
+
+        latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
+
+        return {
+            "status": "success",
+            "record_id": None,
+            "input_type": "camera_fast_frame",
+            "output_image_url": "",
+            "latency_ms": latency_ms,
+            "result": {
+                **result_data,
+                "camera_mode": True,
+                "fast_mode": True,
+            },
+        }
+
+    except _OCHTTPException:
+        raise
+    except Exception as exc:
+        raise _OCHTTPException(status_code=500, detail=f"交警手势摄像头识别失败：{exc}")
 
 
 # REALTIME_FUSION_MONITOR_PATCH_V1
@@ -7115,69 +8358,113 @@ def _rfm_ensure_table():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fusion_monitor_anomaly_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_key INTEGER NOT NULL,
+                user_id INTEGER,
+                source_id TEXT NOT NULL,
+                source_name TEXT,
+                anomaly_type TEXT NOT NULL,
+                consecutive_count INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 0,
+                last_alert_id INTEGER,
+                last_reason TEXT,
+                last_seen_at TEXT,
+                last_alert_at TEXT,
+                recovered_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_key, source_id, anomaly_type)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fusion_anomaly_active
+            ON fusion_monitor_anomaly_state(
+                user_key,
+                active,
+                anomaly_type
+            )
+            """
+        )
         conn.commit()
 
 
 def _rfm_to_dict(value):
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _rfm_result_of(channel: dict) -> dict:
+    """递归拆开 channel/result/data/summary，只读取本轮接口真实返回。"""
+    current = _rfm_to_dict(channel)
+    visited = set()
+
+    while isinstance(current, dict) and id(current) not in visited:
+        visited.add(id(current))
+        next_value = None
+        for key in ("result", "data", "summary", "result_summary"):
+            candidate = current.get(key)
+            if isinstance(candidate, dict):
+                next_value = candidate
+                break
+        if next_value is None:
+            break
+        current = next_value
+
+    return current if isinstance(current, dict) else {}
+
+
+def _rfm_channel_ok(channel: dict) -> bool:
     channel = _rfm_to_dict(channel)
-
-    if isinstance(channel.get("result"), dict):
-        return channel["result"]
-
-    if isinstance(channel.get("summary"), dict):
-        return channel["summary"]
-
-    if isinstance(channel.get("result_summary"), dict):
-        summary = channel["result_summary"]
-        if isinstance(summary.get("result"), dict):
-            return summary["result"]
-        return summary
-
-    return channel
+    if not channel:
+        return False
+    if str(channel.get("status") or "success").lower() not in {"success", "ok"}:
+        return False
+    if channel.get("error") or channel.get("detail"):
+        return False
+    return True
 
 
 def _rfm_extract_plate(plate_channel: dict) -> dict:
     channel = _rfm_to_dict(plate_channel)
     result = _rfm_result_of(channel)
+    raw_plates = result.get("plates") or result.get("stable_plates") or []
+    plates = [item for item in raw_plates if isinstance(item, dict)]
 
-    plates = result.get("plates")
-    if plates is None:
-        plates = []
-
-    plate_count = result.get("plate_count")
-    if plate_count is None:
+    def confidence(item):
         try:
-            plate_count = len(plates)
+            return float(item.get("confidence") or item.get("avg_confidence") or 0)
         except Exception:
-            plate_count = 0
+            return 0.0
 
-    best_plate = ""
-    best_confidence = None
-
-    if isinstance(plates, list) and plates:
-        first = plates[0]
-        if isinstance(first, dict):
-            best_plate = first.get("plate") or first.get("plate_number") or first.get("text") or ""
-            best_confidence = first.get("confidence")
-        else:
-            best_plate = str(first)
+    best = max(plates, key=confidence, default={})
+    best_plate = (
+        best.get("plate_number")
+        or best.get("plate")
+        or best.get("text")
+        or result.get("best_plate")
+        or result.get("best_plate_text")
+        or ""
+    )
+    valid = _rfm_channel_ok(channel) and bool(best_plate)
 
     return {
-        "available": bool(channel),
+        "available": valid,
+        "detected": valid,
         "source_id": channel.get("source_id") or result.get("source_id") or "",
         "input_type": channel.get("input_type") or result.get("input_type") or "",
         "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
-        "plate_count": int(plate_count or 0),
-        "best_plate": best_plate,
-        "best_confidence": best_confidence,
+        "plate_count": len(plates) if plates else int(result.get("plate_count") or 0),
+        "best_plate": str(best_plate),
+        "best_plate_color": str(
+            best.get("plate_color")
+            or best.get("color")
+            or result.get("best_plate_color")
+            or "未知颜色"
+        ) if best_plate else "",
+        "best_confidence": confidence(best) if best else result.get("best_confidence"),
         "plates": plates,
         "raw": channel,
     }
@@ -7186,16 +8473,23 @@ def _rfm_extract_plate(plate_channel: dict) -> dict:
 def _rfm_extract_traffic(traffic_channel: dict) -> dict:
     channel = _rfm_to_dict(traffic_channel)
     result = _rfm_result_of(channel)
+    gesture = str(result.get("gesture") or "").strip()
+    valid = (
+        _rfm_channel_ok(channel)
+        and gesture not in {"", "unknown", "no_pose", "none"}
+        and bool(result.get("landmarks") or result.get("pose_detected", True))
+    )
 
     return {
-        "available": bool(channel),
-        "source_id": channel.get("source_id") or result.get("source_id") or "",
+        "available": valid,
+        "detected": valid,
+        "source_id": channel.get("source_id") or result.get("source_id") or "camera",
         "input_type": channel.get("input_type") or result.get("input_type") or "",
         "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
-        "gesture": result.get("gesture") or "",
-        "gesture_name": result.get("gesture_name") or "",
-        "traffic_command": result.get("traffic_command") or result.get("command") or "",
-        "confidence": result.get("confidence"),
+        "gesture": gesture if valid else "",
+        "gesture_name": str(result.get("gesture_name") or "") if valid else "",
+        "traffic_command": str(result.get("traffic_command") or result.get("command") or "") if valid else "",
+        "confidence": result.get("confidence") if valid else None,
         "raw": channel,
     }
 
@@ -7203,18 +8497,24 @@ def _rfm_extract_traffic(traffic_channel: dict) -> dict:
 def _rfm_extract_owner(owner_channel: dict) -> dict:
     channel = _rfm_to_dict(owner_channel)
     result = _rfm_result_of(channel)
+    gesture = str(result.get("gesture") or "").strip()
+    valid = (
+        _rfm_channel_ok(channel)
+        and gesture not in {"", "unknown", "no_hand", "none"}
+    )
 
     return {
-        "available": bool(channel),
+        "available": valid,
+        "detected": valid,
         "source_id": channel.get("source_id") or result.get("source_id") or "camera",
         "input_type": channel.get("input_type") or result.get("input_type") or "camera_fast_frame",
         "latency_ms": channel.get("latency_ms") or result.get("latency_ms"),
-        "gesture": result.get("gesture") or "",
-        "gesture_name": result.get("gesture_name") or "",
-        "action": result.get("action") or "",
-        "description": result.get("description") or "",
-        "confidence": result.get("confidence"),
-        "vehicle_state": result.get("vehicle_state") or {},
+        "gesture": gesture if valid else "",
+        "gesture_name": str(result.get("gesture_name") or "") if valid else "",
+        "action": str(result.get("action") or "") if valid else "",
+        "description": str(result.get("description") or "") if valid else "",
+        "confidence": result.get("confidence") if valid else None,
+        "vehicle_state": (result.get("vehicle_state") or {}) if valid else {},
         "raw": channel,
     }
 
@@ -7228,139 +8528,137 @@ def _rfm_level(score: int) -> str:
 
 
 def _rfm_decide(evidence: dict) -> dict:
+    """只依据当前轮次真实识别结果生成决策，不补写不存在的事件。"""
     plate = _rfm_extract_plate(evidence.get("plate"))
     traffic = _rfm_extract_traffic(evidence.get("traffic"))
     owner = _rfm_extract_owner(evidence.get("owner"))
 
-    score = 10
+    score = 0
+    observed_events = []
     reasons = []
 
-    has_plate = plate["plate_count"] > 0
+    if plate["detected"]:
+        observed_events.append({
+            "channel": "plate",
+            "event": "plate_detected",
+            "text": (
+                f"检测到车牌 {plate['best_plate']}"
+                f"（{plate.get('best_plate_color') or '未知颜色'}）"
+            ),
+            "confidence": plate["best_confidence"],
+        })
+        reasons.append(
+            f"车牌通道实际检测到 {plate['best_plate']}"
+            f"（{plate.get('best_plate_color') or '未知颜色'}）。"
+        )
+        score += 10
+
     traffic_gesture = traffic["gesture"]
+    traffic_name = traffic["gesture_name"] or traffic_gesture
+    if traffic["detected"]:
+        observed_events.append({
+            "channel": "traffic",
+            "event": traffic_gesture,
+            "text": f"交警手势：{traffic_name}",
+            "confidence": traffic["confidence"],
+        })
+        reasons.append(f"交警摄像头实际识别为 {traffic_name}。")
+        if traffic_gesture == "stop" or "停止" in traffic_name:
+            score += 55
+        elif traffic_gesture in {"lane_change", "left_turn", "right_turn", "left_turn_wait"}:
+            score += 32
+        elif traffic_gesture in {"slow_down", "pull_over"}:
+            score += 40
+        else:
+            score += 18
+
     owner_gesture = owner["gesture"]
     owner_action = owner["action"]
-
-    if plate["available"]:
-        if has_plate:
-            score += 20
-            reasons.append(f"视频流检测到车辆/车牌：{plate['best_plate'] or '未解析车牌号'}。")
+    if owner["detected"]:
+        owner_text = owner["gesture_name"] or owner_gesture
+        observed_events.append({
+            "channel": "owner",
+            "event": owner_gesture,
+            "text": f"车主手势：{owner_text}",
+            "confidence": owner["confidence"],
+        })
+        reasons.append(f"车主摄像头实际识别为 {owner_text}。")
+        if owner_action in {"answer_call", "hang_up_call"}:
+            score += 18
         else:
-            score += 5
-            reasons.append("车牌视频流已接入，但当前未检测到有效车牌。")
-    else:
-        reasons.append("车牌视频流暂未提供有效证据。")
-
-    if traffic["available"]:
-        if traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]:
-            score += 45
-            reasons.append("交警手势识别为停止类指令，需要优先服从交通指挥。")
-        elif traffic_gesture in {"lane_change", "turn_left", "turn_right"} or "变道" in traffic["gesture_name"]:
-            score += 28
-            reasons.append("交警手势识别为变道/转向类指令，需要观察周边车辆并谨慎执行。")
-        elif traffic_gesture:
-            score += 15
-            reasons.append(f"交警手势识别为 {traffic['gesture_name'] or traffic_gesture}。")
-        else:
-            reasons.append("交警手势视频流已接入，但暂未识别到明确手势。")
-    else:
-        reasons.append("交警手势视频流暂未提供有效证据。")
-
-    if owner["available"]:
-        if owner_gesture in {"thumb_up", "thumb_down"} or owner_action in {"answer_call", "hang_up_call"}:
-            score += 15
-            reasons.append("车主摄像头识别到电话相关手势，驾驶注意力存在分散风险。")
-        elif owner_gesture in {"open_palm", "wave", "swipe_left", "swipe_right"}:
             score += 8
-            reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车载交互。")
-        elif owner_gesture in {
-            "fist",
-            "ok",
-            "circle_clockwise",
-            "circle_counterclockwise",
-        }:
-            score += 10
-            reasons.append(f"车主摄像头识别到 {owner['gesture_name'] or owner_gesture}，触发车辆控制动作。")
-        elif owner_gesture == "no_hand":
-            reasons.append("车主摄像头当前未检测到手部。")
-    else:
-        reasons.append("车主摄像头暂未提供有效证据。")
 
-    if has_plate and (traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]):
+    has_plate = plate["detected"]
+    stop_signal = traffic["detected"] and (
+        traffic_gesture == "stop" or "停止" in traffic_name
+    )
+    direction_signal = traffic["detected"] and traffic_gesture in {
+        "lane_change", "left_turn", "right_turn", "left_turn_wait"
+    }
+
+    if has_plate and stop_signal:
         score += 20
-        scenario = "前方车辆存在且交警发出停止指令"
-        suggestion = "建议立即减速并停车等待交警进一步指挥，禁止继续抢行。"
+        scenario = f"检测到车牌 {plate['best_plate']}，同时识别到交警停止信号"
+        suggestion = "立即减速并停车，等待交警进一步指挥。"
         control_advice = "decelerate_and_stop"
-    elif has_plate and (traffic_gesture in {"lane_change", "turn_left", "turn_right"} or "变道" in traffic["gesture_name"]):
-        score += 12
-        scenario = "前方车辆存在且交警发出变道/转向指令"
-        suggestion = "建议降低车速，确认相邻车道安全后按交警指挥变道或转向。"
-        control_advice = "slow_down_and_follow_traffic_police"
-    elif traffic_gesture in {"stop", "stop_signal", "halt"} or "停止" in traffic["gesture_name"]:
-        scenario = "交警停止指令触发"
-        suggestion = "建议立即减速，准备停车并等待交通指挥。"
+    elif stop_signal:
+        scenario = "识别到交警停止信号"
+        suggestion = "立即减速，准备停车并服从现场交通指挥。"
         control_advice = "prepare_to_stop"
-    elif owner_action in {"answer_call", "hang_up_call"}:
-        scenario = "车主电话交互手势触发"
-        suggestion = "已执行电话相关车载交互，建议驾驶员保持注意力集中。"
+    elif has_plate and direction_signal:
+        score += 10
+        scenario = f"检测到车牌 {plate['best_plate']}，同时识别到交警转向或变道信号"
+        suggestion = "降低车速，确认周边安全后按交警指挥通行。"
+        control_advice = "slow_down_and_follow_traffic_police"
+    elif traffic["detected"]:
+        scenario = f"识别到交警手势：{traffic_name}"
+        suggestion = traffic["traffic_command"] or "按当前交警手势指令谨慎通行。"
+        control_advice = "follow_traffic_police"
+    elif has_plate:
+        scenario = f"当前轮次检测到车牌 {plate['best_plate']}"
+        suggestion = "保持安全车距并继续观察道路环境。"
+        control_advice = "maintain_safe_distance"
+    elif owner["detected"]:
+        scenario = f"当前轮次识别到车主手势：{owner['gesture_name'] or owner_gesture}"
+        suggestion = owner["description"] or "已记录车主交互动作，请保持驾驶注意力。"
         control_advice = "keep_attention"
-    elif owner_gesture and owner_gesture not in {"no_hand", "unknown"}:
-        scenario = "车主车载功能控制"
-        suggestion = "已根据车主手势执行车载功能控制，建议继续保持安全驾驶。"
-        control_advice = "maintain_safe_driving"
-    elif plate["available"] or traffic["available"] or owner["available"]:
-        scenario = "多路感知输入正常"
-        suggestion = "当前未检测到显著风险，继续监控车牌、交警手势和车主手势变化。"
-        control_advice = "continue_monitoring"
     else:
-        scenario = "暂无有效感知输入"
-        suggestion = "请确认视频流和摄像头输入是否正常接入。"
-        control_advice = "check_inputs"
+        scenario = "本轮未检测到有效交通事件"
+        suggestion = "当前轮次没有可用于决策的有效识别结果，继续等待下一轮真实感知输入。"
+        control_advice = "continue_monitoring"
 
     score = max(0, min(100, int(score)))
-    risk_level = _rfm_level(score)
-
     created_at = _rfm_now_text()
 
     return {
         "decision_id": f"fusion_monitor_{_rfm_uuid.uuid4().hex}",
         "agent": {
             "name": "RealtimeFusionMonitorAgent",
-            "mode": "evidence_payload_rule_based",
+            "mode": "current_cycle_verified_evidence",
             "llm_enabled": False,
         },
         "scenario": scenario,
-        "risk_level": risk_level,
+        "risk_level": _rfm_level(score),
         "risk_score": score,
         "suggestion": suggestion,
-        "reason": "；".join(reasons),
+        "reason": "；".join(reasons) if reasons else "本轮三个通道均未返回有效检测事件。",
         "control_advice": control_advice,
+        "observed_events": observed_events,
+        "evidence_integrity": {
+            "current_cycle_only": True,
+            "fabricated_events": False,
+            "valid_channel_count": sum([
+                int(plate["detected"]),
+                int(traffic["detected"]),
+                int(owner["detected"]),
+            ]),
+        },
         "evidence_summary": {
-            "plate": {
-                "available": plate["available"],
-                "plate_count": plate["plate_count"],
-                "best_plate": plate["best_plate"],
-                "latency_ms": plate["latency_ms"],
-            },
-            "traffic": {
-                "available": traffic["available"],
-                "gesture": traffic["gesture"],
-                "gesture_name": traffic["gesture_name"],
-                "traffic_command": traffic["traffic_command"],
-                "latency_ms": traffic["latency_ms"],
-            },
-            "owner": {
-                "available": owner["available"],
-                "gesture": owner["gesture"],
-                "gesture_name": owner["gesture_name"],
-                "action": owner["action"],
-                "latency_ms": owner["latency_ms"],
-            },
+            "plate": {key: plate[key] for key in ("available", "plate_count", "best_plate", "best_confidence", "latency_ms")},
+            "traffic": {key: traffic[key] for key in ("available", "gesture", "gesture_name", "traffic_command", "confidence", "latency_ms")},
+            "owner": {key: owner[key] for key in ("available", "gesture", "gesture_name", "action", "confidence", "latency_ms")},
         },
-        "evidence": {
-            "plate": plate,
-            "traffic": traffic,
-            "owner": owner,
-        },
+        "evidence": {"plate": plate, "traffic": traffic, "owner": owner},
         "created_at": created_at,
     }
 
@@ -7402,6 +8700,480 @@ def _rfm_save_decision(decision: dict) -> int:
         return int(cursor.lastrowid)
 
 
+
+# 融合监控异常邮件策略：
+# - 车牌通道连续 3 轮“读取成功但无有效车牌”才告警。
+# - 视频源连续 2 轮读取失败才告警。
+# - 同一异常持续期间只创建一次告警，恢复后才允许再次告警。
+# - 未识别到交警/车主手势不视为异常，因为现场可能本来就没有手势。
+_RFM_NO_PLATE_ALERT_ROUNDS = 3
+_RFM_SOURCE_FAILURE_ALERT_ROUNDS = 2
+
+
+def _rfm_user_key(user_id: int | None) -> int:
+    return int(user_id) if user_id is not None else 0
+
+
+def _rfm_get_anomaly_state(
+    *,
+    user_id: int | None,
+    source_id: str,
+    anomaly_type: str,
+) -> dict:
+    _rfm_ensure_table()
+
+    with _rfm_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM fusion_monitor_anomaly_state
+            WHERE user_key = ?
+              AND source_id = ?
+              AND anomaly_type = ?
+            """,
+            (
+                _rfm_user_key(user_id),
+                str(source_id),
+                str(anomaly_type),
+            ),
+        ).fetchone()
+
+    return dict(row) if row else {}
+
+
+def _rfm_mark_anomaly(
+    *,
+    user_id: int | None,
+    source_id: str,
+    source_name: str,
+    anomaly_type: str,
+    reason: str,
+    threshold: int,
+    level: str,
+    event_type: str,
+    summary: str,
+    suggestion: str,
+) -> dict:
+    """
+    递增异常连续次数。
+
+    达到阈值且当前异常尚未激活时：
+    1. 创建一条 alert_events；
+    2. insert_alert_event 自动安排用户和管理员邮件；
+    3. 标记 active，持续异常期间不重复创建。
+    """
+    _rfm_ensure_table()
+
+    user_key = _rfm_user_key(user_id)
+    source_id = str(source_id or "unknown_source")
+    source_name = str(source_name or source_id)
+    anomaly_type = str(anomaly_type)
+    now = _rfm_now_text()
+    threshold = max(1, int(threshold))
+
+    with _rfm_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM fusion_monitor_anomaly_state
+            WHERE user_key = ?
+              AND source_id = ?
+              AND anomaly_type = ?
+            """,
+            (user_key, source_id, anomaly_type),
+        ).fetchone()
+
+        previous_count = int(
+            row["consecutive_count"] or 0
+        ) if row else 0
+        active = bool(int(row["active"] or 0)) if row else False
+        count = previous_count + 1
+        should_create = count >= threshold and not active
+
+        if row:
+            conn.execute(
+                """
+                UPDATE fusion_monitor_anomaly_state
+                SET
+                    user_id = ?,
+                    source_name = ?,
+                    consecutive_count = ?,
+                    active = ?,
+                    last_reason = ?,
+                    last_seen_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    user_id,
+                    source_name,
+                    count,
+                    1 if (active or should_create) else 0,
+                    reason,
+                    now,
+                    now,
+                    int(row["id"]),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO fusion_monitor_anomaly_state (
+                    user_key,
+                    user_id,
+                    source_id,
+                    source_name,
+                    anomaly_type,
+                    consecutive_count,
+                    active,
+                    last_reason,
+                    last_seen_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_key,
+                    user_id,
+                    source_id,
+                    source_name,
+                    anomaly_type,
+                    count,
+                    1 if should_create else 0,
+                    reason,
+                    now,
+                    now,
+                ),
+            )
+
+        conn.commit()
+
+    alert_id = None
+
+    if should_create:
+        alert_id = insert_alert_event(
+            level=level,
+            event_type=event_type,
+            summary=summary,
+            reason=reason,
+            suggestion=suggestion,
+            related_record_id=None,
+            user_id=user_id,
+        )
+
+        with _rfm_connect() as conn:
+            conn.execute(
+                """
+                UPDATE fusion_monitor_anomaly_state
+                SET
+                    last_alert_id = ?,
+                    last_alert_at = ?,
+                    updated_at = ?
+                WHERE user_key = ?
+                  AND source_id = ?
+                  AND anomaly_type = ?
+                """,
+                (
+                    int(alert_id),
+                    now,
+                    now,
+                    user_key,
+                    source_id,
+                    anomaly_type,
+                ),
+            )
+            conn.commit()
+
+    state = _rfm_get_anomaly_state(
+        user_id=user_id,
+        source_id=source_id,
+        anomaly_type=anomaly_type,
+    )
+
+    return {
+        "source_id": source_id,
+        "source_name": source_name,
+        "anomaly_type": anomaly_type,
+        "consecutive_count": count,
+        "threshold": threshold,
+        "active": bool(
+            int(state.get("active") or 0)
+        ),
+        "created": alert_id is not None,
+        "alert_id": alert_id,
+        "reason": reason,
+    }
+
+
+def _rfm_recover_anomaly(
+    *,
+    user_id: int | None,
+    source_id: str,
+    anomaly_type: str,
+) -> dict:
+    """
+    感知恢复后清除异常锁。
+
+    恢复只写状态和操作日志，不再额外发送恢复邮件，避免邮件过多。
+    """
+    state = _rfm_get_anomaly_state(
+        user_id=user_id,
+        source_id=source_id,
+        anomaly_type=anomaly_type,
+    )
+
+    if not state:
+        return {
+            "recovered": False,
+            "was_active": False,
+        }
+
+    was_active = bool(int(state.get("active") or 0))
+    previous_count = int(
+        state.get("consecutive_count") or 0
+    )
+    now = _rfm_now_text()
+
+    with _rfm_connect() as conn:
+        conn.execute(
+            """
+            UPDATE fusion_monitor_anomaly_state
+            SET
+                consecutive_count = 0,
+                active = 0,
+                recovered_at = ?,
+                updated_at = ?
+            WHERE user_key = ?
+              AND source_id = ?
+              AND anomaly_type = ?
+            """,
+            (
+                now,
+                now,
+                _rfm_user_key(user_id),
+                str(source_id),
+                str(anomaly_type),
+            ),
+        )
+        conn.commit()
+
+    recovered = was_active or previous_count > 0
+
+    if recovered:
+        try:
+            insert_operation_log(
+                action="fusion_monitor_anomaly_recovered",
+                detail={
+                    "source_id": source_id,
+                    "anomaly_type": anomaly_type,
+                    "was_active": was_active,
+                    "previous_count": previous_count,
+                },
+                user_id=user_id,
+            )
+        except Exception:
+            pass
+
+    return {
+        "recovered": recovered,
+        "was_active": was_active,
+        "previous_count": previous_count,
+    }
+
+
+def _rfm_evaluate_monitor_anomalies(
+    *,
+    evidence: dict,
+    monitor_context: dict,
+    cycle: int,
+) -> dict:
+    """
+    根据当前轮次结果判断是否需要创建告警和邮件通知。
+
+    不把单轮空结果直接发邮件，避免 3~5 秒一封邮件。
+    """
+    user_id = current_request_user_id()
+    created: list[dict] = []
+    states: list[dict] = []
+    recovered: list[dict] = []
+
+    context = _rfm_to_dict(monitor_context)
+    evidence = _rfm_to_dict(evidence)
+
+    # ---------------------- 车牌通道 ----------------------
+    plate_expected = bool(context.get("plate_expected"))
+    plate_source_id = str(
+        context.get("plate_source_id")
+        or _rfm_to_dict(evidence.get("plate")).get("source_id")
+        or "plate_source"
+    )
+    plate_source_name = str(
+        context.get("plate_source_name")
+        or plate_source_id
+    )
+    plate_error = str(
+        context.get("plate_error") or ""
+    ).strip()
+
+    if plate_expected:
+        if plate_error:
+            # 源读取失败和“读取成功但没有车牌”分开统计。
+            state = _rfm_mark_anomaly(
+                user_id=user_id,
+                source_id=plate_source_id,
+                source_name=plate_source_name,
+                anomaly_type="plate_source_failed",
+                reason=(
+                    f"融合监控车牌视频源“{plate_source_name}”"
+                    f"连续读取失败，本轮错误：{plate_error}"
+                ),
+                threshold=_RFM_SOURCE_FAILURE_ALERT_ROUNDS,
+                level="error",
+                event_type="fusion_plate_source_failed",
+                summary="融合监控车牌视频源连续读取失败",
+                suggestion=(
+                    "建议检查老师 RTSP 是否在线、MediaMTX 与 ffmpeg "
+                    "是否运行、视频源地址和网络连通性。"
+                ),
+            )
+            states.append(state)
+            if state["created"]:
+                created.append(state)
+        else:
+            recovery = _rfm_recover_anomaly(
+                user_id=user_id,
+                source_id=plate_source_id,
+                anomaly_type="plate_source_failed",
+            )
+            if recovery["recovered"]:
+                recovered.append({
+                    "source_id": plate_source_id,
+                    "anomaly_type": "plate_source_failed",
+                    **recovery,
+                })
+
+            plate = _rfm_extract_plate(
+                evidence.get("plate")
+            )
+
+            if plate.get("detected"):
+                recovery = _rfm_recover_anomaly(
+                    user_id=user_id,
+                    source_id=plate_source_id,
+                    anomaly_type="plate_not_detected",
+                )
+                if recovery["recovered"]:
+                    recovered.append({
+                        "source_id": plate_source_id,
+                        "anomaly_type": "plate_not_detected",
+                        **recovery,
+                    })
+            else:
+                plate_channel = _rfm_to_dict(
+                    evidence.get("plate")
+                )
+                sampled_frames = (
+                    plate_channel.get("sampled_frames")
+                    or _rfm_result_of(
+                        plate_channel
+                    ).get("sampled_frames")
+                    or 0
+                )
+
+                state = _rfm_mark_anomaly(
+                    user_id=user_id,
+                    source_id=plate_source_id,
+                    source_name=plate_source_name,
+                    anomaly_type="plate_not_detected",
+                    reason=(
+                        f"融合监控车牌通道“{plate_source_name}”"
+                        f"已连续多轮未检测到有效车牌。"
+                        f"当前为第 {int(cycle or 0)} 轮，"
+                        f"本轮抽样 {int(sampled_frames or 0)} 帧。"
+                        "视频源可以读取，但没有形成稳定车牌结果。"
+                    ),
+                    threshold=_RFM_NO_PLATE_ALERT_ROUNDS,
+                    level="warning",
+                    event_type="fusion_plate_not_detected",
+                    summary="融合监控连续未检测到有效车牌",
+                    suggestion=(
+                        "建议检查场景内是否存在车辆、车牌目标尺寸和清晰度；"
+                        "对于沙盘画面，应优先使用小目标车牌检测模型先定位、"
+                        "裁剪和放大，再交给 HyperLPR 识别。"
+                    ),
+                )
+                states.append(state)
+                if state["created"]:
+                    created.append(state)
+
+    # ---------------------- 交警备用视频源 ----------------------
+    # “没有识别到交警手势”可能是正常现场状态，不发送邮件；
+    # 仅对配置了备用源且连续读取失败进行告警。
+    traffic_expected = bool(
+        context.get("traffic_source_expected")
+    )
+    traffic_source_id = str(
+        context.get("traffic_source_id")
+        or "traffic_source"
+    )
+    traffic_source_name = str(
+        context.get("traffic_source_name")
+        or traffic_source_id
+    )
+    traffic_error = str(
+        context.get("traffic_error") or ""
+    ).strip()
+
+    if traffic_expected:
+        if traffic_error:
+            state = _rfm_mark_anomaly(
+                user_id=user_id,
+                source_id=traffic_source_id,
+                source_name=traffic_source_name,
+                anomaly_type="traffic_source_failed",
+                reason=(
+                    f"融合监控交警备用视频源“{traffic_source_name}”"
+                    f"连续读取失败，本轮错误：{traffic_error}"
+                ),
+                threshold=_RFM_SOURCE_FAILURE_ALERT_ROUNDS,
+                level="error",
+                event_type="fusion_traffic_source_failed",
+                summary="融合监控交警备用视频源连续读取失败",
+                suggestion=(
+                    "建议检查备用流地址、RTSP 发布状态、网络连接，"
+                    "或直接启用交警电脑摄像头作为当前轮次证据。"
+                ),
+            )
+            states.append(state)
+            if state["created"]:
+                created.append(state)
+        else:
+            recovery = _rfm_recover_anomaly(
+                user_id=user_id,
+                source_id=traffic_source_id,
+                anomaly_type="traffic_source_failed",
+            )
+            if recovery["recovered"]:
+                recovered.append({
+                    "source_id": traffic_source_id,
+                    "anomaly_type": "traffic_source_failed",
+                    **recovery,
+                })
+
+    return {
+        "policy": {
+            "no_plate_rounds": _RFM_NO_PLATE_ALERT_ROUNDS,
+            "source_failure_rounds": _RFM_SOURCE_FAILURE_ALERT_ROUNDS,
+            "deduplicate_until_recovery": True,
+            "email_recipients": "owning_user_and_all_valid_admins",
+            "gesture_absence_is_alert": False,
+        },
+        "created": created,
+        "states": states,
+        "recovered": recovered,
+    }
+
+
 @app.post("/api/fusion/monitor/decision")
 def realtime_fusion_monitor_decision(payload: dict | None = _RFMBody(default=None)):
     payload = payload or {}
@@ -7413,15 +9185,40 @@ def realtime_fusion_monitor_decision(payload: dict | None = _RFMBody(default=Non
     }
 
     save = bool(payload.get("save", True))
+    cycle = int(payload.get("cycle") or 0)
+    monitor_context = _rfm_to_dict(
+        payload.get("monitor_context")
+    )
 
     try:
         decision = _rfm_decide(_rfm_to_dict(evidence))
+
+        try:
+            monitor_alerts = _rfm_evaluate_monitor_anomalies(
+                evidence=_rfm_to_dict(evidence),
+                monitor_context=monitor_context,
+                cycle=cycle,
+            )
+        except Exception as alert_error:
+            monitor_alerts = {
+                "policy": {},
+                "created": [],
+                "states": [],
+                "recovered": [],
+                "error": (
+                    f"{type(alert_error).__name__}: "
+                    f"{alert_error}"
+                ),
+            }
+
+        decision["monitor_alerts"] = monitor_alerts
         saved_id = _rfm_save_decision(decision) if save else None
 
         return {
             "status": "success",
             "saved_id": saved_id,
             "decision": decision,
+            "monitor_alerts": monitor_alerts,
         }
 
     except Exception as exc:
@@ -7492,205 +9289,438 @@ def realtime_fusion_monitor_history(limit: int = _RFMQuery(default=20, ge=1, le=
     }
 
 
-# FUSION_MONITOR_CHANNEL_RECOGNIZE_PATCH_V1
-# 融合监控页：按前端配置识别单个输入通道
+# FUSION_MONITOR_CHANNEL_RECOGNIZE_PATCH_V3
+# 融合监控通道低延迟读取：
+# 1. 沙盘 live1~live12 优先读取本地 MediaMTX 转发流；
+# 2. OpenCV 设置打开/读取硬超时；
+# 3. 每轮限制采样数量和总读取时间；
+# 4. 前端并行调用车牌和交警备用通道。
 from fastapi import Body as _RMCBody, HTTPException as _RMCHTTPException
-from pathlib import Path as _RMCPath
+import re as _rmc_re
 import time as _rmc_time
-import cv2 as _rmc_cv2
 
 
-def _rmc_project_root() -> _RMCPath:
-    return _RMCPath(__file__).resolve().parent.parent
+_RMC_OPEN_TIMEOUT_MS = 4000
+_RMC_READ_TIMEOUT_MS = 2500
+_RMC_CAPTURE_DEADLINE_SECONDS = 6.5
+_RMC_PLATE_MAX_SAMPLES = 6
+_RMC_TRAFFIC_MAX_SAMPLES = 8
 
 
-def _rmc_demo_path(filename: str) -> _RMCPath:
-    return _rmc_project_root() / "demo" / filename
+def _rmc_is_sandbox_source(
+    source_id: str,
+    source_url: str,
+) -> bool:
+    source_id = str(source_id or "").strip()
+    source_url = str(source_url or "").strip()
+
+    if _rmc_re.fullmatch(r"live(?:[1-9]|1[0-2])", source_id):
+        return True
+
+    return source_url.startswith(
+        f"{SANDBOX_RTSP_BASE}/"
+    )
 
 
-def _rmc_read_stream_frame(source_url: str, warmup_frames: int = 3) -> bytes:
-    cap = _rmc_cv2.VideoCapture(source_url)
+def _rmc_raw_source_url(
+    source_id: str,
+    source_url: str,
+) -> str:
+    if source_url:
+        return source_url
 
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频流：{source_url}")
+    if source_id:
+        try:
+            source = get_stream_source(source_id)
+            return str(source.get("url") or "")
+        except Exception:
+            pass
 
-    frame = None
+    return ""
+
+
+def _rmc_source_candidates(
+    source_id: str,
+    source_url: str,
+) -> list[dict]:
+    """
+    沙盘流优先使用本地 MediaMTX 长连接转发，避免每轮重新连接老师 RTSP。
+
+    本地转发不可用时，才短超时回退到原始地址。
+    """
+    source_id = str(source_id or "").strip()
+    source_url = str(source_url or "").strip()
+    candidates: list[dict] = []
+
+    if _rmc_is_sandbox_source(source_id, source_url):
+        match = _rmc_re.search(
+            r"(live(?:[1-9]|1[0-2]))",
+            source_id or source_url,
+        )
+        camera_id = match.group(1) if match else source_id
+
+        if camera_id:
+            try:
+                status = get_stream_status(camera_id)
+                if not status.get("running"):
+                    start_stream(
+                        camera_id,
+                        mode="copy",
+                        fps=15,
+                        force_restart=False,
+                    )
+                    # 给本地 RTSP 发布留出极短启动时间。
+                    _rmc_time.sleep(0.25)
+            except Exception:
+                pass
+
+            candidates.append({
+                "url": (
+                    "rtsp://127.0.0.1:8554/"
+                    f"sandbox_{camera_id}"
+                ),
+                "kind": "local_mediamtx",
+                "camera_id": camera_id,
+            })
+
+    raw_url = _rmc_raw_source_url(
+        source_id,
+        source_url,
+    )
+
+    if raw_url and all(
+        item["url"] != raw_url
+        for item in candidates
+    ):
+        candidates.append({
+            "url": raw_url,
+            "kind": "original_source",
+            "camera_id": "",
+        })
+
+    return candidates
+
+
+def _rmc_open_capture(
+    url: str,
+    *,
+    open_timeout_ms: int = _RMC_OPEN_TIMEOUT_MS,
+    read_timeout_ms: int = _RMC_READ_TIMEOUT_MS,
+):
+    """
+    使用 OpenCV FFmpeg 后端的打开/读取超时。
+
+    新版 OpenCV 支持在 open() 时传入参数；旧版不支持时回退到 set()。
+    """
+    cap = cv2.VideoCapture()
+    params: list[int] = []
+
+    open_prop = getattr(
+        cv2,
+        "CAP_PROP_OPEN_TIMEOUT_MSEC",
+        None,
+    )
+    read_prop = getattr(
+        cv2,
+        "CAP_PROP_READ_TIMEOUT_MSEC",
+        None,
+    )
+
+    if open_prop is not None:
+        params.extend([
+            int(open_prop),
+            int(open_timeout_ms),
+        ])
+    if read_prop is not None:
+        params.extend([
+            int(read_prop),
+            int(read_timeout_ms),
+        ])
+
+    opened = False
+
+    try:
+        if params:
+            opened = bool(
+                cap.open(
+                    url,
+                    cv2.CAP_FFMPEG,
+                    params,
+                )
+            )
+        else:
+            opened = bool(
+                cap.open(url, cv2.CAP_FFMPEG)
+            )
+    except Exception:
+        cap.release()
+        cap = cv2.VideoCapture()
+
+        if open_prop is not None:
+            cap.set(
+                open_prop,
+                int(open_timeout_ms),
+            )
+        if read_prop is not None:
+            cap.set(
+                read_prop,
+                int(read_timeout_ms),
+            )
+
+        opened = bool(
+            cap.open(url, cv2.CAP_FFMPEG)
+        )
+
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap, opened
+
+
+def _rmc_open_first_available_source(
+    source_id: str,
+    source_url: str,
+):
+    candidates = _rmc_source_candidates(
+        source_id,
+        source_url,
+    )
+
+    if not candidates:
+        raise RuntimeError("未提供可读取的视频源地址")
+
+    errors: list[str] = []
+
+    for candidate in candidates:
+        url = str(candidate["url"])
+        cap = None
+
+        try:
+            cap, opened = _rmc_open_capture(url)
+
+            if opened and cap.isOpened():
+                return cap, candidate, errors
+
+            errors.append(
+                f"{candidate['kind']} 无法打开：{url}"
+            )
+        except Exception as error:
+            errors.append(
+                f"{candidate['kind']} 打开异常："
+                f"{type(error).__name__}: {error}"
+            )
+        finally:
+            if (
+                cap is not None
+                and not cap.isOpened()
+            ):
+                cap.release()
+
+    raise RuntimeError(
+        "；".join(errors)
+        or "所有视频源候选均无法打开"
+    )
+
+
+def _rmc_best_plate(plates: list[dict]) -> dict | None:
+    valid = [item for item in plates if isinstance(item, dict) and item.get("plate_number")]
+    if not valid:
+        return None
+    return max(valid, key=lambda item: float(item.get("confidence") or 0))
+
+
+def _rmc_recognize_channel_current_cycle(
+    *,
+    task_type: str,
+    source_id: str,
+    source_url: str,
+    frame_count: int,
+    sample_interval: int,
+    warmup_frames: int,
+) -> dict:
+    started = _rmc_time.perf_counter()
+    cap, source_meta, source_errors = (
+        _rmc_open_first_available_source(
+            source_id,
+            source_url,
+        )
+    )
+    url = str(source_meta["url"])
+    requested_frame_count = max(1, int(frame_count))
+    requested_interval = max(1, int(sample_interval))
+
+    if task_type == "plate":
+        max_samples = min(
+            _RMC_PLATE_MAX_SAMPLES,
+            requested_frame_count,
+        )
+    else:
+        max_samples = min(
+            _RMC_TRAFFIC_MAX_SAMPLES,
+            requested_frame_count,
+        )
+
+    # 融合监控强调当前轮次低延迟，不再按“帧数 × 间隔”读取数百帧。
+    effective_interval = max(
+        1,
+        min(
+            requested_interval,
+            3 if task_type == "plate" else 2,
+        ),
+    )
+    max_reads = max(
+        int(warmup_frames) + max_samples,
+        max_samples * effective_interval + int(warmup_frames),
+    )
+    capture_deadline = (
+        _rmc_time.perf_counter()
+        + _RMC_CAPTURE_DEADLINE_SECONDS
+    )
+
+    frame_results = []
+    frames_read = 0
+    sampled = 0
 
     try:
         for _ in range(max(0, int(warmup_frames))):
+            if _rmc_time.perf_counter() >= capture_deadline:
+                break
             cap.read()
 
-        ok, frame = cap.read()
+        while (
+            frames_read < max_reads
+            and sampled < max_samples
+            and _rmc_time.perf_counter() < capture_deadline
+        ):
+            ok, frame = cap.read()
+            frames_read += 1
+            if not ok or frame is None:
+                continue
+            if frames_read % effective_interval != 0:
+                continue
 
-        if not ok or frame is None:
-            raise RuntimeError(f"无法从视频流读取有效帧：{source_url}")
+            sampled += 1
+            frame_started = _rmc_time.perf_counter()
 
-        ok, buffer = _rmc_cv2.imencode(".jpg", frame)
+            if task_type == "plate":
+                result = recognize_plate_frame(
+                    frame,
+                    output_path=None,
+                    draw_annotation=False,
+                )
+                confidence = max(
+                    [float(item.get("confidence") or 0) for item in result.get("plates", [])],
+                    default=0.0,
+                )
+            elif task_type == "traffic_gesture":
+                result = recognize_traffic_gesture_frame(
+                    frame,
+                    output_path=None,
+                    static_image_mode=False,
+                    draw_annotation=False,
+                )
+                confidence = float(result.get("confidence") or 0)
+            else:
+                raise RuntimeError("task_type 只支持 plate 或 traffic_gesture")
 
-        if not ok:
-            raise RuntimeError("视频流帧编码为 JPG 失败")
-
-        return buffer.tobytes()
-
+            frame_results.append({
+                "frame_index": frames_read,
+                "captured_at": now_text(),
+                "saved_filename": "",
+                "image_url": "",
+                "output_filename": "",
+                "output_image_url": "",
+                "confidence": confidence,
+                "latency_ms": round((_rmc_time.perf_counter() - frame_started) * 1000, 2),
+                "result": result,
+            })
     finally:
         cap.release()
 
+    if not frame_results:
+        raise RuntimeError("视频源未返回可识别的有效帧")
 
-def _rmc_post_image_to_endpoint(endpoint: str, filename: str, content: bytes) -> dict:
-    try:
-        from fastapi.testclient import TestClient as _RMCTestClient
-    except Exception as exc:
-        raise RuntimeError(f"缺少 fastapi.testclient/httpx2 支持：{repr(exc)}")
+    if task_type == "plate":
+        aggregated = aggregate_plate_frame_results(frame_results)
+        final_result = aggregated.get("final_result") or aggregated
+        plates = final_result.get("stable_plates") or final_result.get("plates") or []
+        best = _rmc_best_plate(plates)
+        if best is None:
+            best_text = final_result.get("best_plate_text") or ""
+            best_confidence = float(final_result.get("best_confidence") or 0)
+        else:
+            best_text = best.get("plate_number") or ""
+            best_confidence = float(best.get("confidence") or best.get("avg_confidence") or 0)
+        result = {
+            **final_result,
+            "plates": plates,
+            "plate_count": len(plates),
+            "best_plate": best_text,
+            "best_confidence": round(best_confidence, 4),
+        }
+    else:
+        aggregated = aggregate_gesture_frame_results(task_type, frame_results)
+        result = aggregated.get("final_result") or {}
 
-    client = _RMCTestClient(app)
-
-    response = client.post(
-        endpoint,
-        files={
-            "file": (filename, content, "image/jpeg")
-        },
-    )
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {"raw": response.text}
-
-    data["_status_code"] = response.status_code
-
-    if response.status_code >= 400:
-        raise RuntimeError(data.get("detail") or data.get("message") or response.text)
-
-    return data
-
-
-def _rmc_post_json_to_endpoint(endpoint: str, body: dict) -> dict:
-    try:
-        from fastapi.testclient import TestClient as _RMCTestClient
-    except Exception as exc:
-        raise RuntimeError(f"缺少 fastapi.testclient/httpx2 支持：{repr(exc)}")
-
-    client = _RMCTestClient(app)
-    response = client.post(endpoint, json=body)
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {"raw": response.text}
-
-    data["_status_code"] = response.status_code
-
-    if response.status_code >= 400:
-        raise RuntimeError(data.get("detail") or data.get("message") or response.text)
-
-    return data
+    return {
+        "status": "success",
+        "task_type": task_type,
+        "source_id": source_id,
+        "source_url": url,
+        "requested_source_url": source_url,
+        "source_resolution": source_meta.get("kind"),
+        "source_fallback_errors": source_errors,
+        "open_timeout_ms": _RMC_OPEN_TIMEOUT_MS,
+        "read_timeout_ms": _RMC_READ_TIMEOUT_MS,
+        "capture_deadline_seconds": _RMC_CAPTURE_DEADLINE_SECONDS,
+        "input_type": "current_cycle_stream",
+        "latency_ms": round((_rmc_time.perf_counter() - started) * 1000, 2),
+        "frames_read": frames_read,
+        "sampled_frames": len(frame_results),
+        "sample_interval_effective": effective_interval,
+        "result": result,
+    }
 
 
 @app.post("/api/fusion/monitor/channel/recognize")
 def fusion_monitor_channel_recognize(payload: dict | None = _RMCBody(default=None)):
-    """
-    融合监控页专用：识别单个输入通道。
-
-    支持：
-    - task_type=plate
-    - task_type=traffic_gesture
-
-    输入来源：
-    - use_mock_frame=true：使用 mock / demo
-    - source_url 非空：读取 RTSP / 视频流一帧后识别
-    - source_id 非空：调用已有 /api/stream/recognize
-    """
     payload = payload or {}
-
     task_type = str(payload.get("task_type") or "").strip()
     source_id = str(payload.get("source_id") or "").strip()
     source_url = str(payload.get("source_url") or "").strip()
-    use_mock_frame = bool(payload.get("use_mock_frame", True))
-    demo_file = str(payload.get("demo_file") or "traffic.png").strip()
-    frame_count = int(payload.get("frame_count") or 20)
-    sample_interval = int(payload.get("sample_interval") or 5)
-    warmup_frames = int(payload.get("warmup_frames") or 3)
 
-    started = _rmc_time.perf_counter()
+    if task_type not in {"plate", "traffic_gesture"}:
+        raise _RMCHTTPException(status_code=400, detail="task_type 只支持 plate 或 traffic_gesture")
 
     try:
-        if task_type == "plate":
-            if source_url and not use_mock_frame:
-                content = _rmc_read_stream_frame(source_url, warmup_frames=warmup_frames)
-                data = _rmc_post_image_to_endpoint(
-                    "/api/plate/image",
-                    "fusion_plate_stream_frame.jpg",
-                    content,
-                )
-                input_type = "rtsp_frame"
-            else:
-                body = {
-                    "source_id": source_id or "live12",
-                    "task_type": "plate",
-                    "frame_count": frame_count,
-                    "sample_interval": sample_interval,
-                    "use_mock_frame": use_mock_frame,
-                }
-                data = _rmc_post_json_to_endpoint("/api/stream/recognize", body)
-                input_type = "mock_stream" if use_mock_frame else "rtsp_stream"
-
-        elif task_type == "traffic_gesture":
-            if source_url and not use_mock_frame:
-                content = _rmc_read_stream_frame(source_url, warmup_frames=warmup_frames)
-                data = _rmc_post_image_to_endpoint(
-                    "/api/gesture/traffic/image",
-                    "fusion_traffic_stream_frame.jpg",
-                    content,
-                )
-                input_type = "rtsp_frame"
-            else:
-                path = _rmc_demo_path(demo_file)
-
-                if not path.exists():
-                    raise RuntimeError(f"找不到交警手势 demo 文件：{path}")
-
-                content = path.read_bytes()
-                data = _rmc_post_image_to_endpoint(
-                    "/api/gesture/traffic/image",
-                    path.name,
-                    content,
-                )
-                input_type = "mock_frame"
-
-        else:
-            raise _RMCHTTPException(
-                status_code=400,
-                detail="task_type 只支持 plate 或 traffic_gesture",
-            )
-
-        latency_ms = round((_rmc_time.perf_counter() - started) * 1000, 2)
-
-        return {
-            "status": "success",
-            "task_type": task_type,
-            "source_id": source_id,
-            "source_url": source_url,
-            "input_type": input_type,
-            "use_mock_frame": use_mock_frame,
-            "latency_ms": latency_ms,
-            "result": data.get("result") or data,
-            "raw_response": data,
-        }
-
-    except _RMCHTTPException:
-        raise
+        return _rmc_recognize_channel_current_cycle(
+            task_type=task_type,
+            source_id=source_id,
+            source_url=source_url,
+            frame_count=int(payload.get("frame_count") or 20),
+            sample_interval=int(payload.get("sample_interval") or 5),
+            warmup_frames=int(payload.get("warmup_frames") or 3),
+        )
     except Exception as exc:
         raise _RMCHTTPException(
             status_code=500,
-            detail=f"融合监控通道识别失败：{exc}",
+            detail=(
+                "融合监控通道识别失败："
+                f"{exc}；打开超时 {_RMC_OPEN_TIMEOUT_MS}ms，"
+                f"读取超时 {_RMC_READ_TIMEOUT_MS}ms"
+            ),
         )
 
 
-# VIDEO_SOURCE_MANAGEMENT_PATCH_V1
-# 视频源管理：新增、保存、选择、检测 RTSP / MediaMTX / demo 源
-from fastapi import Body as _VSMBody, Query as _VSMQuery, HTTPException as _VSMHTTPException
+# VIDEO_SOURCE_MANAGEMENT_PATCH_V2
+# 用户视频源：普通用户管理自己的源；管理员管理全部；系统共享源所有用户可见。
+from fastapi import (
+    Body as _VSMBody,
+    Query as _VSMQuery,
+    HTTPException as _VSMHTTPException,
+    Depends as _VSMDepends,
+)
 from pathlib import Path as _VSMPath
 from datetime import datetime as _VSMDateTime
+import re as _vsm_re
 import sqlite3 as _vsm_sqlite3
 import cv2 as _vsm_cv2
 
@@ -7710,7 +9740,7 @@ def _vsm_project_root() -> _VSMPath:
 def _vsm_connect():
     path = _vsm_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = _vsm_sqlite3.connect(str(path))
+    conn = _vsm_sqlite3.connect(str(path), timeout=20)
     conn.row_factory = _vsm_sqlite3.Row
     return conn
 
@@ -7721,6 +9751,7 @@ def _vsm_ensure_table():
             """
             CREATE TABLE IF NOT EXISTS video_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
                 source_key TEXT UNIQUE,
                 name TEXT,
                 source_type TEXT,
@@ -7739,28 +9770,56 @@ def _vsm_ensure_table():
             )
             """
         )
+
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(video_sources)"
+            ).fetchall()
+        }
+
+        if "user_id" not in columns:
+            conn.execute(
+                "ALTER TABLE video_sources ADD COLUMN user_id INTEGER"
+            )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_video_sources_user
+            ON video_sources(user_id, enabled, id)
+            """
+        )
         conn.commit()
 
 
-def _vsm_row_to_dict(row) -> dict:
+def _vsm_row_to_dict(
+    row,
+    current_user: dict | None = None,
+) -> dict:
     item = dict(row)
     item["use_mock_frame"] = bool(item.get("use_mock_frame"))
     item["enabled"] = bool(item.get("enabled"))
+
+    owner_id = item.get("user_id")
+    item["is_global"] = owner_id is None
+
+    if current_user:
+        is_admin = current_user.get("role") == "admin"
+        is_owner = (
+            owner_id is not None
+            and int(owner_id) == int(current_user["id"])
+        )
+        item["can_manage"] = bool(is_admin or is_owner)
+        item["is_mine"] = bool(is_owner)
+    else:
+        item["can_manage"] = False
+        item["is_mine"] = False
+
     return item
 
 
-def _vsm_count_sources() -> int:
-    _vsm_ensure_table()
-
-    with _vsm_connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM video_sources").fetchone()
-        return int(row["c"] or 0)
-
-
 def _vsm_insert_default_sources():
-    if _vsm_count_sources() > 0:
-        return
-
+    _vsm_ensure_table()
     now = _vsm_now_text()
 
     defaults = [
@@ -7777,7 +9836,7 @@ def _vsm_insert_default_sources():
             "sample_interval": 5,
             "warmup_frames": 3,
             "enabled": 1,
-            "description": "本地演示用车牌 mock 视频流，适合没有真实 RTSP 时测试融合链路。",
+            "description": "系统共享 Mock 视频源。",
         },
         {
             "source_key": "plate_rtsp_live12",
@@ -7792,7 +9851,7 @@ def _vsm_insert_default_sources():
             "sample_interval": 5,
             "warmup_frames": 3,
             "enabled": 1,
-            "description": "使用后端已配置的 live12 RTSP 源。",
+            "description": "系统共享沙盘 RTSP 源。",
         },
         {
             "source_key": "plate_mediamtx",
@@ -7807,7 +9866,7 @@ def _vsm_insert_default_sources():
             "sample_interval": 5,
             "warmup_frames": 3,
             "enabled": 1,
-            "description": "通过 MediaMTX 接入车牌视频流，对应 path=plate。",
+            "description": "系统共享 MediaMTX 车牌流。",
         },
         {
             "source_key": "traffic_demo_file",
@@ -7822,7 +9881,7 @@ def _vsm_insert_default_sources():
             "sample_interval": 5,
             "warmup_frames": 3,
             "enabled": 1,
-            "description": "使用 demo/traffic.png 测试交警手势识别。",
+            "description": "系统共享交警手势 Demo。",
         },
         {
             "source_key": "traffic_mediamtx",
@@ -7837,7 +9896,7 @@ def _vsm_insert_default_sources():
             "sample_interval": 5,
             "warmup_frames": 3,
             "enabled": 1,
-            "description": "通过 MediaMTX 接入交警手势视频流，对应 path=traffic。",
+            "description": "系统共享交警手势流。",
         },
     ]
 
@@ -7846,6 +9905,7 @@ def _vsm_insert_default_sources():
             conn.execute(
                 """
                 INSERT OR IGNORE INTO video_sources (
+                    user_id,
                     source_key,
                     name,
                     source_type,
@@ -7862,7 +9922,9 @@ def _vsm_insert_default_sources():
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (
+                    NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     item["source_key"],
@@ -7885,89 +9947,314 @@ def _vsm_insert_default_sources():
         conn.commit()
 
 
-def _vsm_normalize_payload(payload: dict, existing: dict | None = None) -> dict:
+def _vsm_safe_source_key(
+    value: str,
+    *,
+    owner_user_id: int | None,
+) -> str:
+    clean = _vsm_re.sub(
+        r"[^a-zA-Z0-9_-]+",
+        "_",
+        str(value or "").strip(),
+    ).strip("_")
+
+    if not clean:
+        clean = f"source_{uuid4().hex[:10]}"
+
+    if owner_user_id is not None:
+        prefix = f"u{int(owner_user_id)}_"
+        if not clean.startswith(prefix):
+            clean = prefix + clean
+
+    return clean[:120]
+
+
+def _vsm_normalize_payload(
+    payload: dict,
+    *,
+    current_user: dict,
+    existing: dict | None = None,
+) -> dict:
     payload = payload or {}
     existing = existing or {}
 
-    name = str(payload.get("name", existing.get("name", ""))).strip()
-    source_type = str(payload.get("source_type", existing.get("source_type", "plate"))).strip()
-    source_id = str(payload.get("source_id", existing.get("source_id", ""))).strip()
-    source_url = str(payload.get("source_url", existing.get("source_url", ""))).strip()
-    protocol = str(payload.get("protocol", existing.get("protocol", "rtsp"))).strip()
-    demo_file = str(payload.get("demo_file", existing.get("demo_file", ""))).strip()
-    description = str(payload.get("description", existing.get("description", ""))).strip()
+    name = str(
+        payload.get("name", existing.get("name", ""))
+    ).strip()
+    source_type = str(
+        payload.get(
+            "source_type",
+            existing.get("source_type", "plate"),
+        )
+    ).strip()
+    source_id = str(
+        payload.get(
+            "source_id",
+            existing.get("source_id", ""),
+        )
+    ).strip()
+    source_url = str(
+        payload.get(
+            "source_url",
+            existing.get("source_url", ""),
+        )
+    ).strip()
+    protocol = str(
+        payload.get(
+            "protocol",
+            existing.get("protocol", "rtsp"),
+        )
+    ).strip().lower()
+    demo_file = str(
+        payload.get(
+            "demo_file",
+            existing.get("demo_file", ""),
+        )
+    ).strip()
+    description = str(
+        payload.get(
+            "description",
+            existing.get("description", ""),
+        )
+    ).strip()
 
     if not name:
-        raise _VSMHTTPException(status_code=400, detail="视频源名称不能为空。")
+        raise _VSMHTTPException(
+            status_code=400,
+            detail="视频源名称不能为空。",
+        )
 
-    if source_type not in {"plate", "traffic_gesture", "owner_gesture", "general"}:
-        raise _VSMHTTPException(status_code=400, detail="source_type 只支持 plate、traffic_gesture、owner_gesture、general。")
+    if source_type not in {
+        "plate",
+        "traffic_gesture",
+        "owner_gesture",
+        "general",
+    }:
+        raise _VSMHTTPException(
+            status_code=400,
+            detail=(
+                "source_type 只支持 plate、traffic_gesture、"
+                "owner_gesture、general。"
+            ),
+        )
+
+    if protocol not in {
+        "rtsp",
+        "mediamtx",
+        "hls",
+        "webrtc",
+        "mjpeg",
+        "mock",
+        "demo",
+    }:
+        raise _VSMHTTPException(
+            status_code=400,
+            detail="不支持的视频源协议。",
+        )
 
     if not source_id and not source_url and not demo_file:
-        raise _VSMHTTPException(status_code=400, detail="source_id、source_url、demo_file 至少填写一个。")
+        raise _VSMHTTPException(
+            status_code=400,
+            detail=(
+                "源 ID、视频流地址、Demo 文件至少填写一个。"
+            ),
+        )
 
-    source_key = str(payload.get("source_key", existing.get("source_key", ""))).strip()
+    if existing:
+        owner_user_id = existing.get("user_id")
+    else:
+        # 管理员新增的视频源默认为系统共享；
+        # 普通用户新增的视频源只归属于自己。
+        owner_user_id = (
+            None
+            if current_user.get("role") == "admin"
+            else int(current_user["id"])
+        )
 
-    if not source_key:
-        base = f"{source_type}_{source_id or protocol or 'source'}_{abs(hash(name)) % 100000}"
-        source_key = base.replace(" ", "_")
+    source_key = _vsm_safe_source_key(
+        payload.get(
+            "source_key",
+            existing.get("source_key", ""),
+        ),
+        owner_user_id=owner_user_id,
+    )
+
+    frame_count = max(
+        5,
+        min(
+            300,
+            int(
+                payload.get(
+                    "frame_count",
+                    existing.get("frame_count", 20),
+                )
+                or 20
+            ),
+        ),
+    )
+    sample_interval = max(
+        1,
+        min(
+            60,
+            int(
+                payload.get(
+                    "sample_interval",
+                    existing.get("sample_interval", 5),
+                )
+                or 5
+            ),
+        ),
+    )
+    warmup_frames = max(
+        0,
+        min(
+            30,
+            int(
+                payload.get(
+                    "warmup_frames",
+                    existing.get("warmup_frames", 3),
+                )
+                or 3
+            ),
+        ),
+    )
 
     return {
+        "user_id": owner_user_id,
         "source_key": source_key,
         "name": name,
         "source_type": source_type,
         "source_id": source_id,
         "source_url": source_url,
         "protocol": protocol,
-        "use_mock_frame": 1 if bool(payload.get("use_mock_frame", existing.get("use_mock_frame", False))) else 0,
+        "use_mock_frame": (
+            1
+            if bool(
+                payload.get(
+                    "use_mock_frame",
+                    existing.get("use_mock_frame", False),
+                )
+            )
+            else 0
+        ),
         "demo_file": demo_file,
-        "frame_count": int(payload.get("frame_count", existing.get("frame_count", 20)) or 20),
-        "sample_interval": int(payload.get("sample_interval", existing.get("sample_interval", 5)) or 5),
-        "warmup_frames": int(payload.get("warmup_frames", existing.get("warmup_frames", 3)) or 3),
-        "enabled": 1 if bool(payload.get("enabled", existing.get("enabled", True))) else 0,
+        "frame_count": frame_count,
+        "sample_interval": sample_interval,
+        "warmup_frames": warmup_frames,
+        "enabled": (
+            1
+            if bool(
+                payload.get(
+                    "enabled",
+                    existing.get("enabled", True),
+                )
+            )
+            else 0
+        ),
         "description": description,
     }
 
 
-def _vsm_get_source_or_404(source_id: int) -> dict:
-    _vsm_ensure_table()
-
+def _vsm_select_source_row(source_id: int):
     with _vsm_connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM video_sources WHERE id = ?",
+        return conn.execute(
+            """
+            SELECT
+                v.*,
+                u.username AS owner_username,
+                u.email AS owner_email
+            FROM video_sources v
+            LEFT JOIN users u ON u.id = v.user_id
+            WHERE v.id = ?
+            """,
             (int(source_id),),
         ).fetchone()
 
-    if not row:
-        raise _VSMHTTPException(status_code=404, detail="视频源不存在。")
 
-    return _vsm_row_to_dict(row)
+def _vsm_get_source_or_404(
+    source_id: int,
+    *,
+    current_user: dict,
+    require_manage: bool = False,
+) -> dict:
+    _vsm_ensure_table()
+    row = _vsm_select_source_row(source_id)
+
+    if not row:
+        raise _VSMHTTPException(
+            status_code=404,
+            detail="视频源不存在。",
+        )
+
+    item = _vsm_row_to_dict(row, current_user)
+    is_admin = current_user.get("role") == "admin"
+    owner_id = item.get("user_id")
+    is_owner = (
+        owner_id is not None
+        and int(owner_id) == int(current_user["id"])
+    )
+    is_visible = is_admin or owner_id is None or is_owner
+
+    if not is_visible:
+        raise _VSMHTTPException(
+            status_code=403,
+            detail="无权访问其他用户的视频源。",
+        )
+
+    if require_manage and not (is_admin or is_owner):
+        raise _VSMHTTPException(
+            status_code=403,
+            detail="系统共享视频源只能由管理员管理。",
+        )
+
+    return item
 
 
 @app.get("/api/video-sources")
 def list_video_sources(
     source_type: str | None = _VSMQuery(default=None),
     enabled_only: bool = _VSMQuery(default=False),
+    current_user: dict = _VSMDepends(get_current_user),
 ):
     _vsm_ensure_table()
     _vsm_insert_default_sources()
 
-    sql = "SELECT * FROM video_sources WHERE 1 = 1"
-    params = []
+    sql = """
+        SELECT
+            v.*,
+            u.username AS owner_username,
+            u.email AS owner_email
+        FROM video_sources v
+        LEFT JOIN users u ON u.id = v.user_id
+        WHERE 1 = 1
+    """
+    params: list = []
+
+    if current_user.get("role") != "admin":
+        sql += " AND (v.user_id IS NULL OR v.user_id = ?)"
+        params.append(int(current_user["id"]))
 
     if source_type:
-        sql += " AND source_type = ?"
+        sql += " AND v.source_type = ?"
         params.append(source_type)
 
     if enabled_only:
-        sql += " AND enabled = 1"
+        sql += " AND v.enabled = 1"
 
-    sql += " ORDER BY source_type, id"
+    sql += """
+        ORDER BY
+            CASE WHEN v.user_id IS NULL THEN 0 ELSE 1 END,
+            v.source_type,
+            v.id
+    """
 
     with _vsm_connect() as conn:
         rows = conn.execute(sql, params).fetchall()
 
-    items = [_vsm_row_to_dict(row) for row in rows]
+    items = [
+        _vsm_row_to_dict(row, current_user)
+        for row in rows
+    ]
 
     return {
         "status": "success",
@@ -7977,9 +10264,15 @@ def list_video_sources(
 
 
 @app.post("/api/video-sources")
-def create_video_source(payload: dict | None = _VSMBody(default=None)):
+def create_video_source(
+    payload: dict | None = _VSMBody(default=None),
+    current_user: dict = _VSMDepends(get_current_user),
+):
     _vsm_ensure_table()
-    item = _vsm_normalize_payload(payload or {})
+    item = _vsm_normalize_payload(
+        payload or {},
+        current_user=current_user,
+    )
     now = _vsm_now_text()
 
     try:
@@ -7987,6 +10280,7 @@ def create_video_source(payload: dict | None = _VSMBody(default=None)):
             cursor = conn.execute(
                 """
                 INSERT INTO video_sources (
+                    user_id,
                     source_key,
                     name,
                     source_type,
@@ -8003,9 +10297,10 @@ def create_video_source(payload: dict | None = _VSMBody(default=None)):
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    item["user_id"],
                     item["source_key"],
                     item["name"],
                     item["source_type"],
@@ -8026,20 +10321,48 @@ def create_video_source(payload: dict | None = _VSMBody(default=None)):
             conn.commit()
             new_id = int(cursor.lastrowid)
     except _vsm_sqlite3.IntegrityError:
-        raise _VSMHTTPException(status_code=400, detail="source_key 已存在，请换一个名称或 key。")
+        raise _VSMHTTPException(
+            status_code=400,
+            detail="视频源 key 已存在，请修改名称或源 ID。",
+        )
+
+    insert_operation_log(
+        action="create_video_source",
+        detail={
+            "source_id": new_id,
+            "source_name": item["name"],
+            "owner_user_id": item["user_id"],
+        },
+        user_id=int(current_user["id"]),
+    )
 
     return {
         "status": "success",
         "message": "视频源已创建",
         "id": new_id,
-        "item": _vsm_get_source_or_404(new_id),
+        "item": _vsm_get_source_or_404(
+            new_id,
+            current_user=current_user,
+        ),
     }
 
 
 @app.put("/api/video-sources/{source_id}")
-def update_video_source(source_id: int, payload: dict | None = _VSMBody(default=None)):
-    old = _vsm_get_source_or_404(source_id)
-    item = _vsm_normalize_payload(payload or {}, existing=old)
+def update_video_source(
+    source_id: int,
+    payload: dict | None = _VSMBody(default=None),
+    current_user: dict = _VSMDepends(get_current_user),
+):
+    old = _vsm_get_source_or_404(
+        source_id,
+        current_user=current_user,
+        require_manage=True,
+    )
+    item = _vsm_normalize_payload(
+        payload or {},
+        current_user=current_user,
+        existing=old,
+    )
     now = _vsm_now_text()
 
     try:
@@ -8047,7 +10370,9 @@ def update_video_source(source_id: int, payload: dict | None = _VSMBody(default=
             conn.execute(
                 """
                 UPDATE video_sources
-                SET source_key = ?,
+                SET
+                    user_id = ?,
+                    source_key = ?,
                     name = ?,
                     source_type = ?,
                     source_id = ?,
@@ -8064,6 +10389,7 @@ def update_video_source(source_id: int, payload: dict | None = _VSMBody(default=
                 WHERE id = ?
                 """,
                 (
+                    item["user_id"],
                     item["source_key"],
                     item["name"],
                     item["source_type"],
@@ -8083,18 +10409,40 @@ def update_video_source(source_id: int, payload: dict | None = _VSMBody(default=
             )
             conn.commit()
     except _vsm_sqlite3.IntegrityError:
-        raise _VSMHTTPException(status_code=400, detail="source_key 已存在，请换一个名称或 key。")
+        raise _VSMHTTPException(
+            status_code=400,
+            detail="视频源 key 已存在，请修改名称或源 ID。",
+        )
+
+    insert_operation_log(
+        action="update_video_source",
+        detail={
+            "source_id": int(source_id),
+            "source_name": item["name"],
+        },
+        user_id=int(current_user["id"]),
+    )
 
     return {
         "status": "success",
         "message": "视频源已更新",
-        "item": _vsm_get_source_or_404(source_id),
+        "item": _vsm_get_source_or_404(
+            source_id,
+            current_user=current_user,
+        ),
     }
 
 
 @app.delete("/api/video-sources/{source_id}")
-def delete_video_source(source_id: int):
-    _vsm_get_source_or_404(source_id)
+def delete_video_source(
+    source_id: int,
+    current_user: dict = _VSMDepends(get_current_user),
+):
+    item = _vsm_get_source_or_404(
+        source_id,
+        current_user=current_user,
+        require_manage=True,
+    )
 
     with _vsm_connect() as conn:
         conn.execute(
@@ -8102,6 +10450,15 @@ def delete_video_source(source_id: int):
             (int(source_id),),
         )
         conn.commit()
+
+    insert_operation_log(
+        action="delete_video_source",
+        detail={
+            "source_id": int(source_id),
+            "source_name": item.get("name"),
+        },
+        user_id=int(current_user["id"]),
+    )
 
     return {
         "status": "success",
@@ -8111,8 +10468,14 @@ def delete_video_source(source_id: int):
 
 
 @app.post("/api/video-sources/{source_id}/check")
-def check_video_source(source_id: int):
-    item = _vsm_get_source_or_404(source_id)
+def check_video_source(
+    source_id: int,
+    current_user: dict = _VSMDepends(get_current_user),
+):
+    item = _vsm_get_source_or_404(
+        source_id,
+        current_user=current_user,
+    )
 
     if item.get("use_mock_frame"):
         demo_file = item.get("demo_file") or ""
@@ -8124,7 +10487,11 @@ def check_video_source(source_id: int):
                 "status": "success",
                 "online": ok,
                 "mode": "demo_file",
-                "message": "demo 文件存在" if ok else f"demo 文件不存在：{demo_path}",
+                "message": (
+                    "Demo 文件存在"
+                    if ok
+                    else f"Demo 文件不存在：{demo_path}"
+                ),
                 "item": item,
             }
 
@@ -8132,7 +10499,7 @@ def check_video_source(source_id: int):
             "status": "success",
             "online": True,
             "mode": "mock_stream",
-            "message": "mock 视频源可用",
+            "message": "Mock 视频源可用",
             "item": item,
         }
 
@@ -8143,48 +10510,196 @@ def check_video_source(source_id: int):
             "status": "success",
             "online": True,
             "mode": "backend_source_id",
-            "message": "未填写 source_url，将使用后端 source_id 配置读取。",
+            "message": (
+                "未填写 source_url，将使用后端 source_id 配置读取。"
+            ),
             "item": item,
         }
 
     cap = None
 
     try:
-        cap = _vsm_cv2.VideoCapture(source_url)
+        cap = _vsm_cv2.VideoCapture(
+            source_url,
+            _vsm_cv2.CAP_FFMPEG,
+        )
+        cap.set(_vsm_cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
             return {
                 "status": "success",
                 "online": False,
-                "mode": "rtsp",
+                "mode": item.get("protocol") or "video",
                 "message": f"无法打开视频源：{source_url}",
                 "item": item,
             }
 
         warmup_frames = int(item.get("warmup_frames") or 3)
+        frame = None
 
-        for _ in range(max(0, warmup_frames)):
-            cap.read()
+        for _ in range(max(1, warmup_frames + 1)):
+            ok, current = cap.read()
+            if ok and current is not None:
+                frame = current
 
-        ok, frame = cap.read()
-
-        if not ok or frame is None:
-            return {
-                "status": "success",
-                "online": False,
-                "mode": "rtsp",
-                "message": "视频源已打开，但无法读取有效帧。",
-                "item": item,
-            }
+        online = frame is not None
 
         return {
             "status": "success",
-            "online": True,
-            "mode": "rtsp",
-            "message": "视频源在线，已成功读取一帧。",
+            "online": online,
+            "mode": item.get("protocol") or "video",
+            "message": (
+                "视频源连接正常"
+                if online
+                else "视频源已打开，但未读取到有效帧"
+            ),
             "item": item,
         }
-
     finally:
         if cap is not None:
             cap.release()
+
+
+# STREAMING_SANDBOX_V1
+# 沙盘 HLS 流列表 + ffmpeg 推流管理
+@app.get("/api/streaming/sandbox/list")
+def list_sandbox_streams():
+    """返回沙盘 12 路摄像头的 HLS + WebRTC 播放地址。"""
+    streams = []
+    for cam in SANDBOX_CAMERAS:
+        cam_id = cam["id"]
+        streams.append({
+            "id": cam_id,
+            "name": cam["name"],
+            "source_url": f"rtsp://10.126.59.120:8554/live/{cam_id}",
+            "hls_url": f"http://127.0.0.1:8888/sandbox_{cam_id}/index.m3u8",
+            "webrtc_url": f"http://127.0.0.1:8889/sandbox_{cam_id}",
+        })
+    return {"status": "success", "streams": streams}
+
+
+@app.post("/api/streaming/ffmpeg/start")
+def ffmpeg_start(payload: dict):
+    """启动 ffmpeg 拉流推流到 MediaMTX。"""
+    camera_id = payload.get("camera_id", "")
+    mode = payload.get("mode", "copy")
+    fps = int(payload.get("fps") or 15)
+    force_restart = bool(payload.get("force_restart", False))
+    valid_ids = {c["id"] for c in SANDBOX_CAMERAS}
+    if camera_id not in valid_ids:
+        raise HTTPException(status_code=400, detail=f"无效摄像头 ID: {camera_id}")
+    try:
+        ok = start_stream(
+            camera_id,
+            mode,
+            fps=fps,
+            force_restart=force_restart,
+        )
+        return {
+            "status": "success" if ok else "error",
+            "camera_id": camera_id,
+            "running": ok,
+            "data": get_stream_status(camera_id),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"启动 ffmpeg 失败: {exc}")
+
+
+@app.post("/api/streaming/ffmpeg/stop")
+def ffmpeg_stop(payload: dict):
+    """停止指定摄像头的 ffmpeg 推流进程。"""
+    camera_id = payload.get("camera_id", "")
+    try:
+        ok = stop_stream(camera_id)
+        return {"status": "success" if ok else "error", "camera_id": camera_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"停止 ffmpeg 失败: {exc}")
+
+
+@app.get("/api/streaming/ffmpeg/status")
+def ffmpeg_status(camera_id: str = Query("", description="摄像头 ID，留空返回全部")):
+    """查询 ffmpeg 推流进程状态。"""
+    if camera_id:
+        try:
+            return {"status": "success", "data": get_stream_status(camera_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "success", "streams": get_all_streams_status()}
+
+
+@app.post("/api/fusion/monitor/sandbox/plate/recognize")
+def sandbox_plate_recognize(payload: dict):
+    """沙盘车牌识别：复用融合当前轮次快速抽帧管线。"""
+    camera_id = str(payload.get("camera_id") or "").strip()
+    valid_ids = {item["id"] for item in SANDBOX_CAMERAS}
+    if camera_id not in valid_ids:
+        raise HTTPException(status_code=400, detail=f"无效摄像头 ID: {camera_id}")
+
+    try:
+        channel = _rmc_recognize_channel_current_cycle(
+            task_type="plate",
+            source_id=camera_id,
+            source_url=f"{SANDBOX_RTSP_BASE}/{camera_id}",
+            frame_count=int(payload.get("frame_count") or 60),
+            sample_interval=int(payload.get("sample_interval") or 5),
+            warmup_frames=int(payload.get("warmup_frames") or 3),
+        )
+        result = channel.get("result") or {}
+        plates = result.get("plates") or []
+
+        return {
+            "status": "success",
+            "data": {
+                "camera_id": camera_id,
+                "plate_count": int(result.get("plate_count") or len(plates)),
+                "plates": plates,
+                "best_plate": result.get("best_plate") or result.get("best_plate_text") or "",
+                "best_confidence": result.get("best_confidence") or 0,
+                "latency_ms": channel.get("latency_ms"),
+                "frames_read": channel.get("frames_read"),
+                "sampled_frames": channel.get("sampled_frames"),
+                "sample_interval_effective": channel.get("sample_interval_effective"),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"沙盘车牌识别失败：{exc}")
+
+
+@app.get("/api/video/stream")
+def video_mjpeg_stream(
+    source_id: str = Query("live1", description="RTSP 源 ID"),
+    source_url: str = Query("", description="自定义 RTSP 地址（优先级高于 source_id）"),
+    fps: int = Query(15, ge=1, le=30, description="最大帧率"),
+):
+    """
+    实时 MJPEG 视频流。
+
+    前端 <img> 标签直接加载此端点即可看到实时画面：
+        <img src="http://127.0.0.1:8000/api/video/stream?source_id=live1" />
+
+    支持两种模式：
+    - source_id：从内置 RTSP_SOURCES 查找
+    - source_url：直接使用自定义 RTSP 地址
+    """
+    if source_url and source_url.strip():
+        url = source_url.strip()
+    else:
+        source = next((s for s in RTSP_SOURCES if s["id"] == source_id), None)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"未找到视频源：{source_id}")
+        url = source["url"]
+
+    # 为每个请求创建独立的生成器实例
+    return StreamingResponse(
+        _mjpeg_stream_generator(url, max_fps=fps),
+        media_type="multipart/x-mixed-replace; boundary=mjpeg-frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "close",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )

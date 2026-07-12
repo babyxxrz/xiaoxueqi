@@ -237,17 +237,15 @@ def _recognition_summary(context: dict) -> str:
 
     if task_type == "plate":
         plates = result.get("plates") or []
-        values = [
-            str(
-                item.get("plate_number")
-                or item.get("plate")
-                or item.get("text")
-                or ""
-            ).strip()
-            for item in plates
-            if isinstance(item, dict)
-        ]
-        values = [item for item in values if item]
+        values = []
+        for item in plates:
+            if not isinstance(item, dict):
+                continue
+            number = str(item.get("plate_number") or item.get("plate") or item.get("text") or "").strip()
+            if not number:
+                continue
+            color = str(item.get("plate_color") or item.get("color") or "未知颜色").strip()
+            values.append(f"{number}（{color}）")
         return "、".join(values[:5]) or "未识别到有效车牌"
 
     if task_type == "traffic_gesture":
