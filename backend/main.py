@@ -18,10 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from algorithm.plate_recognizer import recognize_plate_real
+from algorithm.plate_recognizer import recognize_plate_frame, recognize_plate_real
 from algorithm.plate_video_aggregator import aggregate_plate_frame_results_v2
 from algorithm.owner_gesture_recognizer import recognize_owner_gesture_image
 from algorithm.traffic_gesture_recognizer import (
+    recognize_traffic_gesture_frame,
     recognize_traffic_gesture_image,
     aggregate_traffic_gesture_sequence,
 )
@@ -53,6 +54,17 @@ from alert_email_notifier import (
     retry_all_failed_notifications,
     schedule_alert_notifications,
     start_alert_notification_worker,
+)
+
+from stream_manager import (
+    SANDBOX_CAMERAS,
+    SANDBOX_RTSP_BASE,
+    build_ffmpeg_cmd,
+    get_all_streams_status,
+    get_stream_status,
+    start_stream,
+    stop_all_streams,
+    stop_stream,
 )
 
 # --- AlertAgent 全局实例 ---
@@ -1452,6 +1464,12 @@ def on_startup():
     start_alert_notification_worker(DB_PATH)
 
 
+@app.on_event("shutdown")
+def on_shutdown():
+    """停止所有 ffmpeg 推流进程。"""
+    stop_all_streams()
+
+
 @app.get("/")
 def root():
     return {
@@ -2320,6 +2338,260 @@ def recognize_traffic_gesture_from_video(
         sample_interval=sample_interval,
         log_action="traffic_gesture_video_recognition",
     )
+
+
+# ---------------------------------------------------------------------------
+# 批量上传识别：支持图片和视频混合上传
+# ---------------------------------------------------------------------------
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+BATCH_MAX_FILES = 50
+BATCH_MAX_TOTAL_BYTES = 1024 * 1024 * 1024  # 1GB total
+
+
+def _is_image_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in IMAGE_SUFFIXES
+
+
+def _is_video_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in VIDEO_UPLOAD_SUFFIXES
+
+
+def _process_single_uploaded_file(
+    file: UploadFile,
+    task_type: str,
+    frame_count: int,
+    sample_interval: int,
+) -> dict:
+    """处理单个上传文件：自动判断图片/视频，调用对应识别管线。"""
+    original_name = file.filename or ""
+    file_type = "image" if _is_image_file(original_name) else "video"
+    started = time.perf_counter()
+
+    try:
+        if file_type == "image":
+            # --- 图片识别 ---
+            suffix = Path(original_name).suffix.lower()
+            saved_filename = f"batch_{task_type}_{uuid4().hex}{suffix}"
+            saved_path = UPLOAD_DIR / saved_filename
+
+            with saved_path.open("wb") as buffer:
+                shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+
+            image_url = f"/uploads/{saved_filename}"
+            output_filename = f"annotated_{saved_filename}"
+            output_path = OUTPUT_DIR / output_filename
+            output_image_url = f"/outputs/{output_filename}"
+
+            if task_type == "plate":
+                result = create_annotated_plate_image(
+                    input_path=saved_path,
+                    output_path=output_path,
+                    confidence=0.92,
+                )
+            elif task_type == "traffic_gesture":
+                result = recognize_traffic_gesture_image(
+                    input_path=saved_path,
+                    output_path=output_path,
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"不支持的任务类型: {task_type}")
+
+            processing_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            result.setdefault("latency_ms", processing_latency_ms)
+
+            record_id = insert_recognition_record(
+                task_type=task_type,
+                input_type="image",
+                original_filename=original_name,
+                saved_filename=saved_filename,
+                image_url=image_url,
+                output_image_url=output_image_url,
+                result=result,
+            )
+
+            return {
+                "filename": original_name,
+                "file_type": "image",
+                "status": "success",
+                "record_id": record_id,
+                "image_url": image_url,
+                "output_image_url": output_image_url,
+                "processing_latency_ms": processing_latency_ms,
+                "result": result,
+            }
+
+        else:
+            # --- 视频识别 ---
+            upload_info = _save_uploaded_recognition_video(file, task_type)
+            video_metadata = _read_uploaded_video_metadata(upload_info["saved_path"])
+
+            source = {
+                "id": f"batch_{task_type}_{uuid4().hex[:8]}",
+                "name": upload_info["original_filename"] or "批量上传视频",
+                "url": str(upload_info["saved_path"]),
+                "kind": "local_video",
+            }
+
+            sampled_frames, frames_read = capture_stream_sampled_frames(
+                source=source,
+                frame_count=frame_count,
+                sample_interval=sample_interval,
+                use_mock_frame=False,
+            )
+
+            recognition_output = recognize_stream_for_task(
+                task_type=task_type,
+                sampled_frames=sampled_frames,
+            )
+
+            best = recognition_output["best"]
+            final_result = recognition_output["final_result"]
+            processing_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+            final_result["source"] = {
+                "id": source["id"],
+                "name": source["name"],
+                "kind": "uploaded_video",
+                "video_url": upload_info["video_url"],
+            }
+            final_result["video_metadata"] = video_metadata
+            final_result["frame_count_requested"] = frame_count
+            final_result["frames_read"] = frames_read
+            final_result["sample_interval"] = sample_interval
+            final_result["sampled_frames"] = len(sampled_frames)
+            final_result["processing_latency_ms"] = processing_latency_ms
+            final_result["input_mode"] = "uploaded_video"
+
+            best_output_image_url = best.get("output_image_url", "")
+
+            record_id = insert_recognition_record(
+                task_type=task_type,
+                input_type="video_upload",
+                original_filename=upload_info["original_filename"],
+                saved_filename=upload_info["saved_filename"],
+                image_url=upload_info["video_url"],
+                output_image_url=best_output_image_url,
+                result=final_result,
+            )
+
+            return {
+                "filename": original_name,
+                "file_type": "video",
+                "status": "success",
+                "record_id": record_id,
+                "video_url": upload_info["video_url"],
+                "output_image_url": best_output_image_url,
+                "frames_read": frames_read,
+                "sampled_frames": len(sampled_frames),
+                "processing_latency_ms": processing_latency_ms,
+                "video_metadata": video_metadata,
+                "result": final_result,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        return {
+            "filename": original_name,
+            "file_type": file_type,
+            "status": "error",
+            "error": str(error),
+        }
+
+
+@app.post("/api/recognition/batch")
+def recognize_batch_files(
+    files: list[UploadFile] = File(...),
+    task_type: str = Query("plate", description="plate 或 traffic_gesture"),
+    frame_count: int = Query(120, ge=5, le=300),
+    sample_interval: int = Query(5, ge=1, le=60),
+):
+    """
+    批量上传识别接口：支持图片和视频混合上传。
+
+    - 自动根据文件扩展名判断图片/视频
+    - 图片调用单帧识别管线（HyperLPR3 / MediaPipe）
+    - 视频调用连续帧抽帧识别管线
+    - 返回每个文件的独立识别结果
+
+    限制：最多 50 个文件，总大小不超过 1GB。
+    """
+    if task_type not in {"plate", "traffic_gesture"}:
+        raise HTTPException(
+            status_code=400,
+            detail="task_type 只支持 plate 或 traffic_gesture",
+        )
+
+    if len(files) > BATCH_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次批量上传最多 {BATCH_MAX_FILES} 个文件",
+        )
+
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件")
+
+    frame_count = clamp_int(frame_count, 5, 300)
+    sample_interval = clamp_int(sample_interval, 1, 60)
+
+    # 预检文件类型
+    for f in files:
+        original_name = f.filename or ""
+        suffix = Path(original_name).suffix.lower()
+        if suffix not in IMAGE_SUFFIXES and suffix not in VIDEO_UPLOAD_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件类型: {original_name}（仅支持图片和视频格式）",
+            )
+
+    started = time.perf_counter()
+    results = []
+
+    for f in files:
+        try:
+            file_result = _process_single_uploaded_file(
+                file=f,
+                task_type=task_type,
+                frame_count=frame_count,
+                sample_interval=sample_interval,
+            )
+        except HTTPException:
+            raise
+        except Exception as error:
+            file_result = {
+                "filename": f.filename or "unknown",
+                "file_type": "unknown",
+                "status": "error",
+                "error": str(error),
+            }
+        results.append(file_result)
+
+    total_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+    success_count = sum(1 for r in results if r.get("status") == "success")
+    error_count = sum(1 for r in results if r.get("status") == "error")
+
+    insert_operation_log(
+        action="batch_recognition",
+        detail={
+            "task_type": task_type,
+            "total_files": len(files),
+            "success_count": success_count,
+            "error_count": error_count,
+            "total_latency_ms": total_latency_ms,
+        },
+    )
+
+    return {
+        "status": "success",
+        "task_type": task_type,
+        "total_files": len(files),
+        "success_count": success_count,
+        "error_count": error_count,
+        "total_latency_ms": total_latency_ms,
+        "results": results,
+    }
 
 
 @app.post("/api/monitor/start")
@@ -7070,6 +7342,65 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
         raise _OCHTTPException(status_code=500, detail=f"摄像头快速手势识别失败：{exc}")
 
 
+# TRAFFIC_GESTURE_CAMERA_FAST_ENDPOINT_V1
+# 交警手势：电脑摄像头实时帧接口
+@app.post("/api/gesture/traffic/camera-fast-frame")
+def recognize_traffic_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)):
+    """
+    交警手势电脑摄像头快速识别接口。
+
+    接收前端摄像头抽帧图片，调用 MediaPipe Pose 进行全身姿态检测，
+    通过规则引擎识别 8 类交警手势（停止/直行/左转/右转/变道/左转待转/减速/靠边停车）。
+
+    与 /api/gesture/traffic/image 的区别：
+    - 不保存上传图片
+    - 不保存标注图片（前端自行绘制骨架）
+    - 只返回姿态关键点、手势结果和延迟
+    - 适合前端高频实时识别（~400ms 间隔）
+    """
+    start_time = _oc_time.perf_counter()
+
+    try:
+        content = file.file.read()
+
+        if not content:
+            raise _OCHTTPException(status_code=400, detail="上传图片为空。")
+
+        image_array = _oc_np.frombuffer(content, dtype=_oc_np.uint8)
+        image_bgr = _oc_cv2.imdecode(image_array, _oc_cv2.IMREAD_COLOR)
+
+        if image_bgr is None:
+            raise _OCHTTPException(status_code=400, detail="无法解析摄像头帧图片。")
+
+        # 调用交警手势识别（不保存标注图片，前端自己画骨架）
+        # static_image_mode=False 启用 MediaPipe 帧间平滑
+        result_data = recognize_traffic_gesture_frame(
+            image_bgr,
+            output_path=None,
+            static_image_mode=False,
+        )
+
+        latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
+
+        return {
+            "status": "success",
+            "record_id": None,
+            "input_type": "camera_fast_frame",
+            "output_image_url": "",
+            "latency_ms": latency_ms,
+            "result": {
+                **result_data,
+                "camera_mode": True,
+                "fast_mode": True,
+            },
+        }
+
+    except _OCHTTPException:
+        raise
+    except Exception as exc:
+        raise _OCHTTPException(status_code=500, detail=f"交警手势摄像头识别失败：{exc}")
+
+
 # REALTIME_FUSION_MONITOR_PATCH_V1
 # 实时融合决策监控接口：接收前端当前轮次三路识别证据，立即生成风险分析
 from fastapi import Body as _RFMBody, Query as _RFMQuery, HTTPException as _RFMHTTPException
@@ -8188,3 +8519,275 @@ def check_video_source(source_id: int):
     finally:
         if cap is not None:
             cap.release()
+
+
+# ---------- 实时视频流 (MJPEG) ----------
+
+@app.get("/api/video/sources")
+def list_rtsp_sources():
+    """返回沙盘 RTSP 源列表，供前端视频预览选择。"""
+    return {
+        "status": "success",
+        "items": [
+            {
+                "id": src["id"],
+                "name": src["name"],
+                "url": src["url"],
+            }
+            for src in RTSP_SOURCES
+        ],
+    }
+
+
+def _mjpeg_stream_generator(source_url: str, max_fps: int = 15):
+    """
+    MJPEG 流生成器：持续从 RTSP 拉帧 → JPEG 编码 → multipart 输出。
+
+    浏览器 <img> 标签原生支持 multipart/x-mixed-replace，
+    会持续显示最新帧，达到实时视频效果。
+    """
+    cap: cv2.VideoCapture | None = None
+    frame_interval = 1.0 / max(max_fps, 1)
+    last_frame_time = 0.0
+
+    boundary = "mjpeg-frame"
+
+    try:
+        while True:
+            # 建立/重建连接
+            if cap is None:
+                cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = None
+                    # 连接失败，发送空白占位后等待重试
+                    yield (
+                        f"--{boundary}\r\n"
+                        "Content-Type: text/plain\r\n\r\n"
+                        "connecting...\r\n"
+                    )
+                    time.sleep(2)
+                    continue
+
+            # 帧率控制
+            now = time.time()
+            elapsed = now - last_frame_time
+            if elapsed < frame_interval:
+                time.sleep(max(0, frame_interval - elapsed))
+            last_frame_time = time.time()
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                # 断流，释放连接以便重连
+                cap.release()
+                cap = None
+                continue
+
+            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if not ok:
+                continue
+
+            yield (
+                f"--{boundary}\r\n"
+                "Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(jpg)}\r\n\r\n"
+            )
+            yield jpg.tobytes()
+            yield b"\r\n"
+
+    except GeneratorExit:
+        # 客户端断开连接
+        pass
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+# STREAMING_SANDBOX_V1
+# 沙盘 HLS 流列表 + ffmpeg 推流管理
+@app.get("/api/streaming/sandbox/list")
+def list_sandbox_streams():
+    """返回沙盘 12 路摄像头的 HLS + WebRTC 播放地址。"""
+    streams = []
+    for cam in SANDBOX_CAMERAS:
+        cam_id = cam["id"]
+        streams.append({
+            "id": cam_id,
+            "name": cam["name"],
+            "source_url": f"rtsp://10.126.59.120:8554/live/{cam_id}",
+            "hls_url": f"http://127.0.0.1:8888/sandbox_{cam_id}/index.m3u8",
+            "webrtc_url": f"http://127.0.0.1:8889/sandbox_{cam_id}",
+        })
+    return {"status": "success", "streams": streams}
+
+
+@app.post("/api/streaming/ffmpeg/start")
+def ffmpeg_start(payload: dict):
+    """启动 ffmpeg 拉流推流到 MediaMTX。"""
+    camera_id = payload.get("camera_id", "")
+    mode = payload.get("mode", "copy")
+    valid_ids = {c["id"] for c in SANDBOX_CAMERAS}
+    if camera_id not in valid_ids:
+        raise HTTPException(status_code=400, detail=f"无效摄像头 ID: {camera_id}")
+    try:
+        ok = start_stream(camera_id, mode)
+        return {"status": "success" if ok else "error", "camera_id": camera_id, "running": ok}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"启动 ffmpeg 失败: {exc}")
+
+
+@app.post("/api/streaming/ffmpeg/stop")
+def ffmpeg_stop(payload: dict):
+    """停止指定摄像头的 ffmpeg 推流进程。"""
+    camera_id = payload.get("camera_id", "")
+    try:
+        ok = stop_stream(camera_id)
+        return {"status": "success" if ok else "error", "camera_id": camera_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"停止 ffmpeg 失败: {exc}")
+
+
+@app.get("/api/streaming/ffmpeg/status")
+def ffmpeg_status(camera_id: str = Query("", description="摄像头 ID，留空返回全部")):
+    """查询 ffmpeg 推流进程状态。"""
+    if camera_id:
+        try:
+            return {"status": "success", "data": get_stream_status(camera_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "success", "streams": get_all_streams_status()}
+
+
+@app.post("/api/fusion/monitor/sandbox/plate/recognize")
+def sandbox_plate_recognize(payload: dict):
+    """从当前沙盘摄像头 RTSP 流抓帧并识别车牌。
+
+    前端 WebRTC iframe 无法截帧，此端点独立打开 RTSP 流抓帧，
+    利用 HyperLPR3 进行车牌检测与 OCR。
+    """
+    camera_id = payload.get("camera_id", "")
+    frame_count = int(payload.get("frame_count", 20))
+    sample_interval = int(payload.get("sample_interval", 5))
+
+    # 查找摄像头 RTSP 地址
+    rtsp_url = None
+    for cam in SANDBOX_CAMERAS:
+        if cam["id"] == camera_id:
+            rtsp_url = f"{SANDBOX_RTSP_BASE}/{camera_id}"
+            break
+    if rtsp_url is None:
+        raise HTTPException(status_code=400, detail=f"无效摄像头 ID: {camera_id}")
+
+    # 打开 RTSP 流
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        raise HTTPException(status_code=502, detail=f"无法打开沙盘视频流: {rtsp_url}")
+
+    started = time.time()
+    all_frame_results = []
+    best_plate = None
+    best_confidence = 0.0
+    output_image_url = ""
+
+    try:
+        read_count = 0
+        sampled_count = 0
+        max_reads = frame_count * sample_interval
+
+        while sampled_count < frame_count and read_count < max_reads:
+            ok, frame = cap.read()
+            read_count += 1
+            if not ok or frame is None:
+                continue
+
+            # 按采样间隔抓帧
+            if read_count % sample_interval != 0:
+                continue
+            sampled_count += 1
+
+            # 保存帧并识别
+            saved = save_frame_image(frame, f"sandbox_{camera_id}")
+            frame_path = str(saved["saved_path"])
+            result = recognize_plate_frame(frame, output_path=Path(frame_path))
+
+            all_frame_results.append(result)
+
+            # 跟踪最佳车牌
+            for plate in result.get("plates", []):
+                conf = float(plate.get("confidence", 0))
+                if conf > best_confidence:
+                    best_confidence = conf
+                    best_plate = plate["plate_number"]
+                    output_image_url = saved["image_url"]
+
+        total_latency = round((time.time() - started) * 1000, 2)
+
+        # 汇聚所有帧的 plates
+        all_plates = []
+        for fr in all_frame_results:
+            all_plates.extend(fr.get("plates", []))
+
+        # 跨帧聚合去重
+        if len(all_plates) >= 2:
+            aggregated = aggregate_plate_frame_results_v2(all_frame_results)
+            stable_plates = aggregated.get("stable_plates", [])
+            best_plate = aggregated.get("best_plate_text") or best_plate
+        else:
+            stable_plates = all_plates
+
+        return {
+            "status": "success",
+            "data": {
+                "camera_id": camera_id,
+                "plate_count": len(stable_plates),
+                "plates": stable_plates,
+                "best_plate": best_plate,
+                "best_confidence": round(best_confidence, 4),
+                "output_image_url": output_image_url,
+                "latency_ms": total_latency,
+                "frames_read": read_count,
+                "frames_sampled": sampled_count,
+            },
+        }
+
+    finally:
+        cap.release()
+
+
+@app.get("/api/video/stream")
+def video_mjpeg_stream(
+    source_id: str = Query("live1", description="RTSP 源 ID"),
+    source_url: str = Query("", description="自定义 RTSP 地址（优先级高于 source_id）"),
+    fps: int = Query(15, ge=1, le=30, description="最大帧率"),
+):
+    """
+    实时 MJPEG 视频流。
+
+    前端 <img> 标签直接加载此端点即可看到实时画面：
+        <img src="http://127.0.0.1:8000/api/video/stream?source_id=live1" />
+
+    支持两种模式：
+    - source_id：从内置 RTSP_SOURCES 查找
+    - source_url：直接使用自定义 RTSP 地址
+    """
+    if source_url and source_url.strip():
+        url = source_url.strip()
+    else:
+        source = next((s for s in RTSP_SOURCES if s["id"] == source_id), None)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"未找到视频源：{source_id}")
+        url = source["url"]
+
+    # 为每个请求创建独立的生成器实例
+    return StreamingResponse(
+        _mjpeg_stream_generator(url, max_fps=fps),
+        media_type="multipart/x-mixed-replace; boundary=mjpeg-frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "close",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )

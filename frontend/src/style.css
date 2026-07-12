@@ -180,3 +180,95 @@ a {
     transform: rotate(360deg);
   }
 }
+
+/* ---- Live Video Stage (MJPEG stream) ---- */
+
+.live-video-stage {
+  position: relative;
+  background: #020617;
+  border-radius: 14px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  min-height: 360px;
+}
+
+.live-video-stage img,
+.live-video-stage video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.live-video-stage.offline img,
+.live-video-stage.offline video,
+.live-video-stage.offline .hls-video-wrapper {
+  display: none;
+}
+
+.live-video-stage .hls-video-wrapper {
+  width: 100%;
+  height: 100%;
+}
+
+.live-video-stage .video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #64748b;
+  font-size: 15px;
+  background: #020617;
+  pointer-events: none;
+}
+
+.live-video-stage img[src] + .video-placeholder {
+  display: flex;
+}
+
+.live-video-stage:not(.offline) img[src] + .video-placeholder {
+  display: none;
+}
+
+.live-video-stage:not(.offline) img,
+.live-video-stage:not(.offline) video {
+  display: block;
+}
+
+/* ---- Stream Status Card ---- */
+
+.stream-status-card {
+  display: grid;
+  gap: 12px;
+}
+
+.stream-status-card .status-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stream-status-card .dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #ef4444;
+}
+
+.stream-status-card .dot.on {
+  background: #22c55e;
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.4);
+}
+
+.stream-status-card .dot.off {
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
+}
+
+.stream-status-card p {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 13px;
+  word-break: break-all;
+}
