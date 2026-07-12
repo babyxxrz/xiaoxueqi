@@ -131,9 +131,9 @@
             </label>
 
             <label>
-              <span>交警手势视频流</span>
+              <span>交警手势备用视频流（可选）</span>
               <select v-model="selectedTrafficSourceId">
-                <option value="">请选择交警手势视频源</option>
+                <option value="">优先使用下方电脑摄像头</option>
                 <option v-for="item in trafficSources" :key="item.id" :value="item.id">
                   {{ item.name }}
                 </option>
@@ -185,7 +185,7 @@
               <div class="channel-card">
                 <span>交警手势通道</span>
                 <strong>{{ trafficEvidenceText }}</strong>
-                <small>{{ evidence.traffic?.latency_ms ? `${evidence.traffic.latency_ms} ms` : '等待识别' }}</small>
+                <small>{{ evidence.traffic?.latency_ms ? `${Math.round(evidence.traffic.latency_ms)} ms` : '等待电脑摄像头或备用视频流' }}</small>
               </div>
               <div class="channel-card">
                 <span>车主摄像头通道</span>
@@ -214,7 +214,7 @@
             <!-- WebRTC 模式：iframe 嵌入 MediaMTX 播放器 -->
             <iframe
               v-if="liveStreamUrl && !streamError && selectedLivePreviewSource?.protocol === 'webrtc'"
-              :key="livePreviewSourceId"
+              :key="`${livePreviewSourceId}_${streamReloadToken}`"
               :src="liveStreamUrl"
               class="webrtc-iframe"
               allow="autoplay; fullscreen"
@@ -224,9 +224,10 @@
             <!-- HLS 模式：HlsVideoPlayer -->
             <HlsVideoPlayer
               v-else-if="liveStreamUrl && !streamError && selectedLivePreviewSource?.protocol === 'hls'"
-              :key="livePreviewSourceId"
+              :key="`${livePreviewSourceId}_${streamReloadToken}`"
               :src="liveStreamUrl"
               @playing="onStreamLoaded"
+              @reconnecting="onStreamReconnecting"
               @error="onStreamError"
             />
             <!-- MJPEG 模式：img -->
@@ -246,7 +247,7 @@
           <!-- 推流状态信息条 -->
           <div class="stream-info-bar">
             <span :class="['dot', streamError ? 'off' : 'on']"></span>
-            <span>{{ streamError ? '未连接' : streamLoading ? '连接中' : '已连接' }}</span>
+            <span>{{ streamStatusText }}</span>
             <span class="stream-info-sep">|</span>
             <span>格式：{{ selectedLivePreviewSource?.protocol === 'webrtc' ? 'WebRTC' : selectedLivePreviewSource?.protocol === 'hls' ? 'HLS' : 'MJPEG' }}</span>
             <span class="stream-info-sep">|</span>
@@ -307,7 +308,11 @@
           </div>
         </article>
 
-        <!-- Row 3: 车主摄像头 -->
+        <!-- Row 3: 两路电脑摄像头。摄像头识别结果只作为当前轮次真实证据。 -->
+        <article class="panel span-12">
+          <TrafficGestureCamera @recognized="handleTrafficEvidence" />
+        </article>
+
         <article class="panel span-12">
           <OwnerCameraPanel @recognized="handleOwnerEvidence" />
         </article>
@@ -320,8 +325,8 @@
               <p class="eyebrow">MODEL TEST CENTER</p>
               <h2>模型测试中心</h2>
               <p>
-                车牌识别与交警手势识别统一使用本地视频上传。系统会连续抽帧、完成时序分析，
-                并展示最佳标注帧、识别结果和性能数据。
+                车牌识别与交警手势识别统一使用本地视频上传。车牌视频默认采用约 12 帧快速 OCR
+                与跨帧聚合，避免批量任务逐帧长时间等待；交警手势继续进行时序分析。
               </p>
             </div>
             <div class="input-mode-badge">
@@ -584,14 +589,22 @@
                     </small>
                   </div>
                   <img
-                    v-if="plateResult.output_image_url"
-                    :src="assetUrl(plateResult.output_image_url)"
+                    v-if="plateBestOutputImageUrl"
+                    :src="assetUrl(plateBestOutputImageUrl)"
                     alt="车牌最佳标注帧"
                     style="cursor:pointer"
-                    @click="enlargedImage = assetUrl(plateResult.output_image_url)"
+                    @click="enlargedImage = assetUrl(plateBestOutputImageUrl)"
                     title="点击放大"
                   />
                   <div v-else class="empty-state">本次未生成最佳标注帧。</div>
+                </div>
+
+                <div class="plate-evidence-heading">
+                  <div>
+                    <span>BEST FRAME EVIDENCE</span>
+                    <strong>最佳帧车牌（与上方标注框一一对应）</strong>
+                  </div>
+                  <b>{{ plateBestFrameList.length }} 个框</b>
                 </div>
 
                 <div class="data-table result-table">
@@ -600,13 +613,51 @@
                       <tr>
                         <th>车牌号码</th>
                         <th>颜色</th>
-                        <th>置信度</th>
+                        <th>本帧置信度</th>
+                        <th>原始 OCR</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="(plate, index) in plateBestFrameList"
+                        :key="`best_${plate.plate_number || index}_${index}`"
+                      >
+                        <td><strong>{{ plate.plate_number || plate.plate || plate.text || '未解析号码' }}</strong></td>
+                        <td>{{ plate.plate_color || plate.color || '未知' }}</td>
+                        <td>{{ percent(plate.confidence) }}</td>
+                        <td>{{ plate.raw_plate_number || plate.plate_number || '-' }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <div v-if="!plateBestFrameList.length" class="empty-state">
+                    最佳帧中没有通过过滤的车牌框。
+                  </div>
+                </div>
+
+                <div v-if="plateFileType === 'video'" class="plate-evidence-heading video-summary">
+                  <div>
+                    <span>FULL VIDEO SUMMARY</span>
+                    <strong>全视频稳定聚合结果</strong>
+                  </div>
+                  <b>{{ plateAggregatedList.length }} 个稳定车牌</b>
+                </div>
+
+                <div v-if="plateFileType === 'video'" class="data-table result-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>车牌号码</th>
+                        <th>颜色</th>
+                        <th>聚合置信度</th>
                         <th>出现次数</th>
                         <th>最佳帧</th>
                       </tr>
                     </thead>
                     <tbody>
-                      <tr v-for="(plate, index) in plateList" :key="`${plate.plate_number || index}_${index}`">
+                      <tr
+                        v-for="(plate, index) in plateAggregatedList"
+                        :key="`video_${plate.plate_number || index}_${index}`"
+                      >
                         <td><strong>{{ plate.plate_number || plate.plate || plate.text || '未解析号码' }}</strong></td>
                         <td>{{ plate.plate_color || plate.color || '未知' }}</td>
                         <td>{{ percent(plate.confidence) }}</td>
@@ -615,8 +666,8 @@
                       </tr>
                     </tbody>
                   </table>
-                  <div v-if="!plateList.length" class="empty-state">
-                    当前{{ plateFileType === 'image' ? '图片' : '视频' }}未检测到车牌。可尝试更换文件或调整参数。
+                  <div v-if="!plateAggregatedList.length" class="empty-state">
+                    全视频没有形成稳定车牌结果。
                   </div>
                 </div>
 
@@ -658,31 +709,59 @@
                 </div>
                 <div v-if="br.status === 'success'" class="batch-result-body">
                   <img
-                    v-if="br.output_image_url"
-                    :src="assetUrl(br.output_image_url)"
+                    v-if="batchBestOutputImageUrl(br)"
+                    :src="assetUrl(batchBestOutputImageUrl(br))"
                     class="batch-result-thumb"
                     alt="标注结果"
-                    @click="enlargedImage = assetUrl(br.output_image_url)"
+                    @click="enlargedImage = assetUrl(batchBestOutputImageUrl(br))"
                     title="点击放大"
                   />
-                  <!-- 车牌结果 -->
-                  <div v-if="br.result?.plates?.length" class="batch-plates">
-                    <span
-                      v-for="p in br.result.plates"
-                      :key="p.plate_number"
-                      class="batch-plate-tag"
-                    >
-                      {{ p.plate_number || p.plate || '?' }}
-                      <small>{{ percent(p.confidence) }}</small>
-                    </span>
+                  <div class="batch-evidence-groups">
+                    <div>
+                      <strong class="batch-evidence-title">
+                        最佳帧车牌 · {{ batchBestFramePlates(br).length }} 个框
+                      </strong>
+                      <div v-if="batchBestFramePlates(br).length" class="batch-plates">
+                        <span
+                          v-for="(p, pIndex) in batchBestFramePlates(br)"
+                          :key="`best_${p.plate_number || pIndex}_${pIndex}`"
+                          class="batch-plate-tag"
+                        >
+                          {{ p.plate_number || p.plate || '?' }}
+                          <small>
+                            {{ p.plate_color || p.color || '未知颜色' }}
+                            · {{ percent(p.confidence) }}
+                          </small>
+                        </span>
+                      </div>
+                      <span v-else class="batch-no-result">
+                        最佳帧未检测到有效车牌框
+                      </span>
+                    </div>
+
+                    <div v-if="br.file_type === 'video'">
+                      <strong class="batch-evidence-title">
+                        全视频汇总 · {{ batchAggregatedPlates(br).length }} 个稳定车牌
+                      </strong>
+                      <div v-if="batchAggregatedPlates(br).length" class="batch-plates">
+                        <span
+                          v-for="(p, pIndex) in batchAggregatedPlates(br)"
+                          :key="`video_${p.plate_number || pIndex}_${pIndex}`"
+                          class="batch-plate-tag aggregate"
+                        >
+                          {{ p.plate_number || p.plate || '?' }}
+                          <small>
+                            {{ p.plate_color || p.color || '未知颜色' }}
+                            · {{ percent(p.confidence) }}
+                            · 出现 {{ p.appear_count ?? 1 }} 次
+                          </small>
+                        </span>
+                      </div>
+                      <span v-else class="batch-no-result">
+                        全视频没有形成稳定车牌
+                      </span>
+                    </div>
                   </div>
-                  <div v-else-if="br.result?.plate_number" class="batch-plates">
-                    <span class="batch-plate-tag">
-                      {{ br.result.plate_number }}
-                      <small>{{ percent(br.result.confidence) }}</small>
-                    </span>
-                  </div>
-                  <span v-else class="batch-no-result">未检测到车牌</span>
                 </div>
                 <div v-else class="batch-result-body">
                   <span class="batch-result-error">{{ br.error }}</span>
@@ -1077,28 +1156,150 @@
           <header class="panel-title">
             <div>
               <p class="eyebrow">VIDEO SOURCES</p>
-              <h2>可用视频源</h2>
-              <p>用户端仅负责选择和检测视频源；新增、编辑、删除由管理员后台完成。</p>
+              <h2>我的视频源与系统共享源</h2>
+              <p>
+                普通用户可以新增、编辑、启停和删除自己的视频源；
+                系统共享源所有用户可用，但只能由管理员修改。
+              </p>
             </div>
+            <button class="primary-action compact" @click="openNewSourceEditor">
+              新增我的视频源
+            </button>
           </header>
+
+          <div v-if="sourceEditorOpen" class="user-source-editor">
+            <div class="source-editor-heading">
+              <div>
+                <span>{{ editingSourceId ? 'EDIT SOURCE' : 'NEW SOURCE' }}</span>
+                <h3>{{ editingSourceId ? '编辑我的视频源' : '新增我的视频源' }}</h3>
+              </div>
+              <button class="text-button" @click="closeSourceEditor">关闭</button>
+            </div>
+
+            <div class="user-source-form-grid">
+              <label>
+                <span>名称</span>
+                <input v-model.trim="userSourceForm.name" placeholder="例如：我的车牌 RTSP 流" />
+              </label>
+              <label>
+                <span>用途</span>
+                <select v-model="userSourceForm.source_type">
+                  <option value="plate">车牌识别</option>
+                  <option value="traffic_gesture">交警手势</option>
+                  <option value="owner_gesture">车主手势</option>
+                  <option value="general">通用视频源</option>
+                </select>
+              </label>
+              <label>
+                <span>协议</span>
+                <select v-model="userSourceForm.protocol">
+                  <option value="rtsp">RTSP</option>
+                  <option value="mediamtx">MediaMTX</option>
+                  <option value="hls">HLS</option>
+                  <option value="webrtc">WebRTC</option>
+                  <option value="mjpeg">MJPEG</option>
+                  <option value="demo">Demo</option>
+                  <option value="mock">Mock</option>
+                </select>
+              </label>
+              <label>
+                <span>源 ID</span>
+                <input v-model.trim="userSourceForm.source_id" placeholder="例如：my_plate_stream" />
+              </label>
+              <label class="source-form-wide">
+                <span>视频流地址</span>
+                <input
+                  v-model.trim="userSourceForm.source_url"
+                  placeholder="rtsp://127.0.0.1:8554/my_stream"
+                />
+              </label>
+              <label>
+                <span>Demo 文件</span>
+                <input v-model.trim="userSourceForm.demo_file" placeholder="可选，例如 traffic.png" />
+              </label>
+              <label>
+                <span>最大读取帧数</span>
+                <input v-model.number="userSourceForm.frame_count" type="number" min="5" max="300" />
+              </label>
+              <label>
+                <span>抽帧间隔</span>
+                <input v-model.number="userSourceForm.sample_interval" type="number" min="1" max="60" />
+              </label>
+              <label>
+                <span>预热帧数</span>
+                <input v-model.number="userSourceForm.warmup_frames" type="number" min="0" max="30" />
+              </label>
+              <label class="source-form-wide">
+                <span>说明</span>
+                <textarea v-model.trim="userSourceForm.description" rows="3"></textarea>
+              </label>
+            </div>
+
+            <div class="source-form-options">
+              <label>
+                <input v-model="userSourceForm.use_mock_frame" type="checkbox" />
+                使用 Mock / Demo 输入
+              </label>
+              <label>
+                <input v-model="userSourceForm.enabled" type="checkbox" />
+                启用视频源
+              </label>
+            </div>
+
+            <div class="source-form-buttons">
+              <button class="text-button" @click="closeSourceEditor">取消</button>
+              <button
+                class="primary-action compact"
+                :disabled="sourceSaving"
+                @click="saveUserSource"
+              >
+                {{ sourceSaving ? '保存中...' : editingSourceId ? '保存修改' : '创建视频源' }}
+              </button>
+            </div>
+          </div>
 
           <div class="source-list">
             <article v-for="item in videoSources" :key="item.id">
-              <div>
-                <span>{{ sourceTypeLabel(item.source_type) }}</span>
+              <div class="source-main-info">
+                <div class="source-badges">
+                  <span>{{ sourceTypeLabel(item.source_type) }}</span>
+                  <span :class="['source-owner-badge', item.is_global ? 'shared' : 'mine']">
+                    {{ item.is_global ? '系统共享' : item.is_mine ? '我的视频源' : `用户：${item.owner_username || item.user_id}` }}
+                  </span>
+                  <span :class="['source-enabled-badge', item.enabled ? 'enabled' : 'disabled']">
+                    {{ item.enabled ? '已启用' : '已停用' }}
+                  </span>
+                </div>
                 <h3>{{ item.name }}</h3>
                 <p>{{ maskUrl(item.source_url || item.demo_file || item.source_id || '-') }}</p>
+                <small v-if="item.description">{{ item.description }}</small>
               </div>
+
               <div class="source-actions">
                 <strong :class="{ online: sourceChecks[item.id]?.online }">
                   {{ sourceChecks[item.id] ? (sourceChecks[item.id].online ? '可用' : '不可用') : '未检测' }}
                 </strong>
-                <button :disabled="checkingSourceId === item.id" @click="checkSource(item)">
+                <button
+                  :disabled="checkingSourceId === item.id"
+                  @click="checkSource(item)"
+                >
                   {{ checkingSourceId === item.id ? '检测中...' : '检测连接' }}
                 </button>
+                <template v-if="item.can_manage">
+                  <button @click="editUserSource(item)">编辑</button>
+                  <button @click="toggleUserSource(item)">
+                    {{ item.enabled ? '停用' : '启用' }}
+                  </button>
+                  <button class="danger-button" @click="removeUserSource(item)">
+                    删除
+                  </button>
+                </template>
               </div>
             </article>
-            <div v-if="!videoSources.length" class="empty-state">暂无已启用视频源。</div>
+
+            <div v-if="!videoSources.length" class="empty-state">
+              暂无可用视频源。
+            </div>
           </div>
         </article>
       </section>
@@ -1341,7 +1542,14 @@ import { useRouter } from 'vue-router'
 import OwnerCameraPanel from './components/OwnerCameraPanel.vue'
 import TrafficGestureCamera from './components/TrafficGestureCamera.vue'
 import HlsVideoPlayer from './components/HlsVideoPlayer.vue'
-import { API_BASE, apiGet, apiPost, uploadFile } from './api'
+import {
+  API_BASE,
+  apiDelete,
+  apiGet,
+  apiPost,
+  apiPut,
+  uploadFile,
+} from './api'
 import { useAuth } from './useAuth'
 
 const router = useRouter()
@@ -1395,6 +1603,25 @@ const retryingAlertId = ref(null)
 const videoSources = ref([])
 const latestDecisionRaw = ref(null)
 
+const sourceEditorOpen = ref(false)
+const sourceSaving = ref(false)
+const editingSourceId = ref(null)
+const userSourceForm = reactive({
+  source_key: '',
+  name: '',
+  source_type: 'plate',
+  source_id: '',
+  source_url: '',
+  protocol: 'rtsp',
+  use_mock_frame: false,
+  demo_file: '',
+  frame_count: 20,
+  sample_interval: 5,
+  warmup_frames: 3,
+  enabled: true,
+  description: '',
+})
+
 const selectedPlateSourceId = ref('')
 const selectedTrafficSourceId = ref('')
 const sourceChecks = reactive({})
@@ -1408,8 +1635,9 @@ const trafficResult = ref(null)
 const plateUpload = reactive({
   previewUrl: '',
   duration: 0,
-  frameCount: 240,
-  sampleInterval: 5,
+  // 后端会进一步限制为约 12 次 OCR；前端默认参数也避免全量抽帧。
+  frameCount: 90,
+  sampleInterval: 10,
   status: 'idle',
 })
 
@@ -1441,6 +1669,11 @@ const fusionMonitor = reactive({
 })
 
 const fusionTimer = ref(null)
+let fusionCycleController = null
+let fusionRunToken = 0
+const FUSION_CHANNEL_TIMEOUT_MS = 10000
+const FUSION_DECISION_TIMEOUT_MS = 6000
+
 const evidence = reactive({
   plate: null,
   traffic: null,
@@ -1449,12 +1682,24 @@ const evidence = reactive({
 
 const currentDecisionRaw = ref(null)
 const fusionTimeline = ref([])
+const lastFusionEvent = reactive({ message: '', at: 0 })
+const lastCameraEvent = reactive({
+  traffic: { signature: '', at: 0 },
+  owner: { signature: '', at: 0 },
+})
+const FUSION_CAMERA_EVIDENCE_MAX_AGE_MS = 3500
 
 // ---- Live video stream state ----
 const livePreviewSourceId = ref('')
 const streamLoading = ref(false)
 const streamError = ref(false)
+const streamReloadToken = ref(0)
+const streamRecoveryAttempt = ref(0)
+const streamStatusText = ref('未连接')
 const sandboxStreams = ref([]) // 来自 GET /api/streaming/sandbox/list
+
+let streamRecoveryTimer = null
+let streamHealthTimer = null
 
 // 沙盘车牌识别
 const loadingPlateRecognize = ref(false)
@@ -1465,8 +1710,9 @@ async function recognizeSandboxPlate() {
   try {
     const res = await apiPost('/api/fusion/monitor/sandbox/plate/recognize', {
       camera_id: livePreviewSourceId.value,
-      frame_count: 20,
+      frame_count: 60,
       sample_interval: 5,
+      warmup_frames: 3,
     })
     if (res.status === 'success' && res.data) {
       evidence.plate = res.data
@@ -1487,8 +1733,10 @@ const livePreviewSources = computed(() => {
     id: s.id,
     source_id: s.id,
     name: `沙盘 - ${s.name}`,
-    source_url: s.webrtc_url,
-    protocol: 'webrtc',
+    source_url: s.hls_url,
+    hls_url: s.hls_url,
+    webrtc_url: s.webrtc_url,
+    protocol: 'hls',
     enabled: true,
   }))
   const existing = videoSources.value.filter((item) => item.enabled !== false)
@@ -1505,8 +1753,10 @@ const selectedLivePreviewSource = computed(() => {
     return {
       source_id: sandbox.id,
       name: `沙盘 - ${sandbox.name}`,
-      source_url: sandbox.webrtc_url,
-      protocol: 'webrtc',
+      source_url: sandbox.hls_url,
+      hls_url: sandbox.hls_url,
+      webrtc_url: sandbox.webrtc_url,
+      protocol: 'hls',
     }
   }
   // 再查 video_sources 表
@@ -1542,28 +1792,167 @@ const liveStreamUrl = computed(() => {
   return `${API_BASE}/api/video/stream?${params}`
 })
 
-function onLivePreviewSourceChange() {
+function clearStreamTimers() {
+  if (streamRecoveryTimer) {
+    window.clearTimeout(streamRecoveryTimer)
+    streamRecoveryTimer = null
+  }
+  if (streamHealthTimer) {
+    window.clearInterval(streamHealthTimer)
+    streamHealthTimer = null
+  }
+}
+
+function selectedSandboxStream() {
+  return sandboxStreams.value.find(
+    (item) =>
+      String(item.id) === String(livePreviewSourceId.value),
+  )
+}
+
+async function ensureSandboxRelay({
+  forceRestart = false,
+} = {}) {
+  const sandbox = selectedSandboxStream()
+  if (!sandbox) return false
+
+  const response = await apiPost('/api/streaming/ffmpeg/start', {
+    camera_id: sandbox.id,
+    mode: 'copy',
+    fps: 15,
+    force_restart: forceRestart,
+  })
+
+  return Boolean(
+    response?.running
+    || response?.data?.running,
+  )
+}
+
+function startStreamHealthMonitor() {
+  if (streamHealthTimer) {
+    window.clearInterval(streamHealthTimer)
+  }
+
+  streamHealthTimer = window.setInterval(async () => {
+    const sandbox = selectedSandboxStream()
+    if (!sandbox) return
+
+    try {
+      const status = await apiGet(
+        `/api/streaming/ffmpeg/status?camera_id=${encodeURIComponent(sandbox.id)}`,
+      )
+      const running = Boolean(status?.data?.running)
+
+      if (!running) {
+        streamStatusText.value = '转发中断，正在恢复'
+        await ensureSandboxRelay({ forceRestart: true })
+        await sleep(1200)
+        streamReloadToken.value += 1
+      }
+    } catch {
+      // 短暂状态查询失败不立刻终止播放器。
+    }
+  }, 4000)
+}
+
+async function onLivePreviewSourceChange() {
+  clearStreamTimers()
+  streamRecoveryAttempt.value = 0
   streamError.value = false
-  streamLoading.value = !!livePreviewSourceId.value
+  streamLoading.value = Boolean(livePreviewSourceId.value)
+  streamStatusText.value = (
+    livePreviewSourceId.value ? '正在连接' : '未连接'
+  )
+
+  if (!livePreviewSourceId.value) return
+
+  const sandbox = selectedSandboxStream()
+
+  if (!sandbox) {
+    streamReloadToken.value += 1
+    return
+  }
+
+  try {
+    await ensureSandboxRelay()
+    await sleep(1400)
+    streamReloadToken.value += 1
+    streamError.value = false
+    startStreamHealthMonitor()
+  } catch (error) {
+    streamLoading.value = false
+    streamError.value = true
+    streamStatusText.value = '视频转发启动失败'
+    globalError.value = (
+      `沙盘视频转发启动失败：${error.message}。`
+      + '请确认 MediaMTX 已启动、ffmpeg 可用且老师 RTSP 在线。'
+    )
+  }
+}
+
+function scheduleAppStreamRecovery() {
+  if (streamRecoveryTimer || !selectedSandboxStream()) return
+
+  streamRecoveryAttempt.value += 1
+
+  if (streamRecoveryAttempt.value > 6) {
+    streamError.value = true
+    streamLoading.value = false
+    streamStatusText.value = '多次重连失败'
+    return
+  }
+
+  const delay = Math.min(
+    8000,
+    1000 * streamRecoveryAttempt.value,
+  )
+
+  streamStatusText.value = (
+    `自动重连中 ${streamRecoveryAttempt.value}/6`
+  )
+  streamLoading.value = true
+  streamError.value = false
+
+  streamRecoveryTimer = window.setTimeout(async () => {
+    streamRecoveryTimer = null
+
+    try {
+      await ensureSandboxRelay({
+        forceRestart: streamRecoveryAttempt.value >= 2,
+      })
+      await sleep(1200)
+      streamReloadToken.value += 1
+    } catch {
+      scheduleAppStreamRecovery()
+    }
+  }, delay)
+}
+
+function onStreamReconnecting(payload) {
+  streamLoading.value = true
+  streamError.value = false
+  streamStatusText.value = (
+    `播放器重连中 ${payload?.attempt || ''}`
+  )
 }
 
 function onStreamError() {
-  streamError.value = true
-  streamLoading.value = false
+  scheduleAppStreamRecovery()
 }
 
 function onStreamLoaded() {
+  streamRecoveryAttempt.value = 0
   streamError.value = false
   streamLoading.value = false
+  streamStatusText.value = '已连接'
 }
 
 function openStreamInNewTab() {
-  if (!liveStreamUrl.value) return
-  // HLS m3u8 在大部分浏览器无法直接播放，用 MediaMTX WebRTC URL
   const src = selectedLivePreviewSource.value
-  const sourceId = src?.source_id || livePreviewSourceId.value
-  if (sourceId) {
-    window.open(`http://127.0.0.1:8889/${sourceId}`, '_blank')
+  const url = src?.webrtc_url || liveStreamUrl.value
+  if (url) {
+    window.open(url, '_blank')
   }
 }
 
@@ -1607,13 +1996,85 @@ const platePayload = computed(() =>
   plateResult.value?.result || plateResult.value || {},
 )
 
-const plateList = computed(() => {
+const plateAggregatedList = computed(() => {
   const payload = platePayload.value
-  if (Array.isArray(payload.plates)) return payload.plates
-  if (payload.plate_number || payload.plate || payload.text) return [payload]
+
+  if (Array.isArray(payload.aggregated_plates)) {
+    return payload.aggregated_plates
+  }
+  if (Array.isArray(payload.video_plates)) {
+    return payload.video_plates
+  }
+  if (Array.isArray(payload.plates)) {
+    return payload.plates
+  }
+  if (payload.plate_number || payload.plate || payload.text) {
+    return [payload]
+  }
   return []
 })
 
+const plateBestFrameList = computed(() => {
+  const payload = platePayload.value
+
+  if (Array.isArray(payload.best_frame_plates)) {
+    return payload.best_frame_plates
+  }
+
+  // 图片识别没有“全视频”概念，结果本身就是当前帧证据。
+  if (plateFileType.value === 'image') {
+    return plateAggregatedList.value
+  }
+
+  return []
+})
+
+const plateList = plateAggregatedList
+
+const plateBestOutputImageUrl = computed(() =>
+  plateResult.value?.output_image_url ||
+  platePayload.value?.best_frame_output_image_url ||
+  platePayload.value?.best_output_image_url ||
+  '',
+)
+function batchBestOutputImageUrl(item) {
+  return (
+    item?.output_image_url
+    || item?.result?.best_frame_output_image_url
+    || item?.result?.best_output_image_url
+    || ''
+  )
+}
+
+function batchBestFramePlates(item) {
+  const result = item?.result || {}
+
+  if (Array.isArray(result.best_frame_plates)) {
+    return result.best_frame_plates
+  }
+
+  if (item?.file_type === 'image' && Array.isArray(result.plates)) {
+    return result.plates
+  }
+
+  return []
+}
+
+function batchAggregatedPlates(item) {
+  const result = item?.result || {}
+
+  if (Array.isArray(result.aggregated_plates)) {
+    return result.aggregated_plates
+  }
+  if (Array.isArray(result.video_plates)) {
+    return result.video_plates
+  }
+  if (Array.isArray(result.plates)) {
+    return result.plates
+  }
+
+  return []
+}
 const trafficPayload = computed(() =>
   trafficResult.value?.result || trafficResult.value || {},
 )
@@ -1726,13 +2187,17 @@ const overviewMetrics = computed(() => [
 ])
 
 const plateEvidenceText = computed(() => {
-  const payload = evidence.plate?.result || evidence.plate || {}
-  const plates = payload.plates || []
+  const payload = evidence.plate?.result || evidence.plate?.data || evidence.plate || {}
+  const plates = payload.plates || payload.stable_plates || []
+  const explicitBest = payload.best_plate || payload.best_plate_text || payload.plate_number
+  if (explicitBest) return explicitBest
   if (Array.isArray(plates) && plates.length) {
-    const first = plates[0]
-    return first.plate || first.plate_number || first.text || `检测到 ${plates.length} 个车牌`
+    const best = [...plates].sort(
+      (a, b) => Number(b.confidence || b.avg_confidence || 0) - Number(a.confidence || a.avg_confidence || 0),
+    )[0]
+    return best?.plate || best?.plate_number || best?.text || `检测到 ${plates.length} 个车牌`
   }
-  return payload.plate_number || payload.plate || '未检测到车牌'
+  return '未检测到车牌'
 })
 
 const trafficEvidenceText = computed(() => {
@@ -1753,10 +2218,13 @@ function recordResultSummary(item) {
   const result = item.result || {}
   if (item.task_type === 'plate') {
     const plates = Array.isArray(result.plates) ? result.plates : []
-    const numbers = plates
-      .map((plate) => plate.plate_number || plate.plate || plate.text)
-      .filter(Boolean)
-    return numbers.length ? numbers.slice(0, 3).join('、') : '未识别到有效车牌'
+    const values = plates.map((plate) => {
+      const number = plate.plate_number || plate.plate || plate.text
+      if (!number) return ''
+      const color = plate.plate_color || plate.color || '未知颜色'
+      return `${number}（${color}）`
+    }).filter(Boolean)
+    return values.length ? values.slice(0, 3).join('、') : '未识别到有效车牌'
   }
 
   if (item.task_type === 'traffic_gesture') {
@@ -1942,7 +2410,7 @@ async function refreshAll() {
     apiGet('/api/dashboard/summary'),
     apiGet('/api/records?limit=30'),
     apiGet('/api/alerts?limit=30'),
-    apiGet('/api/video-sources?enabled_only=true'),
+    apiGet('/api/video-sources?enabled_only=false'),
     apiGet('/api/fusion/monitor/latest'),
   ])
 
@@ -2273,25 +2741,166 @@ async function recognizeTraffic() {
 
 function sourceToPayload(source, taskType) {
   return {
-    source_id: source?.source_id || '',
-    source_url: source?.source_url || '',
+    source_id: source?.source_id || source?.id || '',
+    source_url: source?.source_url || source?.url || '',
     task_type: taskType,
-    use_mock_frame: Boolean(source?.use_mock_frame),
-    demo_file: source?.demo_file || '',
-    frame_count: Number(source?.frame_count || 20),
-    sample_interval: Number(source?.sample_interval || 5),
-    warmup_frames: Number(source?.warmup_frames || 3),
+    use_mock_frame: false,
+    frame_count: Number(
+      source?.frame_count
+      || (taskType === 'plate' ? 18 : 12),
+    ),
+    sample_interval: Number(
+      source?.sample_interval
+      || (taskType === 'plate' ? 2 : 2),
+    ),
+    warmup_frames: Number(
+      source?.warmup_frames
+      ?? 1,
+    ),
   }
 }
 
-function addFusionEvent(message) {
+function isAbortLikeError(error) {
+  return (
+    error?.name === 'AbortError'
+    || /aborted|abort|取消|超时/i.test(
+      String(error?.message || ''),
+    )
+  )
+}
+
+function createChildAbortController(
+  rootSignal,
+  timeoutMs,
+) {
+  const controller = new AbortController()
+  let timedOut = false
+
+  const abortFromRoot = () => {
+    if (!controller.signal.aborted) {
+      controller.abort('fusion_monitor_stopped')
+    }
+  }
+
+  if (rootSignal) {
+    if (rootSignal.aborted) {
+      abortFromRoot()
+    } else {
+      rootSignal.addEventListener(
+        'abort',
+        abortFromRoot,
+        { once: true },
+      )
+    }
+  }
+
+  const timer = window.setTimeout(() => {
+    timedOut = true
+    if (!controller.signal.aborted) {
+      controller.abort('request_timeout')
+    }
+  }, Math.max(1000, Number(timeoutMs || 10000)))
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      window.clearTimeout(timer)
+      rootSignal?.removeEventListener(
+        'abort',
+        abortFromRoot,
+      )
+    },
+  }
+}
+
+async function apiPostWithFusionTimeout(
+  path,
+  body,
+  rootSignal,
+  timeoutMs,
+) {
+  const child = createChildAbortController(
+    rootSignal,
+    timeoutMs,
+  )
+
+  try {
+    return await apiPost(
+      path,
+      body,
+      { signal: child.signal },
+    )
+  } catch (error) {
+    if (child.didTimeout()) {
+      const timeoutError = new Error(
+        `请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`,
+      )
+      timeoutError.name = 'FusionRequestTimeoutError'
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    child.cleanup()
+  }
+}
+
+function addFusionEvent(message, options = {}) {
+  const normalized = String(message || '').trim()
+  if (!normalized) return
+
+  const now = Date.now()
+  const dedupeWindow = Number(options.dedupeWindow ?? 2500)
+  if (
+    !options.force &&
+    lastFusionEvent.message === normalized &&
+    now - lastFusionEvent.at < dedupeWindow
+  ) {
+    return
+  }
+
+  lastFusionEvent.message = normalized
+  lastFusionEvent.at = now
   fusionTimeline.value.unshift({
-    id: `${Date.now()}_${Math.random()}`,
-    time: new Date().toLocaleTimeString(),
-    message,
+    id: `${now}_${Math.random()}`,
+    time: new Date(now).toLocaleTimeString(),
+    message: normalized,
   })
 
-  fusionTimeline.value = fusionTimeline.value.slice(0, 20)
+  fusionTimeline.value = fusionTimeline.value.slice(0, 30)
+}
+
+function channelPayload(channel) {
+  return channel?.result || channel?.data || channel || {}
+}
+
+function isFreshCameraEvidence(channel) {
+  if (!channel) return false
+  const timeValue = channel.captured_at || channel.created_at || channel.received_at
+  const timestamp = timeValue ? Date.parse(timeValue) : Number(channel.received_at_ms || 0)
+  return Number.isFinite(timestamp) && Date.now() - timestamp <= FUSION_CAMERA_EVIDENCE_MAX_AGE_MS
+}
+
+function isValidTrafficEvidence(channel) {
+  const payload = channelPayload(channel)
+  const gesture = String(payload.gesture || '')
+  return !['', 'unknown', 'no_pose', 'none'].includes(gesture)
+}
+
+function isValidOwnerEvidence(channel) {
+  const payload = channelPayload(channel)
+  const gesture = String(payload.gesture || '')
+  return !['', 'unknown', 'no_hand', 'none'].includes(gesture)
+}
+
+function plateResultMessage(channel) {
+  const payload = channelPayload(channel)
+  const plate = payload.best_plate || payload.best_plate_text || plateEvidenceText.value
+  const plateColor = payload.best_plate_color || payload.plates?.[0]?.plate_color || payload.stable_plates?.[0]?.plate_color || ''
+  const sampled = channel?.sampled_frames ?? payload.sampled_frames
+  return plate && plate !== '未检测到车牌'
+    ? `车牌通道真实检测：${plate}${plateColor ? `（${plateColor}）` : ''}${sampled ? `（抽样 ${sampled} 帧）` : ''}`
+    : `车牌通道本轮未检测到有效车牌${sampled ? `（抽样 ${sampled} 帧）` : ''}`
 }
 
 async function runFusionCycle() {
@@ -2300,67 +2909,249 @@ async function runFusionCycle() {
   loading.fusion = true
   fusionMonitor.cycle += 1
 
+  const cycleNumber = fusionMonitor.cycle
+  const runToken = fusionRunToken
+  const rootController = new AbortController()
+  fusionCycleController = rootController
+
+  const cycleEvidence = {
+    plate: null,
+    traffic: null,
+    owner: null,
+  }
+  const channelErrors = {
+    plate: '',
+    traffic: '',
+  }
+
+  let currentPlateSource = null
+  let trafficBackupExpected = false
+
+  const isCurrentRun = () => (
+    fusionMonitor.running
+    && runToken === fusionRunToken
+    && !rootController.signal.aborted
+  )
+
   try {
-    const tasks = []
+    currentPlateSource = selectedPlateSource.value || (
+      livePreviewSourceId.value
+        ? {
+            source_id: livePreviewSourceId.value,
+            source_url: '',
+            name: selectedLivePreviewSource.value?.name,
+          }
+        : null
+    )
 
-    if (selectedPlateSource.value) {
-      tasks.push(
-        apiPost(
+    const platePromise = currentPlateSource
+      ? apiPostWithFusionTimeout(
           '/api/fusion/monitor/channel/recognize',
-          sourceToPayload(selectedPlateSource.value, 'plate'),
-        ).then((data) => {
-          evidence.plate = data
-          addFusionEvent(`车牌通道：${plateEvidenceText.value}`)
-        }),
+          sourceToPayload(currentPlateSource, 'plate'),
+          rootController.signal,
+          FUSION_CHANNEL_TIMEOUT_MS,
+        )
+      : Promise.resolve(null)
+
+    let trafficPromise = Promise.resolve(null)
+
+    if (
+      isFreshCameraEvidence(evidence.traffic)
+      && isValidTrafficEvidence(evidence.traffic)
+    ) {
+      trafficPromise = Promise.resolve(evidence.traffic)
+    } else if (selectedTrafficSource.value) {
+      trafficBackupExpected = true
+      trafficPromise = apiPostWithFusionTimeout(
+        '/api/fusion/monitor/channel/recognize',
+        sourceToPayload(
+          selectedTrafficSource.value,
+          'traffic_gesture',
+        ),
+        rootController.signal,
+        FUSION_CHANNEL_TIMEOUT_MS,
       )
     }
 
-    if (selectedTrafficSource.value) {
-      tasks.push(
-        apiPost(
-          '/api/fusion/monitor/channel/recognize',
-          sourceToPayload(selectedTrafficSource.value, 'traffic_gesture'),
-        ).then((data) => {
-          evidence.traffic = data
-          addFusionEvent(`交警通道：${trafficEvidenceText.value}`)
-        }),
-      )
+    // 车牌和交警备用通道并行执行，不再串行累加等待时间。
+    const [plateSettled, trafficSettled] = (
+      await Promise.allSettled([
+        platePromise,
+        trafficPromise,
+      ])
+    )
+
+    if (!isCurrentRun()) return
+
+    if (plateSettled.status === 'fulfilled') {
+      cycleEvidence.plate = plateSettled.value
+      if (cycleEvidence.plate) {
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] ${plateResultMessage(cycleEvidence.plate)}`,
+        )
+      }
+    } else {
+      const error = plateSettled.reason
+      if (!isAbortLikeError(error)) {
+        channelErrors.plate = (
+          error?.message || String(error)
+        )
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] 车牌通道读取失败：${channelErrors.plate}`,
+          { force: true },
+        )
+      }
     }
 
-    await Promise.allSettled(tasks)
+    if (trafficSettled.status === 'fulfilled') {
+      cycleEvidence.traffic = trafficSettled.value
 
-    const data = await apiPost('/api/fusion/monitor/decision', {
-      save: true,
-      evidence: {
-        plate: evidence.plate,
-        traffic: evidence.traffic,
-        owner: evidence.owner,
+      if (
+        cycleEvidence.traffic
+        && trafficBackupExpected
+      ) {
+        const payload = channelPayload(
+          cycleEvidence.traffic,
+        )
+        const text = isValidTrafficEvidence(
+          cycleEvidence.traffic,
+        )
+          ? `交警备用视频流真实识别：${payload.gesture_name || payload.gesture}`
+          : '交警备用视频流本轮未识别到明确手势'
+
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] ${text}`,
+        )
+      }
+    } else {
+      const error = trafficSettled.reason
+      if (!isAbortLikeError(error)) {
+        channelErrors.traffic = (
+          error?.message || String(error)
+        )
+        addFusionEvent(
+          `[第 ${cycleNumber} 轮] 交警备用视频流读取失败：${channelErrors.traffic}`,
+          { force: true },
+        )
+      }
+    }
+
+    if (!isCurrentRun()) return
+
+    if (
+      isFreshCameraEvidence(evidence.owner)
+      && isValidOwnerEvidence(evidence.owner)
+    ) {
+      cycleEvidence.owner = evidence.owner
+    }
+
+    evidence.plate = cycleEvidence.plate
+    evidence.traffic = cycleEvidence.traffic
+    evidence.owner = cycleEvidence.owner
+
+    const data = await apiPostWithFusionTimeout(
+      '/api/fusion/monitor/decision',
+      {
+        save: true,
+        cycle: cycleNumber,
+        evidence: cycleEvidence,
+        monitor_context: {
+          plate_expected: Boolean(currentPlateSource),
+          plate_source_id: (
+            currentPlateSource?.source_id
+            || currentPlateSource?.id
+            || livePreviewSourceId.value
+            || 'plate_source'
+          ),
+          plate_source_name: (
+            currentPlateSource?.name
+            || selectedLivePreviewSource.value?.name
+            || '车牌视频源'
+          ),
+          plate_error: channelErrors.plate,
+          traffic_source_expected: trafficBackupExpected,
+          traffic_source_id: (
+            selectedTrafficSource.value?.source_id
+            || selectedTrafficSource.value?.id
+            || 'traffic_source'
+          ),
+          traffic_source_name: (
+            selectedTrafficSource.value?.name
+            || '交警备用视频源'
+          ),
+          traffic_error: channelErrors.traffic,
+        },
       },
+      rootController.signal,
+      FUSION_DECISION_TIMEOUT_MS,
+    )
+
+    if (!isCurrentRun()) return
+
+    const createdAlerts = (
+      data?.monitor_alerts?.created || []
+    )
+
+    createdAlerts.forEach((item) => {
+      const label = (
+        item.anomaly_type === 'plate_not_detected'
+          ? '连续未检测到车牌'
+          : item.anomaly_type === 'plate_source_failed'
+            ? '车牌视频源连续读取失败'
+            : '交警备用视频源连续读取失败'
+      )
+
+      addFusionEvent(
+        `[第 ${cycleNumber} 轮] 已生成告警并进入邮件通知队列：${label}（告警 ID ${item.alert_id}）`,
+        { force: true },
+      )
     })
 
     currentDecisionRaw.value = data?.decision || data
+
+    const decision = currentDecision.value || {}
+    const validCount = Number(
+      decision.evidence_integrity?.valid_channel_count
+      || 0,
+    )
+
     addFusionEvent(
-      `融合分析：${riskLabel(currentDecision.value?.risk_level)}，${currentDecision.value?.scenario || '完成'}`,
+      `[第 ${cycleNumber} 轮] 融合结论：${decision.scenario || '本轮无有效事件'}；有效通道 ${validCount}`,
+      { force: true },
     )
   } catch (error) {
-    addFusionEvent(`融合监控异常：${error.message}`)
+    if (
+      isCurrentRun()
+      && !isAbortLikeError(error)
+    ) {
+      addFusionEvent(
+        `[第 ${cycleNumber} 轮] 融合监控异常：${error.message}`,
+        { force: true },
+      )
+    }
   } finally {
-    loading.fusion = false
+    if (fusionCycleController === rootController) {
+      fusionCycleController = null
+    }
+
+    if (runToken === fusionRunToken) {
+      loading.fusion = false
+    }
   }
 }
 
 function startFusionMonitor() {
-  if (!selectedPlateSourceId.value || !selectedTrafficSourceId.value) {
-    globalError.value = '请先选择车牌视频源和交警手势视频源'
+  if (!selectedPlateSourceId.value && !livePreviewSourceId.value) {
+    globalError.value = '请先选择车牌视频源或沙盘实时预览；交警手势可直接使用下方电脑摄像头'
     return
   }
 
   globalError.value = ''
   stopFusionMonitor()
+  fusionRunToken += 1
   fusionMonitor.running = true
   fusionMonitor.cycle = 0
 
-  // 自动打开实时视频预览
   if (selectedPlateSourceId.value && !livePreviewSourceId.value) {
     const plateSrc = selectedPlateSource.value
     livePreviewSourceId.value = plateSrc?.source_id || ''
@@ -2368,7 +3159,7 @@ function startFusionMonitor() {
     streamLoading.value = true
   }
 
-  addFusionEvent('融合监控已启动')
+  addFusionEvent('融合监控已启动：时间线只记录当前轮次真实接口结果', { force: true })
   runFusionCycle()
 
   fusionTimer.value = window.setInterval(
@@ -2383,17 +3174,218 @@ function stopFusionMonitor() {
     fusionTimer.value = null
   }
 
-  if (fusionMonitor.running) {
-    addFusionEvent('融合监控已停止')
+  const wasRunning = fusionMonitor.running
+
+  fusionRunToken += 1
+  fusionMonitor.running = false
+
+  if (fusionCycleController) {
+    fusionCycleController.abort(
+      'fusion_monitor_stopped',
+    )
+    fusionCycleController = null
   }
 
-  fusionMonitor.running = false
+  loading.fusion = false
+  evidence.plate = null
+
+  if (wasRunning) {
+    addFusionEvent(
+      '融合监控已停止：当前轮次请求已取消',
+      { force: true },
+    )
+  }
+}
+
+function emitCameraTimelineEvent(channelName, payload, type) {
+  const resultPayload = channelPayload(payload)
+  const gesture = String(resultPayload.gesture || '')
+  const valid = type === 'traffic'
+    ? isValidTrafficEvidence(payload)
+    : isValidOwnerEvidence(payload)
+
+  if (!valid) return
+
+  const signature = `${gesture}:${resultPayload.action || ''}`
+  const state = lastCameraEvent[type]
+  const now = Date.now()
+  if (state.signature === signature && now - state.at < 3000) return
+
+  state.signature = signature
+  state.at = now
+  addFusionEvent(
+    `${channelName}真实识别：${resultPayload.gesture_name || gesture}${resultPayload.traffic_command ? `；${resultPayload.traffic_command}` : ''}`,
+  )
+}
+
+function handleTrafficEvidence(payload) {
+  const normalized = {
+    ...payload,
+    captured_at: payload?.captured_at || new Date().toISOString(),
+    received_at_ms: Date.now(),
+  }
+  evidence.traffic = normalized
+  emitCameraTimelineEvent('交警电脑摄像头', normalized, 'traffic')
 }
 
 function handleOwnerEvidence(payload) {
-  evidence.owner = payload
-  addFusionEvent(`车主摄像头：${ownerEvidenceText.value}`)
+  const normalized = {
+    ...payload,
+    captured_at: payload?.captured_at || payload?.created_at || new Date().toISOString(),
+    received_at_ms: Date.now(),
+  }
+  evidence.owner = normalized
+  emitCameraTimelineEvent('车主电脑摄像头', normalized, 'owner')
 }
+
+
+function resetUserSourceForm() {
+  Object.assign(userSourceForm, {
+    source_key: '',
+    name: '',
+    source_type: 'plate',
+    source_id: '',
+    source_url: '',
+    protocol: 'rtsp',
+    use_mock_frame: false,
+    demo_file: '',
+    frame_count: 20,
+    sample_interval: 5,
+    warmup_frames: 3,
+    enabled: true,
+    description: '',
+  })
+}
+
+function openNewSourceEditor() {
+  editingSourceId.value = null
+  resetUserSourceForm()
+  sourceEditorOpen.value = true
+}
+
+function closeSourceEditor() {
+  sourceEditorOpen.value = false
+  editingSourceId.value = null
+  resetUserSourceForm()
+}
+
+function editUserSource(item) {
+  if (!item?.can_manage) return
+
+  editingSourceId.value = item.id
+  sourceEditorOpen.value = true
+
+  Object.assign(userSourceForm, {
+    source_key: item.source_key || '',
+    name: item.name || '',
+    source_type: item.source_type || 'plate',
+    source_id: item.source_id || '',
+    source_url: item.source_url || '',
+    protocol: item.protocol || 'rtsp',
+    use_mock_frame: Boolean(item.use_mock_frame),
+    demo_file: item.demo_file || '',
+    frame_count: Number(item.frame_count || 20),
+    sample_interval: Number(item.sample_interval || 5),
+    warmup_frames: Number(item.warmup_frames || 3),
+    enabled: item.enabled !== false,
+    description: item.description || '',
+  })
+}
+
+function userSourcePayload() {
+  return {
+    source_key: userSourceForm.source_key,
+    name: userSourceForm.name,
+    source_type: userSourceForm.source_type,
+    source_id: userSourceForm.source_id,
+    source_url: userSourceForm.source_url,
+    protocol: userSourceForm.protocol,
+    use_mock_frame: userSourceForm.use_mock_frame,
+    demo_file: userSourceForm.demo_file,
+    frame_count: Number(userSourceForm.frame_count || 20),
+    sample_interval: Number(
+      userSourceForm.sample_interval || 5,
+    ),
+    warmup_frames: Number(userSourceForm.warmup_frames || 3),
+    enabled: userSourceForm.enabled,
+    description: userSourceForm.description,
+  }
+}
+
+async function saveUserSource() {
+  if (
+    !userSourceForm.name
+    || (
+      !userSourceForm.source_id
+      && !userSourceForm.source_url
+      && !userSourceForm.demo_file
+    )
+  ) {
+    globalError.value = (
+      '视频源名称不能为空，源 ID、流地址或 Demo 文件至少填写一项'
+    )
+    return
+  }
+
+  sourceSaving.value = true
+  globalError.value = ''
+
+  try {
+    const payload = userSourcePayload()
+
+    if (editingSourceId.value) {
+      await apiPut(
+        `/api/video-sources/${editingSourceId.value}`,
+        payload,
+      )
+    } else {
+      await apiPost('/api/video-sources', payload)
+    }
+
+    closeSourceEditor()
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  } finally {
+    sourceSaving.value = false
+  }
+}
+
+async function toggleUserSource(item) {
+  if (!item?.can_manage) return
+
+  try {
+    await apiPut(
+      `/api/video-sources/${item.id}`,
+      {
+        enabled: !item.enabled,
+      },
+    )
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  }
+}
+
+async function removeUserSource(item) {
+  if (!item?.can_manage) return
+
+  if (
+    !window.confirm(
+      `确定删除视频源“${item.name}”吗？`,
+    )
+  ) {
+    return
+  }
+
+  try {
+    await apiDelete(`/api/video-sources/${item.id}`)
+    await refreshAll()
+  } catch (error) {
+    globalError.value = error.message
+  }
+}
+
 
 async function checkSource(item) {
   checkingSourceId.value = item.id
@@ -2510,6 +3502,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopFusionMonitor()
+  clearStreamTimers()
   revokePreviewUrl(plateUpload)
   revokePreviewUrl(trafficUpload)
 })
@@ -4002,6 +4995,167 @@ button.secondary {
   color: #6ee7b7;
 }
 
+.user-source-editor {
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 14px;
+  background: rgba(8, 47, 73, 0.18);
+}
+
+.source-editor-heading,
+.source-form-buttons,
+.source-form-options,
+.source-badges {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.source-editor-heading,
+.source-form-buttons {
+  justify-content: space-between;
+}
+
+.source-editor-heading h3 {
+  margin: 4px 0 14px;
+}
+
+.source-editor-heading span,
+.plate-evidence-heading span {
+  color: #22d3ee;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.user-source-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.user-source-form-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+.user-source-form-grid input,
+.user-source-form-grid select,
+.user-source-form-grid textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 11px;
+  border: 1px solid #26354d;
+  border-radius: 9px;
+  background: #07111f;
+  color: #e2e8f0;
+}
+
+.source-form-wide {
+  grid-column: span 2;
+}
+
+.source-form-options {
+  margin-top: 12px;
+}
+
+.source-form-options label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.source-form-buttons {
+  margin-top: 14px;
+  justify-content: flex-end;
+}
+
+.source-main-info {
+  min-width: 0;
+}
+
+.source-main-info small {
+  display: block;
+  margin-top: 7px;
+  color: #94a3b8;
+}
+
+.source-owner-badge,
+.source-enabled-badge {
+  padding: 3px 7px;
+  border-radius: 999px;
+}
+
+.source-owner-badge.shared {
+  background: rgba(59, 130, 246, 0.13);
+  color: #93c5fd;
+}
+
+.source-owner-badge.mine {
+  background: rgba(16, 185, 129, 0.13);
+  color: #6ee7b7;
+}
+
+.source-enabled-badge.enabled {
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
+}
+
+.source-enabled-badge.disabled {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+}
+
+.danger-button {
+  border-color: rgba(248, 113, 113, 0.4) !important;
+  color: #fca5a5 !important;
+}
+
+.primary-action.compact {
+  width: auto;
+  padding: 9px 14px;
+}
+
+.plate-evidence-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0 8px;
+}
+
+.plate-evidence-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.plate-evidence-heading b {
+  color: #67e8f9;
+}
+
+.plate-evidence-heading.video-summary {
+  margin-top: 22px;
+}
+
+.batch-evidence-groups {
+  display: grid;
+  gap: 12px;
+  flex: 1;
+}
+
+.batch-evidence-title {
+  display: block;
+  margin-bottom: 7px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.batch-plate-tag.aggregate {
+  border-color: rgba(99, 102, 241, 0.28);
+  background: rgba(79, 70, 229, 0.12);
+}
+
 .alert-summary {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-bottom: 14px;
@@ -4102,6 +5256,14 @@ th {
 }
 
 @media (max-width: 720px) {
+  .user-source-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .source-form-wide {
+    grid-column: span 1;
+  }
+
   .user-main {
     padding: 15px;
   }

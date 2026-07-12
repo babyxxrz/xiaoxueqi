@@ -83,26 +83,42 @@ GESTURE_PRIORITY = [
 ]
 
 
-_pose_local = threading.local()
+_pose_model_lock = threading.RLock()
+_pose_models: dict[bool, Any] = {}
+_pose_process_locks = {
+    True: threading.RLock(),
+    False: threading.RLock(),
+}
 
 
 def _get_pose(static_image_mode: bool):
+    """
+    复用 MediaPipe Pose 实例。
+
+    旧实现使用 threading.local()，FastAPI 线程池可能让相邻摄像头帧落到
+    不同线程，从而重复初始化模型并丢失 tracking 状态。现在静态图片和
+    实时流分别复用一个实例，并在 process 阶段加锁。
+    """
     if mp is None:
         raise RuntimeError("未安装 mediapipe。请先执行：pip install mediapipe")
 
-    key = "static_pose" if static_image_mode else "stream_pose"
-    pose = getattr(_pose_local, key, None)
+    mode = bool(static_image_mode)
+    pose = _pose_models.get(mode)
+    if pose is not None:
+        return pose
 
-    if pose is None:
-        pose = mp.solutions.pose.Pose(
-            static_image_mode=static_image_mode,
-            model_complexity=1,
-            smooth_landmarks=not static_image_mode,
-            enable_segmentation=False,
-            min_detection_confidence=0.50,
-            min_tracking_confidence=0.50,
-        )
-        setattr(_pose_local, key, pose)
+    with _pose_model_lock:
+        pose = _pose_models.get(mode)
+        if pose is None:
+            pose = mp.solutions.pose.Pose(
+                static_image_mode=mode,
+                model_complexity=1 if mode else 0,
+                smooth_landmarks=not mode,
+                enable_segmentation=False,
+                min_detection_confidence=0.50,
+                min_tracking_confidence=0.50,
+            )
+            _pose_models[mode] = pose
 
     return pose
 
@@ -235,6 +251,8 @@ def classify_traffic_gesture(points: dict[int, dict]) -> dict:
             "confidence": 0.0,
             "features": {"reason": "missing_required_keypoints"},
             "rule_scores": {},
+            "matched_rule": "none",
+            "classifier_type": "rule_based_pose_score",
         }
 
     if any(not point_ok(points[index], 0.22) for index in required_ids):
@@ -243,6 +261,8 @@ def classify_traffic_gesture(points: dict[int, dict]) -> dict:
             "confidence": 0.30,
             "features": {"reason": "low_visibility_keypoints"},
             "rule_scores": {},
+            "matched_rule": "none",
+            "classifier_type": "rule_based_pose_score",
         }
 
     nose = points.get(0)
@@ -496,8 +516,14 @@ def recognize_traffic_gesture_frame(
     image_bgr: np.ndarray,
     output_path: Path | None = None,
     static_image_mode: bool = True,
+    draw_annotation: bool = True,
 ) -> dict:
-    """对一帧 BGR 图像执行人体姿态检测和交警手势规则分类。"""
+    """
+    对一帧 BGR 图像执行人体姿态检测和交警手势规则分类。
+
+    实时摄像头调用时可设置 draw_annotation=False，跳过后端骨架绘制、
+    PIL 中文文字渲染和文件写盘，只返回关键点与分类结果。
+    """
     if mp is None:
         raise RuntimeError("未安装 mediapipe。请先执行：pip install mediapipe")
 
@@ -507,23 +533,28 @@ def recognize_traffic_gesture_frame(
     started = time.perf_counter()
     image_height, image_width = image_bgr.shape[:2]
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image_rgb.flags.writeable = False
 
     pose = _get_pose(static_image_mode=static_image_mode)
-    results = pose.process(image_rgb)
+    with _pose_process_locks[bool(static_image_mode)]:
+        results = pose.process(image_rgb)
+
+    should_draw = bool(draw_annotation or output_path is not None)
 
     if not results.pose_landmarks:
-        output_image = draw_chinese_label(
-            image_bgr.copy(),
-            "未检测到人体姿态",
-            30,
-            30,
-            background_rgb=(180, 90, 0),
-        )
+        if should_draw:
+            output_image = draw_chinese_label(
+                image_bgr.copy(),
+                "未检测到人体姿态",
+                30,
+                30,
+                background_rgb=(180, 90, 0),
+            )
 
-        if output_path is not None:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(output_path), output_image):
-                raise RuntimeError("交警手势识别标注图保存失败")
+            if output_path is not None:
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                if not cv2.imwrite(str(output_path), output_image):
+                    raise RuntimeError("交警手势识别标注图保存失败")
 
         return {
             "model": "MediaPipe Pose",
@@ -538,6 +569,7 @@ def recognize_traffic_gesture_frame(
             "matched_rule": "none",
             "classifier_type": "rule_based_pose_score",
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "fast_mode": not should_draw,
         }
 
     landmarks = [
@@ -551,22 +583,23 @@ def recognize_traffic_gesture_frame(
     command_info = TRAFFIC_COMMANDS.get(gesture, TRAFFIC_COMMANDS["unknown"])
     keypoints = [points[index] for index in POSE_LANDMARK_NAMES if index in points]
 
-    output_image = image_bgr.copy()
-    mp.solutions.drawing_utils.draw_landmarks(
-        output_image,
-        results.pose_landmarks,
-        mp.solutions.pose.POSE_CONNECTIONS,
-        landmark_drawing_spec=mp.solutions.drawing_styles.get_default_pose_landmarks_style(),
-    )
+    if should_draw:
+        output_image = image_bgr.copy()
+        mp.solutions.drawing_utils.draw_landmarks(
+            output_image,
+            results.pose_landmarks,
+            mp.solutions.pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=mp.solutions.drawing_styles.get_default_pose_landmarks_style(),
+        )
 
-    label = f"{command_info['gesture_name']} {classify_result['confidence']:.2f}"
-    output_image = draw_chinese_label(output_image, label, 30, 30)
+        label = f"{command_info['gesture_name']} {classify_result['confidence']:.2f}"
+        output_image = draw_chinese_label(output_image, label, 30, 30)
 
-    if output_path is not None:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(output_path), output_image):
-            raise RuntimeError("交警手势识别标注图保存失败")
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(output_path), output_image):
+                raise RuntimeError("交警手势识别标注图保存失败")
 
     return {
         "model": "MediaPipe Pose",
@@ -576,11 +609,18 @@ def recognize_traffic_gesture_frame(
         "confidence": classify_result["confidence"],
         "landmarks": landmarks,
         "keypoints": keypoints,
-        "features": classify_result["features"],
-        "rule_scores": classify_result["rule_scores"],
-        "matched_rule": classify_result["matched_rule"],
-        "classifier_type": classify_result["classifier_type"],
+        "features": classify_result.get("features", {}),
+        "rule_scores": classify_result.get("rule_scores", {}),
+        "matched_rule": classify_result.get(
+            "matched_rule",
+            gesture if gesture != "unknown" else "none",
+        ),
+        "classifier_type": classify_result.get(
+            "classifier_type",
+            "rule_based_pose_score",
+        ),
         "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        "fast_mode": not should_draw,
     }
 
 

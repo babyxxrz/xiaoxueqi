@@ -686,10 +686,13 @@ function recordResultSummary(item) {
 
   if (item.task_type === 'plate') {
     const plates = Array.isArray(result.plates) ? result.plates : []
-    const numbers = plates
-      .map((plate) => plate.plate_number || plate.plate || plate.text)
-      .filter(Boolean)
-    return numbers.length ? numbers.slice(0, 3).join('、') : '未识别到有效车牌'
+    const values = plates.map((plate) => {
+      const number = plate.plate_number || plate.plate || plate.text
+      if (!number) return ''
+      const color = plate.plate_color || plate.color || '未知颜色'
+      return `${number}（${color}）`
+    }).filter(Boolean)
+    return values.length ? values.slice(0, 3).join('、') : '未识别到有效车牌'
   }
 
   if (item.task_type === 'traffic_gesture') {

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
@@ -96,8 +96,48 @@ def normalize_bbox(raw_box: Any, image_width: int, image_height: int) -> list[in
         return fallback
 
 
+PLATE_TYPE_COLOR_MAP = {
+    -1: "未知",
+    0: "蓝牌",
+    1: "黄牌",
+    2: "白牌",
+    3: "绿牌",
+    4: "黑牌",
+    5: "黑牌",
+    6: "黑牌",
+    7: "黑牌",
+    8: "黑牌",
+    9: "黄牌",
+}
+
+
+def _plate_type_index(plate_type: Any) -> int | None:
+    if plate_type is None or isinstance(plate_type, bool):
+        return None
+
+    if isinstance(plate_type, (int, np.integer)):
+        return int(plate_type)
+
+    text = str(plate_type).strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+
+    return None
+
+
 def infer_plate_color(plate_number: str, plate_type: Any = None) -> str:
-    text = str(plate_type or "")
+    """
+    将 HyperLPR3 的 plate_type 转换为中文车牌颜色。
+
+    HyperLPR3 0.1.3 返回的类型索引为：
+    0 蓝牌、1 单层黄牌、2 白牌、3 新能源绿牌、
+    4~8 黑色港澳类车牌、9 双层黄牌。
+    """
+    type_index = _plate_type_index(plate_type)
+    if type_index in PLATE_TYPE_COLOR_MAP:
+        return PLATE_TYPE_COLOR_MAP[type_index]
+
+    text = str(plate_type or "").strip()
 
     if "绿" in text or "新能源" in text:
         return "绿牌"
@@ -107,14 +147,133 @@ def infer_plate_color(plate_number: str, plate_type: Any = None) -> str:
         return "蓝牌"
     if "白" in text:
         return "白牌"
-    if "黑" in text:
+    if "黑" in text or "港" in text or "澳" in text:
         return "黑牌"
 
-    # 新能源车牌一般为 8 位字符，普通车牌一般为 7 位字符。
     if len(plate_number) >= 8:
         return "绿牌"
 
-    return "蓝牌"
+    return "未知"
+
+
+def estimate_plate_color_from_crop(
+    image_bgr: np.ndarray | None,
+    bbox: list[int],
+) -> dict:
+    """
+    使用车牌框内 HSV 像素比例对颜色做轻量复核。
+
+    该步骤只用于纠正明显的黄/蓝/绿分类冲突，不替代 HyperLPR3
+    自带的车牌类型分类器。
+    """
+    empty = {
+        "dominant_color": "未知",
+        "yellow_ratio": 0.0,
+        "blue_ratio": 0.0,
+        "green_ratio": 0.0,
+        "confidence": 0.0,
+    }
+
+    if image_bgr is None or not isinstance(image_bgr, np.ndarray):
+        return empty
+
+    height, width = image_bgr.shape[:2]
+    if width <= 0 or height <= 0:
+        return empty
+
+    x1, y1, x2, y2 = normalize_bbox(bbox, width, height)
+    if x2 <= x1 or y2 <= y1:
+        return empty
+
+    crop = image_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return empty
+
+    crop_height, crop_width = crop.shape[:2]
+    pad_x = max(1, int(crop_width * 0.05))
+    pad_y = max(1, int(crop_height * 0.08))
+    if crop_width > pad_x * 2 and crop_height > pad_y * 2:
+        crop = crop[pad_y:crop_height - pad_y, pad_x:crop_width - pad_x]
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    total_pixels = max(1, hsv.shape[0] * hsv.shape[1])
+
+    yellow_mask = cv2.inRange(
+        hsv,
+        np.array([14, 70, 55], dtype=np.uint8),
+        np.array([42, 255, 255], dtype=np.uint8),
+    )
+    blue_mask = cv2.inRange(
+        hsv,
+        np.array([88, 65, 45], dtype=np.uint8),
+        np.array([138, 255, 255], dtype=np.uint8),
+    )
+    green_mask = cv2.inRange(
+        hsv,
+        np.array([38, 55, 45], dtype=np.uint8),
+        np.array([88, 255, 255], dtype=np.uint8),
+    )
+
+    ratios = {
+        "黄牌": float(cv2.countNonZero(yellow_mask)) / total_pixels,
+        "蓝牌": float(cv2.countNonZero(blue_mask)) / total_pixels,
+        "绿牌": float(cv2.countNonZero(green_mask)) / total_pixels,
+    }
+    dominant_color, confidence = max(
+        ratios.items(),
+        key=lambda item: item[1],
+    )
+
+    if confidence < 0.10:
+        dominant_color = "未知"
+
+    return {
+        "dominant_color": dominant_color,
+        "yellow_ratio": round(ratios["黄牌"], 4),
+        "blue_ratio": round(ratios["蓝牌"], 4),
+        "green_ratio": round(ratios["绿牌"], 4),
+        "confidence": round(confidence, 4),
+    }
+
+
+def resolve_plate_color(
+    plate_number: str,
+    plate_type: Any,
+    image_bgr: np.ndarray | None,
+    bbox: list[int],
+) -> tuple[str, str, dict]:
+    model_color = infer_plate_color(plate_number, plate_type)
+    visual = estimate_plate_color_from_crop(image_bgr, bbox)
+    visual_color = visual["dominant_color"]
+    visual_confidence = float(visual["confidence"])
+
+    if (
+        visual_color == "黄牌"
+        and visual_confidence >= 0.12
+        and float(visual["yellow_ratio"])
+        >= max(0.12, float(visual["blue_ratio"]) * 1.25)
+        and model_color in {"未知", "蓝牌"}
+    ):
+        return "黄牌", "hsv_override", visual
+
+    if (
+        visual_color == "蓝牌"
+        and visual_confidence >= 0.14
+        and model_color == "未知"
+    ):
+        return "蓝牌", "hsv_fallback", visual
+
+    if (
+        visual_color == "绿牌"
+        and visual_confidence >= 0.16
+        and model_color == "未知"
+    ):
+        return "绿牌", "hsv_fallback", visual
+
+    if model_color != "未知":
+        return model_color, "hyperlpr_type", visual
+
+    return "蓝牌", "default_fallback", visual
 
 
 def _looks_like_bbox(value: Any) -> bool:
@@ -128,7 +287,12 @@ def _looks_like_bbox(value: Any) -> bool:
         return False
 
 
-def normalize_hyperlpr_result(item: Any, image_width: int, image_height: int) -> dict:
+def normalize_hyperlpr_result(
+    item: Any,
+    image_width: int,
+    image_height: int,
+    image_bgr: np.ndarray | None = None,
+) -> dict:
     """
     将不同版本 HyperLPR3 返回结果统一为：
     plate_number / plate_color / confidence / bbox / raw_type。
@@ -143,6 +307,7 @@ def normalize_hyperlpr_result(item: Any, image_width: int, image_height: int) ->
             item.get("code")
             or item.get("plate")
             or item.get("plate_number")
+            or item.get("plate_code")
             or item.get("text")
             or item.get("license")
             or ""
@@ -156,13 +321,15 @@ def normalize_hyperlpr_result(item: Any, image_width: int, image_height: int) ->
         )
         plate_type = (
             item.get("type")
-            or item.get("plate_type")
-            or item.get("color")
-            or item.get("plate_color")
+            if item.get("type") is not None
+            else item.get("plate_type")
         )
+        if plate_type is None:
+            plate_type = item.get("color") or item.get("plate_color")
         raw_box = (
             item.get("box")
             or item.get("bbox")
+            or item.get("det_bound_box")
             or item.get("points")
             or item.get("vertex")
         )
@@ -173,19 +340,31 @@ def normalize_hyperlpr_result(item: Any, image_width: int, image_height: int) ->
         if len(item) >= 2:
             confidence = safe_float(item[1])
 
+        if len(item) >= 3:
+            plate_type = item[2]
+        if len(item) >= 4 and _looks_like_bbox(item[3]):
+            raw_box = item[3]
+
         for part in item[2:]:
             if raw_box is None and _looks_like_bbox(part):
                 raw_box = part
-            elif plate_type is None and isinstance(part, (str, int, float)):
+            elif plate_type is None and isinstance(part, (str, int, float, np.integer)):
                 plate_type = part
 
     plate_number = normalize_plate_number(plate_number)
     bbox = normalize_bbox(raw_box, image_width, image_height)
-    plate_color = infer_plate_color(plate_number, plate_type)
+    plate_color, color_source, color_scores = resolve_plate_color(
+        plate_number=plate_number,
+        plate_type=plate_type,
+        image_bgr=image_bgr,
+        bbox=bbox,
+    )
 
     return {
         "plate_number": plate_number,
         "plate_color": plate_color,
+        "plate_color_source": color_source,
+        "plate_color_scores": color_scores,
         "confidence": round(max(0.0, min(confidence, 1.0)), 4),
         "bbox": bbox,
         "raw_type": str(plate_type) if plate_type is not None else "",
@@ -284,29 +463,81 @@ def draw_label_with_pil(
     return cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
 
 
+def draw_plate_annotations(
+    image_bgr: np.ndarray,
+    plates: list[dict] | None,
+    output_path: Path | None = None,
+) -> np.ndarray:
+    """使用已有 OCR 结果绘制车牌标注图，不再次调用 HyperLPR3。"""
+    if image_bgr is None or not isinstance(image_bgr, np.ndarray):
+        raise RuntimeError("车牌标注输入图像为空或格式错误")
+
+    image = image_bgr.copy()
+    plate_items = [item for item in (plates or []) if isinstance(item, dict)]
+
+    for item in plate_items:
+        x1, y1, x2, y2 = normalize_bbox(
+            item.get("bbox") or [0, 0, 0, 0],
+            image.shape[1],
+            image.shape[0],
+        )
+        confidence = safe_float(item.get("confidence"), 0.0)
+        box_color = (0, 255, 0) if confidence >= 0.6 else (0, 165, 255)
+        cv2.rectangle(image, (x1, y1), (x2, y2), box_color, 3)
+
+        number = item.get("plate_number") or item.get("plate") or item.get("text") or "未解析车牌"
+        color = item.get("plate_color") or item.get("color") or "未知颜色"
+        image = draw_label_with_pil(
+            image,
+            f"{number} {color} {confidence:.2f}",
+            x1,
+            y1,
+            background_rgb=(0, 150, 0) if confidence >= 0.6 else (220, 120, 0),
+        )
+
+    if not plate_items:
+        image = draw_label_with_pil(
+            image,
+            "未检测到车牌",
+            30,
+            60,
+            background_rgb=(180, 90, 0),
+        )
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(output_path), image):
+            raise RuntimeError("车牌最佳帧标注图保存失败")
+
+    return image
+
+
 def recognize_plate_frame(
     image_bgr: np.ndarray,
     output_path: Path | None = None,
     force_confidence: float | None = None,
     min_confidence: float = 0.0,
+    draw_annotation: bool = True,
 ) -> dict:
     """
     对一帧 BGR 图像执行 HyperLPR3 多车牌检测与 OCR。
 
-    返回字段始终包含 plates、plate_count、latency_ms，方便图片、视频流和前端统一处理。
+    draw_annotation=False 时跳过 PIL 中文标注和图像写盘，适用于
+    批量视频与融合监控的高频抽帧识别。
     """
     if image_bgr is None or not isinstance(image_bgr, np.ndarray):
         raise RuntimeError("输入图像为空或格式错误")
 
     started = time.perf_counter()
-    image = image_bgr.copy()
-    height, width = image.shape[:2]
+    height, width = image_bgr.shape[:2]
+    should_draw = bool(draw_annotation or output_path is not None)
+    image = image_bgr.copy() if should_draw else None
 
     catcher = get_lpr_catcher()
 
-    # HyperLPR3 推理对象可能不是线程安全的，多路流并发时统一串行调用该模型实例。
     with _lpr_lock:
-        raw_results = catcher(image)
+        raw_results = catcher(image_bgr)
 
     if raw_results is None:
         raw_items: list[Any] = []
@@ -320,7 +551,12 @@ def recognize_plate_frame(
     plates: list[dict] = []
 
     for item in raw_items:
-        plate = normalize_hyperlpr_result(item, width, height)
+        plate = normalize_hyperlpr_result(
+            item,
+            width,
+            height,
+            image_bgr=image_bgr,
+        )
 
         if not plate["plate_number"]:
             continue
@@ -335,42 +571,12 @@ def recognize_plate_frame(
 
     plates = deduplicate_plates(plates)
 
-    for plate in plates:
-        x1, y1, x2, y2 = plate["bbox"]
-        confidence = float(plate["confidence"])
-        box_color = (0, 255, 0) if confidence >= 0.6 else (0, 165, 255)
-
-        cv2.rectangle(image, (x1, y1), (x2, y2), box_color, 3)
-
-        label = (
-            f"{plate['plate_number']} "
-            f"{plate['plate_color']} "
-            f"{confidence:.2f}"
+    if should_draw:
+        image = draw_plate_annotations(
+            image_bgr=image_bgr,
+            plates=plates,
+            output_path=output_path,
         )
-        image = draw_label_with_pil(
-            image,
-            label,
-            x1,
-            y1,
-            background_rgb=(0, 150, 0) if confidence >= 0.6 else (220, 120, 0),
-        )
-
-    if not plates:
-        image = draw_label_with_pil(
-            image,
-            "未检测到车牌",
-            30,
-            60,
-            background_rgb=(180, 90, 0),
-        )
-
-    if output_path is not None:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        success = cv2.imwrite(str(output_path), image)
-
-        if not success:
-            raise RuntimeError("识别标注图保存失败")
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
@@ -382,6 +588,7 @@ def recognize_plate_frame(
         "image_width": width,
         "image_height": height,
         "multi_plate_supported": True,
+        "fast_mode": not should_draw,
     }
 
 

@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <section class="camera-panel">
     <div class="camera-heading">
       <div>
@@ -31,8 +31,19 @@
           <button v-else class="secondary" @click="stopCamera">关闭摄像头</button>
           <button :disabled="!cameraRunning || loopRunning" @click="startLoop">开始实时识别</button>
           <button class="danger" :disabled="!loopRunning" @click="stopLoop">停止识别</button>
-          <button class="secondary" :disabled="!cameraRunning || requesting" @click="captureAndRecognize">
-            单次识别
+          <button
+            class="secondary single-recognition-button"
+            :disabled="!cameraRunning || loopRunning || requesting"
+            :aria-busy="requesting"
+            @click="captureAndRecognize"
+          >
+            {{
+              loopRunning
+                ? '实时识别中'
+                : requesting
+                  ? '识别中...'
+                  : '单次识别'
+            }}
           </button>
         </div>
 
@@ -104,11 +115,15 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref } from 'vue'
 import { API_BASE, authHeaders } from '../api'
 
+const emit = defineEmits(['recognized'])
+
 const videoRef = ref(null)
 const overlayCanvasRef = ref(null)
 const captureCanvasRef = ref(null)
 const streamRef = ref(null)
 const timerRef = ref(null)
+const abortControllerRef = ref(null)
+const drawFrameRef = ref(null)
 
 const cameraRunning = ref(false)
 const loopRunning = ref(false)
@@ -204,24 +219,38 @@ function stopCamera() {
 }
 
 function startLoop() {
-  if (!cameraRunning.value) return
+  if (!cameraRunning.value || loopRunning.value) return
   stopLoop()
   loopRunning.value = true
-  captureAndRecognize()
-  timerRef.value = window.setInterval(captureAndRecognize, 400)
+  runLoopStep()
+}
+
+async function runLoopStep() {
+  if (!loopRunning.value || !cameraRunning.value) return
+
+  await captureAndRecognize()
+
+  if (loopRunning.value && cameraRunning.value) {
+    // 请求完成后再发下一帧，彻底避免 setInterval 造成的请求堆积。
+    timerRef.value = window.setTimeout(runLoopStep, 70)
+  }
 }
 
 function stopLoop() {
+  loopRunning.value = false
+
   if (timerRef.value) {
-    window.clearInterval(timerRef.value)
+    window.clearTimeout(timerRef.value)
     timerRef.value = null
   }
-  loopRunning.value = false
+
+  abortControllerRef.value?.abort()
+  abortControllerRef.value = null
 }
 
 function canvasToBlob(canvas) {
   return new Promise((resolve) => {
-    canvas.toBlob(resolve, 'image/jpeg', 0.55)
+    canvas.toBlob(resolve, 'image/jpeg', 0.42)
   })
 }
 
@@ -238,9 +267,14 @@ async function captureAndRecognize() {
 
   try {
     const scale = Math.min(1, 320 / video.videoWidth)
-    canvas.width = Math.round(video.videoWidth * scale)
-    canvas.height = Math.round(video.videoHeight * scale)
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height)
+    const targetWidth = Math.round(video.videoWidth * scale)
+    const targetHeight = Math.round(video.videoHeight * scale)
+
+    if (canvas.width !== targetWidth) canvas.width = targetWidth
+    if (canvas.height !== targetHeight) canvas.height = targetHeight
+
+    const captureContext = canvas.getContext('2d', { alpha: false })
+    captureContext.drawImage(video, 0, 0, canvas.width, canvas.height)
 
     const blob = await canvasToBlob(canvas)
     if (!blob) throw new Error('摄像头帧生成失败')
@@ -248,12 +282,25 @@ async function captureAndRecognize() {
     const formData = new FormData()
     formData.append('file', blob, `traffic_camera_${Date.now()}.jpg`)
 
+    const controller = new AbortController()
+    abortControllerRef.value = controller
+    const timeoutId = window.setTimeout(() => controller.abort(), 5000)
+
     const started = performance.now()
-    const response = await fetch(`${API_BASE}/api/gesture/traffic/camera-fast-frame`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: formData,
-    })
+    let response
+    try {
+      response = await fetch(`${API_BASE}/api/gesture/traffic/camera-fast-frame`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+        signal: controller.signal,
+      })
+    } finally {
+      window.clearTimeout(timeoutId)
+      if (abortControllerRef.value === controller) {
+        abortControllerRef.value = null
+      }
+    }
 
     const data = await response.json()
     const clientLatency = performance.now() - started
@@ -264,7 +311,9 @@ async function captureAndRecognize() {
 
     updateResult(data, clientLatency)
   } catch (error) {
-    errorMessage.value = `识别失败：${error.message}`
+    if (error?.name !== 'AbortError') {
+      errorMessage.value = `识别失败：${error.message}`
+    }
   } finally {
     requesting.value = false
   }
@@ -283,6 +332,15 @@ function updateResult(data, clientLatency) {
   result.matched_rule = payload.matched_rule || ''
 
   drawSkeleton(result.landmarks)
+
+  emit('recognized', {
+    status: 'success',
+    task_type: 'traffic_gesture',
+    input_type: data.input_type || 'camera_fast_frame',
+    latency_ms: result.latency_ms,
+    captured_at: new Date().toISOString(),
+    result: { ...payload },
+  })
 }
 
 function resizeOverlay() {
@@ -291,8 +349,10 @@ function resizeOverlay() {
   if (!video || !canvas) return
 
   const rect = video.getBoundingClientRect()
-  canvas.width = Math.round(rect.width)
-  canvas.height = Math.round(rect.height)
+  const width = Math.max(1, Math.round(rect.width))
+  const height = Math.max(1, Math.round(rect.height))
+  if (canvas.width !== width) canvas.width = width
+  if (canvas.height !== height) canvas.height = height
 }
 
 function clearOverlay() {
@@ -302,56 +362,61 @@ function clearOverlay() {
 }
 
 function drawSkeleton(landmarks) {
-  resizeOverlay()
-
-  const canvas = overlayCanvasRef.value
-  if (!canvas) return
-
-  const context = canvas.getContext('2d')
-  context.clearRect(0, 0, canvas.width, canvas.height)
-
-  if (!Array.isArray(landmarks) || !landmarks.length) return
-
-  const point = (index) => {
-    const item = landmarks.find((landmark) => landmark.index === index)
-    if (!item) return null
-    return {
-      x: item.x * canvas.width,
-      y: item.y * canvas.height,
-    }
+  if (drawFrameRef.value) {
+    window.cancelAnimationFrame(drawFrameRef.value)
   }
 
-  // Draw connections (skeleton lines)
-  context.lineWidth = 3
-  context.strokeStyle = '#22d3ee'
-  context.lineCap = 'round'
+  drawFrameRef.value = window.requestAnimationFrame(() => {
+    resizeOverlay()
 
-  POSE_CONNECTIONS.forEach(([from, to]) => {
-    const start = point(from)
-    const end = point(to)
-    if (!start || !end) return
+    const canvas = overlayCanvasRef.value
+    if (!canvas) return
 
-    context.beginPath()
-    context.moveTo(start.x, start.y)
-    context.lineTo(end.x, end.y)
-    context.stroke()
-  })
+    const context = canvas.getContext('2d')
+    context.clearRect(0, 0, canvas.width, canvas.height)
 
-  // Draw landmarks (keypoints)
-  context.fillStyle = '#fb923c'
-  landmarks.forEach((landmark) => {
-    const x = landmark.x * canvas.width
-    const y = landmark.y * canvas.height
-    const radius = landmark.visibility > 0.5 ? 5 : 3
+    if (!Array.isArray(landmarks) || !landmarks.length) return
 
-    context.beginPath()
-    context.arc(x, y, radius, 0, Math.PI * 2)
-    context.fill()
+    const pointMap = new Map(
+      landmarks.map((landmark) => [
+        Number(landmark.index),
+        {
+          x: Number(landmark.x) * canvas.width,
+          y: Number(landmark.y) * canvas.height,
+          visibility: Number(landmark.visibility ?? 1),
+        },
+      ]),
+    )
+
+    context.lineWidth = 3
+    context.strokeStyle = '#22d3ee'
+    context.lineCap = 'round'
+
+    POSE_CONNECTIONS.forEach(([from, to]) => {
+      const startPoint = pointMap.get(from)
+      const endPoint = pointMap.get(to)
+      if (!startPoint || !endPoint) return
+      if (startPoint.visibility < 0.25 || endPoint.visibility < 0.25) return
+
+      context.beginPath()
+      context.moveTo(startPoint.x, startPoint.y)
+      context.lineTo(endPoint.x, endPoint.y)
+      context.stroke()
+    })
+
+    context.fillStyle = '#fb923c'
+    pointMap.forEach((point) => {
+      if (point.visibility < 0.25) return
+      context.beginPath()
+      context.arc(point.x, point.y, point.visibility > 0.5 ? 5 : 3, 0, Math.PI * 2)
+      context.fill()
+    })
   })
 }
 
 onBeforeUnmount(() => {
   stopCamera()
+  if (drawFrameRef.value) window.cancelAnimationFrame(drawFrameRef.value)
   window.removeEventListener('resize', resizeOverlay)
 })
 
@@ -616,4 +681,10 @@ window.addEventListener('resize', resizeOverlay)
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+.single-recognition-button {
+  min-width: 112px;
+  white-space: nowrap;
+}
+.single-recognition-button:disabled { transform: none; }
 </style>

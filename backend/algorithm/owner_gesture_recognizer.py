@@ -1,4 +1,4 @@
-
+﻿
 from __future__ import annotations
 
 from collections import Counter
@@ -194,95 +194,207 @@ def classify_static_hand_gesture(points: list[dict], handedness_score: float = 0
     }
 
 
-def detect_dynamic_gesture(frame_items: list[dict]) -> dict | None:
+def detect_dynamic_gesture(
+    frame_items: list[dict],
+) -> dict | None:
     """
-    基于连续帧手部中心点和食指指尖轨迹判断动态手势。
+    上传视频中的动态手势检测。
+
+    V3 规则：
+    - 左右滑：单向净位移明显、轨迹效率高、方向变化少；
+    - 挥手：至少一次往返，路径长度明显大于净位移；
+    - 画圈：使用食指指尖二维轨迹。
     """
     valid_items = [
-        item for item in frame_items
-        if item.get("gesture") != "unknown" and item.get("hand_center")
+        item
+        for item in frame_items
+        if item.get("hand_center")
     ]
 
     if len(valid_items) < 4:
         return None
 
-    centers = [item["hand_center"] for item in valid_items]
-    index_tips = [item["landmarks"][8] for item in valid_items if len(item.get("landmarks", [])) > 8]
+    recent_items = valid_items[-18:]
+    centers = [
+        item["hand_center"]
+        for item in recent_items
+    ]
+    xs = [float(point["x"]) for point in centers]
+    ys = [float(point["y"]) for point in centers]
 
-    xs = [p["x"] for p in centers]
-    ys = [p["y"] for p in centers]
+    def direction_changes(
+        values: list[float],
+        min_delta: float = 0.012,
+    ) -> int:
+        signs: list[int] = []
+
+        for index in range(1, len(values)):
+            delta = values[index] - values[index - 1]
+            if abs(delta) < min_delta:
+                continue
+
+            sign = 1 if delta > 0 else -1
+            if not signs or signs[-1] != sign:
+                signs.append(sign)
+
+        return max(0, len(signs) - 1)
 
     dx = xs[-1] - xs[0]
     dy = ys[-1] - ys[0]
+    horizontal_path = sum(
+        abs(xs[index] - xs[index - 1])
+        for index in range(1, len(xs))
+    )
+    efficiency = abs(dx) / max(horizontal_path, 1e-6)
+    changes = direction_changes(xs)
 
-    # 左右滑动：整体手掌中心明显横向位移
-    if abs(dx) > 0.18 and abs(dx) > abs(dy) * 1.4:
-        if dx > 0:
-            return {
-                "gesture": "swipe_right",
-                "gesture_name": "右滑",
-                "confidence": round(min(0.95, 0.70 + abs(dx)), 4),
-                "dynamic_feature": {
-                    "dx": round(dx, 4),
-                    "dy": round(dy, 4),
-                    "valid_frame_count": len(valid_items),
-                },
-            }
+    open_ratio = sum(
+        1
+        for item in recent_items
+        if item.get("gesture") == "open_palm"
+    ) / len(recent_items)
+
+    # 单向滑动：阈值降低，同时使用轨迹效率防止挥手被误判。
+    if (
+        abs(dx) >= 0.14
+        and abs(dy) <= 0.17
+        and horizontal_path >= 0.15
+        and efficiency >= 0.66
+        and changes <= 1
+        and open_ratio >= 0.50
+    ):
+        gesture = (
+            "swipe_right"
+            if dx > 0
+            else "swipe_left"
+        )
         return {
-            "gesture": "swipe_left",
-            "gesture_name": "左滑",
-            "confidence": round(min(0.95, 0.70 + abs(dx)), 4),
+            "gesture": gesture,
+            "gesture_name": (
+                "右滑"
+                if gesture == "swipe_right"
+                else "左滑"
+            ),
+            "confidence": round(
+                min(
+                    0.95,
+                    0.76 + abs(dx) * 0.75,
+                ),
+                4,
+            ),
             "dynamic_feature": {
                 "dx": round(dx, 4),
                 "dy": round(dy, 4),
-                "valid_frame_count": len(valid_items),
+                "horizontal_path": round(
+                    horizontal_path,
+                    4,
+                ),
+                "efficiency": round(
+                    efficiency,
+                    4,
+                ),
+                "direction_changes": changes,
+                "valid_frame_count": len(recent_items),
             },
         }
 
-    # 挥手：横向方向多次变化
-    diffs = np.diff(np.array(xs))
-    strong_diffs = [d for d in diffs if abs(float(d)) > 0.025]
-    sign_changes = 0
-    for i in range(1, len(strong_diffs)):
-        if strong_diffs[i - 1] * strong_diffs[i] < 0:
-            sign_changes += 1
+    # 挥手：一次明确往返即可，不再要求两次方向变化。
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
 
-    if sign_changes >= 2:
+    if (
+        x_span >= 0.12
+        and y_span <= 0.25
+        and horizontal_path >= 0.24
+        and changes >= 1
+        and open_ratio >= 0.55
+        and (
+            abs(dx) <= 0.10
+            or efficiency <= 0.48
+        )
+    ):
         return {
             "gesture": "wave",
             "gesture_name": "挥手",
-            "confidence": 0.84,
+            "confidence": 0.88,
             "dynamic_feature": {
-                "sign_changes": sign_changes,
-                "valid_frame_count": len(valid_items),
+                "x_span": round(x_span, 4),
+                "y_span": round(y_span, 4),
+                "horizontal_path": round(
+                    horizontal_path,
+                    4,
+                ),
+                "net_dx": round(dx, 4),
+                "efficiency": round(
+                    efficiency,
+                    4,
+                ),
+                "direction_changes": changes,
+                "valid_frame_count": len(recent_items),
             },
         }
 
-    # 单指画圈：食指指尖轨迹同时覆盖较大 x/y 范围，且起终点较近
-    if len(index_tips) >= 6:
-        ix = np.array([p["x"] for p in index_tips], dtype=float)
-        iy = np.array([p["y"] for p in index_tips], dtype=float)
+    # 单指画圈：使用食指指尖轨迹。
+    one_items = [
+        item
+        for item in recent_items
+        if item.get("gesture") == "one"
+        and len(item.get("landmarks", [])) > 8
+    ]
+
+    if len(one_items) >= 6:
+        index_tips = [
+            item["landmarks"][8]
+            for item in one_items
+        ]
+        ix = np.array(
+            [point["x"] for point in index_tips],
+            dtype=float,
+        )
+        iy = np.array(
+            [point["y"] for point in index_tips],
+            dtype=float,
+        )
 
         x_range = float(ix.max() - ix.min())
         y_range = float(iy.max() - iy.min())
-        start_end = float(((ix[-1] - ix[0]) ** 2 + (iy[-1] - iy[0]) ** 2) ** 0.5)
-        path_len = float(np.sum(np.sqrt(np.diff(ix) ** 2 + np.diff(iy) ** 2)))
+        start_end = float(
+            (
+                (ix[-1] - ix[0]) ** 2
+                + (iy[-1] - iy[0]) ** 2
+            )
+            ** 0.5
+        )
+        path_len = float(
+            np.sum(
+                np.sqrt(
+                    np.diff(ix) ** 2
+                    + np.diff(iy) ** 2
+                )
+            )
+        )
 
-        if x_range > 0.10 and y_range > 0.10 and path_len > 0.45 and start_end < 0.16:
+        if (
+            x_range > 0.09
+            and y_range > 0.09
+            and path_len > 0.40
+            and start_end < 0.20
+        ):
             return {
                 "gesture": "circle",
                 "gesture_name": "单指画圈",
-                "confidence": 0.82,
+                "confidence": 0.84,
                 "dynamic_feature": {
                     "x_range": round(x_range, 4),
                     "y_range": round(y_range, 4),
                     "path_len": round(path_len, 4),
                     "start_end": round(start_end, 4),
-                    "valid_frame_count": len(valid_items),
+                    "valid_frame_count": len(one_items),
                 },
             }
 
     return None
+
 
 
 def recognize_owner_gesture_image(input_path: Path, output_path: Path) -> dict:

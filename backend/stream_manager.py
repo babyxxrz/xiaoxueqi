@@ -1,23 +1,25 @@
-"""
-ffmpeg 进程管理模块：从沙盘 RTSP 拉流 → 推送到 MediaMTX → HLS 供前端播放。
+﻿"""
+沙盘视频流管理：
+老师 RTSP → ffmpeg → 本地 MediaMTX → HLS / WebRTC。
 
-两种模式：
-- copy：passthrough（-c copy），零 CPU 开销
-- transcode：H.264 重编码（libx264 ultrafast），可控制码率和帧率
+稳定性策略：
+1. 默认使用视频流复制，避免不必要的转码开销与兼容性问题。
+2. start_stream() 幂等。
+3. ffmpeg 意外退出后由守护线程自动重启。
+4. stop_stream() 会取消自动重启。
 """
 
+from __future__ import annotations
+
+from datetime import datetime
 import subprocess
 import threading
 import time
-from typing import Optional
 
-FFMPEG_PATH = "ffmpeg"  # 从 PATH 环境变量中查找
+
+FFMPEG_PATH = "ffmpeg"
 MEDIAMTX_RTSP_BASE = "rtsp://127.0.0.1:8554"
 SANDBOX_RTSP_BASE = "rtsp://10.126.59.120:8554/live"
-
-# Managed ffmpeg processes: keyed by camera_id (e.g. "live1")
-_ffmpeg_processes: dict[str, subprocess.Popen] = {}
-_lock = threading.Lock()
 
 SANDBOX_CAMERAS = [
     {"id": "live1", "name": "桥面"},
@@ -34,106 +36,389 @@ SANDBOX_CAMERAS = [
     {"id": "live12", "name": "道路1"},
 ]
 
+_ffmpeg_processes: dict[str, subprocess.Popen] = {}
+_stream_configs: dict[str, dict] = {}
+_stream_runtime: dict[str, dict] = {}
+_lock = threading.RLock()
+_watchdog_started = False
 
-def build_ffmpeg_cmd(camera_id: str, mode: str = "copy", fps: int = 15) -> list[str]:
-    """构造 ffmpeg 拉流推流命令行。"""
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_ffmpeg_cmd(
+    camera_id: str,
+    mode: str = "copy",
+    fps: int = 15,
+) -> list[str]:
     source_url = f"{SANDBOX_RTSP_BASE}/{camera_id}"
     target_url = f"{MEDIAMTX_RTSP_BASE}/sandbox_{camera_id}"
 
+    common_input = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-rtsp_transport",
+        "tcp",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-i",
+        source_url,
+    ]
+
     if mode == "copy":
-        return [
-            FFMPEG_PATH,
-            "-rtsp_transport", "tcp",
-            "-i", source_url,
-            "-c", "copy",
-            "-f", "rtsp",
-            "-rtsp_transport", "tcp",
-            target_url,
-        ]
-    else:
-        return [
-            FFMPEG_PATH,
-            "-rtsp_transport", "tcp",
-            "-i", source_url,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-b:v", "2M",
-            "-maxrate", "2M",
-            "-bufsize", "4M",
-            "-g", str(fps * 2),
-            "-r", str(fps),
+        return common_input + [
+            "-map",
+            "0:v:0",
             "-an",
-            "-f", "rtsp",
-            "-rtsp_transport", "tcp",
+            "-c:v",
+            "copy",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
             target_url,
         ]
 
+    gop = max(15, int(fps) * 2)
 
-def start_stream(camera_id: str, mode: str = "copy") -> bool:
-    """启动 ffmpeg 拉流进程。幂等：已运行则跳过。"""
-    valid_ids = {c["id"] for c in SANDBOX_CAMERAS}
+    return common_input + [
+        "-map",
+        "0:v:0",
+        "-an",
+        "-vf",
+        f"scale=1280:-2,fps={fps}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "main",
+        "-level:v",
+        "4.0",
+        "-g",
+        str(gop),
+        "-keyint_min",
+        str(gop),
+        "-sc_threshold",
+        "0",
+        "-b:v",
+        "1800k",
+        "-maxrate",
+        "2200k",
+        "-bufsize",
+        "3600k",
+        "-f",
+        "rtsp",
+        "-rtsp_transport",
+        "tcp",
+        target_url,
+    ]
+
+
+def _validate_camera_id(camera_id: str) -> None:
+    valid_ids = {item["id"] for item in SANDBOX_CAMERAS}
     if camera_id not in valid_ids:
         raise ValueError(f"无效摄像头 ID: {camera_id}")
 
-    with _lock:
-        existing = _ffmpeg_processes.get(camera_id)
-        if existing is not None and existing.poll() is None:
-            return True  # already running
 
-        cmd = build_ffmpeg_cmd(camera_id, mode)
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
+
+def _consume_ffmpeg_stderr(
+    camera_id: str,
+    proc: subprocess.Popen,
+) -> None:
+    stderr = proc.stderr
+    if stderr is None:
+        return
+
+    tail: list[str] = []
+
+    try:
+        for raw_line in iter(stderr.readline, ""):
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+
+            tail.append(line)
+            tail = tail[-20:]
+
+            with _lock:
+                runtime = _stream_runtime.setdefault(
+                    camera_id,
+                    {},
+                )
+                runtime["log_tail"] = list(tail)
+                runtime["last_error"] = line
+    except Exception as error:
+        with _lock:
+            runtime = _stream_runtime.setdefault(camera_id, {})
+            runtime["last_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+    finally:
+        try:
+            stderr.close()
+        except Exception:
+            pass
+
+
+def _spawn_stream(camera_id: str) -> subprocess.Popen:
+    config = _stream_configs[camera_id]
+    cmd = build_ffmpeg_cmd(
+        camera_id,
+        config.get("mode", "copy"),
+        int(config.get("fps", 15)),
+    )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=getattr(
+            subprocess,
+            "CREATE_NO_WINDOW",
+            0,
+        ),
+    )
+
+    runtime = _stream_runtime.setdefault(camera_id, {})
+    runtime["last_started_at"] = now_text()
+    runtime["started_monotonic"] = time.monotonic()
+    runtime["pid"] = proc.pid
+    runtime["last_error"] = ""
+    runtime["log_tail"] = []
+    _ffmpeg_processes[camera_id] = proc
+
+    stderr_thread = threading.Thread(
+        target=_consume_ffmpeg_stderr,
+        args=(camera_id, proc),
+        name=f"ffmpeg-stderr-{camera_id}",
+        daemon=True,
+    )
+    stderr_thread.start()
+
+    return proc
+
+
+def _ensure_watchdog() -> None:
+    global _watchdog_started
+
+    with _lock:
+        if _watchdog_started:
+            return
+
+        thread = threading.Thread(
+            target=_watchdog_loop,
+            name="sandbox-stream-watchdog",
+            daemon=True,
         )
-        _ffmpeg_processes[camera_id] = proc
+        thread.start()
+        _watchdog_started = True
+
+
+def _watchdog_loop() -> None:
+    while True:
+        time.sleep(2)
+
+        with _lock:
+            camera_ids = [
+                camera_id
+                for camera_id, config in _stream_configs.items()
+                if config.get("desired")
+            ]
+
+        for camera_id in camera_ids:
+            with _lock:
+                proc = _ffmpeg_processes.get(camera_id)
+                config = _stream_configs.get(camera_id, {})
+                runtime = _stream_runtime.setdefault(camera_id, {})
+
+                if not config.get("desired"):
+                    continue
+
+                if proc is not None and proc.poll() is None:
+                    started_monotonic = float(
+                        runtime.get(
+                            "started_monotonic",
+                            time.monotonic(),
+                        )
+                    )
+                    if (
+                        time.monotonic() - started_monotonic
+                        >= 10.0
+                    ):
+                        runtime["restart_count"] = 0
+                        runtime["last_error"] = ""
+                    continue
+
+                if proc is not None:
+                    exit_code = proc.poll()
+                    runtime["last_exit_code"] = exit_code
+
+                    if not runtime.get("last_error"):
+                        runtime["last_error"] = (
+                            f"ffmpeg exited with code {exit_code}"
+                        )
+
+                restart_count = int(runtime.get("restart_count", 0))
+                last_restart_monotonic = float(
+                    runtime.get("last_restart_monotonic", 0.0)
+                )
+                delay = min(12.0, 1.5 + restart_count * 1.5)
+
+                if (
+                    time.monotonic() - last_restart_monotonic
+                    < delay
+                ):
+                    continue
+
+                runtime["last_restart_monotonic"] = time.monotonic()
+                runtime["restart_count"] = restart_count + 1
+
+                try:
+                    _spawn_stream(camera_id)
+                    print(
+                        "[STREAM WATCHDOG] restarted "
+                        f"{camera_id}, count={runtime['restart_count']}"
+                    )
+                except Exception as error:
+                    runtime["last_error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )
+
+
+def start_stream(
+    camera_id: str,
+    mode: str = "copy",
+    fps: int = 15,
+    force_restart: bool = False,
+) -> bool:
+    _validate_camera_id(camera_id)
+    _ensure_watchdog()
+
+    mode = "copy" if mode == "copy" else "transcode"
+    fps = max(5, min(30, int(fps or 15)))
+
+    with _lock:
+        _stream_configs[camera_id] = {
+            "desired": True,
+            "mode": mode,
+            "fps": fps,
+        }
+
+        existing = _ffmpeg_processes.get(camera_id)
+
+        if (
+            not force_restart
+            and existing is not None
+            and existing.poll() is None
+        ):
+            return True
+
+        if existing is not None and existing.poll() is None:
+            existing.terminate()
+            try:
+                existing.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                existing.kill()
+
+        _spawn_stream(camera_id)
         return True
 
 
 def stop_stream(camera_id: str) -> bool:
-    """停止 ffmpeg 进程。"""
+    _validate_camera_id(camera_id)
+
     with _lock:
+        config = _stream_configs.setdefault(camera_id, {})
+        config["desired"] = False
+
         proc = _ffmpeg_processes.pop(camera_id, None)
         if proc is None:
             return False
+
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=2)
+
+        runtime = _stream_runtime.setdefault(camera_id, {})
+        runtime["last_exit_code"] = proc.returncode
+        runtime["pid"] = None
         return True
 
 
 def stop_all_streams() -> None:
-    """停止所有 ffmpeg 进程。shutdown 时调用。"""
     with _lock:
-        ids = list(_ffmpeg_processes.keys())
-    for cid in ids:
-        stop_stream(cid)
+        camera_ids = list(_stream_configs.keys())
+
+    for camera_id in camera_ids:
+        try:
+            stop_stream(camera_id)
+        except Exception:
+            pass
 
 
 def get_stream_status(camera_id: str) -> dict:
-    """查询单路推流状态。"""
-    valid_ids = {c["id"] for c in SANDBOX_CAMERAS}
-    if camera_id not in valid_ids:
-        raise ValueError(f"无效摄像头 ID: {camera_id}")
+    _validate_camera_id(camera_id)
 
     with _lock:
         proc = _ffmpeg_processes.get(camera_id)
-        if proc is None:
-            return {"camera_id": camera_id, "running": False, "pid": None, "exit_code": None}
-        poll = proc.poll()
+        config = _stream_configs.get(camera_id, {})
+        runtime = _stream_runtime.get(camera_id, {})
+
+        exit_code = None
+        running = False
+        pid = None
+
+        if proc is not None:
+            exit_code = proc.poll()
+            running = exit_code is None
+            pid = proc.pid if running else None
+
         return {
             "camera_id": camera_id,
-            "running": poll is None,
-            "pid": proc.pid,
-            "exit_code": poll if poll is not None else None,
+            "running": running,
+            "desired": bool(config.get("desired")),
+            "pid": pid,
+            "exit_code": exit_code,
+            "mode": config.get("mode", "copy"),
+            "fps": int(config.get("fps", 15)),
+            "restart_count": int(
+                runtime.get("restart_count", 0)
+            ),
+            "last_started_at": runtime.get("last_started_at"),
+            "last_exit_code": runtime.get("last_exit_code"),
+            "last_error": runtime.get("last_error", ""),
+            "log_tail": runtime.get("log_tail", []),
+            "hls_url": (
+                f"http://127.0.0.1:8888/"
+                f"sandbox_{camera_id}/index.m3u8"
+            ),
+            "webrtc_url": (
+                f"http://127.0.0.1:8889/"
+                f"sandbox_{camera_id}"
+            ),
         }
 
 
 def get_all_streams_status() -> list[dict]:
-    """查询全部推流状态。"""
-    return [get_stream_status(c["id"]) for c in SANDBOX_CAMERAS]
+    return [
+        get_stream_status(item["id"])
+        for item in SANDBOX_CAMERAS
+    ]

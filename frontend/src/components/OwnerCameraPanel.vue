@@ -31,8 +31,19 @@
           <button v-else class="secondary" @click="stopCamera">关闭摄像头</button>
           <button :disabled="!cameraRunning || loopRunning" @click="startLoop">开始实时识别</button>
           <button class="danger" :disabled="!loopRunning" @click="stopLoop">停止识别</button>
-          <button class="secondary" :disabled="!cameraRunning || requesting" @click="captureAndRecognize">
-            单次识别
+          <button
+            class="secondary single-recognition-button"
+            :disabled="!cameraRunning || loopRunning || requesting"
+            :aria-busy="requesting"
+            @click="captureAndRecognize"
+          >
+            {{
+              loopRunning
+                ? '实时识别中'
+                : requesting
+                  ? '识别中...'
+                  : '单次识别'
+            }}
           </button>
         </div>
 
@@ -40,10 +51,16 @@
       </div>
 
       <div class="result-card">
-        <div class="gesture-result">
-          <span>当前手势</span>
-          <strong>{{ result.gesture_name || '等待识别' }}</strong>
-          <small>{{ result.gesture || '-' }}</small>
+        <div class="gesture-result" :class="`panel-${panelState}`">
+          <span>已确认动作</span>
+          <strong>{{ result.gesture_name || '等待下一个动作' }}</strong>
+          <small>
+            {{
+              panelState === 'confirmed'
+                ? result.gesture || '-'
+                : '完成完整动作后显示结果'
+            }}
+          </small>
         </div>
 
         <div class="metric-grid">
@@ -77,9 +94,17 @@
           </div>
           <div>
             <span>动作状态</span>
-            <strong :class="{ triggered: result.triggered }">
+            <strong :class="{ triggered: panelState === 'confirmed' }">
               {{ actionStatusText }}
             </strong>
+          </div>
+          <div>
+            <span>识别流程</span>
+            <strong>{{ panelStatusText }}</strong>
+          </div>
+          <div>
+            <span>方向校正</span>
+            <strong>{{ result.camera_mirror_corrected ? '镜像方向已校正' : '标准方向' }}</strong>
           </div>
         </div>
 
@@ -106,14 +131,17 @@
           <span>任务要求映射</span>
           <strong>至少 6 类车主手势 · 当前支持 9 条控制指令</strong>
         </div>
-        <small>静态手势需连续两帧确认；动态手势按最近轨迹识别。</small>
+        <small>
+          摄像头镜像方向已校正。动作完成并确认后才更新右侧面板；
+          显示结束后进入“等待下一个动作”。
+        </small>
       </div>
 
       <div class="mapping-grid">
         <article
           v-for="item in gestureMappings"
           :key="item.gesture"
-          :class="{ active: result.gesture === item.gesture }"
+          :class="{ active: panelState === 'confirmed' && result.gesture === item.gesture }"
         >
           <span>{{ item.type === 'dynamic' ? '动态' : '静态' }}</span>
           <strong>{{ item.gestureName }}</strong>
@@ -135,6 +163,11 @@ const overlayCanvasRef = ref(null)
 const captureCanvasRef = ref(null)
 const streamRef = ref(null)
 const timerRef = ref(null)
+const abortControllerRef = ref(null)
+const drawFrameRef = ref(null)
+const displayTimerRef = ref(null)
+const lastCommittedEventId = ref(0)
+const panelState = ref('waiting')
 
 const cameraRunning = ref(false)
 const loopRunning = ref(false)
@@ -155,6 +188,11 @@ const result = reactive({
   dynamic_gesture: '',
   cooldown_remaining_ms: 0,
   gesture_mapping_version: '',
+  dynamic_phase: 'idle',
+  motion_state: 'idle',
+  motion_debug: {},
+  event_id: 0,
+  camera_mirror_corrected: true,
 })
 
 const vehicleState = reactive({
@@ -193,19 +231,19 @@ const currentFunctionText = computed(() =>
   '主页',
 )
 
-const actionStatusText = computed(() => {
-  if (result.triggered) return '已执行'
-  if (result.cooldown_remaining_ms > 0) {
-    return `冷却 ${result.cooldown_remaining_ms} ms`
+const actionStatusText = computed(() =>
+  panelState.value === 'confirmed'
+    ? '动作已确认并执行'
+    : '等待动作完成',
+)
+
+const panelStatusText = computed(() => {
+  if (panelState.value === 'confirmed') {
+    return '结果稳定显示中'
   }
-  if (
-    result.gesture &&
-    !['unknown', 'no_hand', 'one', 'two', 'ok'].includes(result.gesture)
-  ) {
-    return `确认 ${result.stable_count}/${result.required_stable_frames}`
-  }
-  return '未触发'
+  return '等待下一个完整动作'
 })
+
 
 const confidenceText = computed(() =>
   result.confidence === null || result.confidence === undefined
@@ -255,27 +293,41 @@ function stopCamera() {
 
   cameraRunning.value = false
   clearOverlay()
+  resetCommittedPanel()
 }
 
 function startLoop() {
-  if (!cameraRunning.value) return
+  if (!cameraRunning.value || loopRunning.value) return
   stopLoop()
   loopRunning.value = true
-  captureAndRecognize()
-  timerRef.value = window.setInterval(captureAndRecognize, 400)
+  runLoopStep()
+}
+
+async function runLoopStep() {
+  if (!loopRunning.value || !cameraRunning.value) return
+
+  await captureAndRecognize()
+
+  if (loopRunning.value && cameraRunning.value) {
+    timerRef.value = window.setTimeout(runLoopStep, 85)
+  }
 }
 
 function stopLoop() {
+  loopRunning.value = false
+
   if (timerRef.value) {
-    window.clearInterval(timerRef.value)
+    window.clearTimeout(timerRef.value)
     timerRef.value = null
   }
-  loopRunning.value = false
+
+  abortControllerRef.value?.abort()
+  abortControllerRef.value = null
 }
 
 function canvasToBlob(canvas) {
   return new Promise((resolve) => {
-    canvas.toBlob(resolve, 'image/jpeg', 0.55)
+    canvas.toBlob(resolve, 'image/jpeg', 0.54)
   })
 }
 
@@ -291,10 +343,15 @@ async function captureAndRecognize() {
   errorMessage.value = ''
 
   try {
-    const scale = Math.min(1, 320 / video.videoWidth)
-    canvas.width = Math.round(video.videoWidth * scale)
-    canvas.height = Math.round(video.videoHeight * scale)
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height)
+    const scale = Math.min(1, 384 / video.videoWidth)
+    const targetWidth = Math.round(video.videoWidth * scale)
+    const targetHeight = Math.round(video.videoHeight * scale)
+
+    if (canvas.width !== targetWidth) canvas.width = targetWidth
+    if (canvas.height !== targetHeight) canvas.height = targetHeight
+
+    const captureContext = canvas.getContext('2d', { alpha: false })
+    captureContext.drawImage(video, 0, 0, canvas.width, canvas.height)
 
     const blob = await canvasToBlob(canvas)
     if (!blob) throw new Error('摄像头帧生成失败')
@@ -302,12 +359,25 @@ async function captureAndRecognize() {
     const formData = new FormData()
     formData.append('file', blob, `owner_camera_${Date.now()}.jpg`)
 
+    const controller = new AbortController()
+    abortControllerRef.value = controller
+    const timeoutId = window.setTimeout(() => controller.abort(), 5000)
+
     const started = performance.now()
-    const response = await fetch(`${API_BASE}/api/gesture/owner/camera-fast-frame`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: formData,
-    })
+    let response
+    try {
+      response = await fetch(`${API_BASE}/api/gesture/owner/camera-fast-frame`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+        signal: controller.signal,
+      })
+    } finally {
+      window.clearTimeout(timeoutId)
+      if (abortControllerRef.value === controller) {
+        abortControllerRef.value = null
+      }
+    }
 
     const data = await response.json()
     const clientLatency = performance.now() - started
@@ -318,38 +388,123 @@ async function captureAndRecognize() {
 
     updateResult(data, clientLatency)
   } catch (error) {
-    errorMessage.value = `识别失败：${error.message}`
+    if (error?.name !== 'AbortError') {
+      errorMessage.value = `识别失败：${error.message}`
+    }
   } finally {
     requesting.value = false
   }
 }
 
-function updateResult(data, clientLatency) {
-  const payload = data.result || data
-  const state = payload.vehicle_state || {}
+function clearDisplayTimer() {
+  if (displayTimerRef.value) {
+    window.clearTimeout(displayTimerRef.value)
+    displayTimerRef.value = null
+  }
+}
+
+function resetCommittedPanel() {
+  clearDisplayTimer()
+  panelState.value = 'waiting'
+
+  Object.assign(result, {
+    gesture: '',
+    gesture_name: '',
+    confidence: null,
+    action: '',
+    description: '',
+    latency_ms: null,
+    triggered: false,
+    stable_count: 0,
+    required_stable_frames: 3,
+    dynamic_gesture: '',
+    cooldown_remaining_ms: 0,
+    dynamic_phase: 'idle',
+    motion_state: 'waiting',
+    motion_debug: {},
+    event_id: 0,
+  })
+}
+
+function scheduleWaitingState(eventId) {
+  clearDisplayTimer()
+
+  displayTimerRef.value = window.setTimeout(() => {
+    // 新动作已经提交时，旧定时器不能清空新结果。
+    if (Number(result.event_id || 0) !== Number(eventId || 0)) {
+      return
+    }
+
+    panelState.value = 'waiting'
+    result.gesture = ''
+    result.gesture_name = ''
+    result.confidence = null
+    result.action = ''
+    result.description = ''
+    result.triggered = false
+    result.dynamic_gesture = ''
+    result.dynamic_phase = 'waiting'
+    result.motion_state = 'waiting'
+  }, 1800)
+}
+
+function shouldCommitPayload(payload) {
+  const eventId = Number(payload.event_id || 0)
+  const committed = Boolean(
+    payload.display_committed
+    || payload.triggered
+    || payload.dynamic_phase === 'event'
+  )
+
+  if (!committed) return false
+
+  if (
+    eventId > 0
+    && eventId === Number(lastCommittedEventId.value || 0)
+  ) {
+    return false
+  }
+
+  return true
+}
+
+function commitPayload(payload, latency) {
+  const eventId = Number(payload.event_id || Date.now())
+
+  lastCommittedEventId.value = eventId
+  panelState.value = 'confirmed'
 
   result.gesture = payload.gesture || ''
   result.gesture_name = payload.gesture_name || ''
   result.confidence = payload.confidence
   result.action = payload.action || ''
   result.description = payload.description || ''
-  result.latency_ms = data.latency_ms ?? clientLatency
-  result.landmarks = payload.landmarks || []
-  result.triggered = Boolean(payload.triggered)
+  result.latency_ms = latency
+  result.triggered = true
   result.stable_count = Number(payload.stable_count || 0)
-  result.required_stable_frames = Number(payload.required_stable_frames || 2)
+  result.required_stable_frames = Number(
+    payload.required_stable_frames || 3,
+  )
   result.dynamic_gesture = payload.dynamic_gesture || ''
-  result.cooldown_remaining_ms = Number(payload.cooldown_remaining_ms || 0)
-  result.gesture_mapping_version = payload.gesture_mapping_version || ''
+  result.cooldown_remaining_ms = Number(
+    payload.cooldown_remaining_ms || 0,
+  )
+  result.gesture_mapping_version =
+    payload.gesture_mapping_version || ''
+  result.dynamic_phase = payload.dynamic_phase || 'event'
+  result.motion_state = 'confirmed'
+  result.motion_debug = payload.motion_debug || {}
+  result.event_id = eventId
+  result.camera_mirror_corrected =
+    payload.camera_mirror_corrected !== false
 
-  Object.assign(vehicleState, state)
-  drawLandmarks(result.landmarks)
+  scheduleWaitingState(eventId)
 
   emit('recognized', {
     status: 'success',
     task_type: 'owner_gesture',
-    input_type: data.input_type || 'camera_fast_frame',
-    latency_ms: result.latency_ms,
+    input_type: 'camera_fast_frame',
+    latency_ms: latency,
     created_at: new Date().toISOString(),
     result: {
       ...payload,
@@ -358,14 +513,32 @@ function updateResult(data, clientLatency) {
   })
 }
 
+function updateResult(data, clientLatency) {
+  const payload = data.result || data
+  const state = payload.vehicle_state || {}
+  const latency = data.latency_ms ?? clientLatency
+
+  // 骨架和车辆状态仍然实时更新；右侧主结果只在动作确认时更新。
+  result.landmarks = payload.landmarks || []
+  Object.assign(vehicleState, state)
+  drawLandmarks(result.landmarks)
+
+  if (shouldCommitPayload(payload)) {
+    commitPayload(payload, latency)
+  }
+}
+
+
 function resizeOverlay() {
   const video = videoRef.value
   const canvas = overlayCanvasRef.value
   if (!video || !canvas) return
 
   const rect = video.getBoundingClientRect()
-  canvas.width = Math.round(rect.width)
-  canvas.height = Math.round(rect.height)
+  const width = Math.max(1, Math.round(rect.width))
+  const height = Math.max(1, Math.round(rect.height))
+  if (canvas.width !== width) canvas.width = width
+  if (canvas.height !== height) canvas.height = height
 }
 
 function clearOverlay() {
@@ -375,64 +548,68 @@ function clearOverlay() {
 }
 
 function drawLandmarks(landmarks) {
-  resizeOverlay()
-
-  const canvas = overlayCanvasRef.value
-  if (!canvas) return
-
-  const context = canvas.getContext('2d')
-  context.clearRect(0, 0, canvas.width, canvas.height)
-
-  if (!Array.isArray(landmarks) || !landmarks.length) return
-
-  const connections = [
-    [0, 1], [1, 2], [2, 3], [3, 4],
-    [0, 5], [5, 6], [6, 7], [7, 8],
-    [5, 9], [9, 10], [10, 11], [11, 12],
-    [9, 13], [13, 14], [14, 15], [15, 16],
-    [13, 17], [17, 18], [18, 19], [19, 20],
-    [0, 17],
-  ]
-
-  const point = (index) => {
-    const item = landmarks.find((landmark) => landmark.index === index)
-    if (!item) return null
-    return {
-      x: item.x * canvas.width,
-      y: item.y * canvas.height,
-    }
+  if (drawFrameRef.value) {
+    window.cancelAnimationFrame(drawFrameRef.value)
   }
 
-  context.lineWidth = 3
-  context.strokeStyle = '#22d3ee'
-  context.fillStyle = '#fb923c'
+  drawFrameRef.value = window.requestAnimationFrame(() => {
+    resizeOverlay()
 
-  connections.forEach(([from, to]) => {
-    const start = point(from)
-    const end = point(to)
-    if (!start || !end) return
+    const canvas = overlayCanvasRef.value
+    if (!canvas) return
 
-    context.beginPath()
-    context.moveTo(start.x, start.y)
-    context.lineTo(end.x, end.y)
-    context.stroke()
-  })
+    const context = canvas.getContext('2d')
+    context.clearRect(0, 0, canvas.width, canvas.height)
 
-  landmarks.forEach((landmark) => {
-    context.beginPath()
-    context.arc(
-      landmark.x * canvas.width,
-      landmark.y * canvas.height,
-      4,
-      0,
-      Math.PI * 2,
+    if (!Array.isArray(landmarks) || !landmarks.length) return
+
+    const connections = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [17, 18], [18, 19], [19, 20],
+      [0, 17],
+    ]
+
+    const pointMap = new Map(
+      landmarks.map((landmark) => [
+        Number(landmark.index),
+        {
+          x: Number(landmark.x) * canvas.width,
+          y: Number(landmark.y) * canvas.height,
+        },
+      ]),
     )
-    context.fill()
+
+    context.lineWidth = 3
+    context.strokeStyle = '#22d3ee'
+    context.fillStyle = '#fb923c'
+    context.lineCap = 'round'
+
+    connections.forEach(([from, to]) => {
+      const startPoint = pointMap.get(from)
+      const endPoint = pointMap.get(to)
+      if (!startPoint || !endPoint) return
+
+      context.beginPath()
+      context.moveTo(startPoint.x, startPoint.y)
+      context.lineTo(endPoint.x, endPoint.y)
+      context.stroke()
+    })
+
+    pointMap.forEach((point) => {
+      context.beginPath()
+      context.arc(point.x, point.y, 4, 0, Math.PI * 2)
+      context.fill()
+    })
   })
 }
 
 onBeforeUnmount(() => {
+  clearDisplayTimer()
   stopCamera()
+  if (drawFrameRef.value) window.cancelAnimationFrame(drawFrameRef.value)
   window.removeEventListener('resize', resizeOverlay)
 })
 
@@ -590,6 +767,23 @@ window.addEventListener('resize', resizeOverlay)
 
 .gesture-result small {
   color: #67e8f9;
+}
+
+.gesture-result.panel-waiting {
+  background: linear-gradient(
+    135deg,
+    rgba(51, 65, 85, 0.22),
+    rgba(15, 23, 42, 0.18)
+  );
+}
+
+.gesture-result.panel-confirmed {
+  border: 1px solid rgba(45, 212, 191, 0.26);
+  background: linear-gradient(
+    135deg,
+    rgba(13, 148, 136, 0.22),
+    rgba(37, 99, 235, 0.12)
+  );
 }
 
 .metric-grid {
@@ -750,4 +944,10 @@ window.addEventListener('resize', resizeOverlay)
     flex-direction: column;
   }
 }
+
+.single-recognition-button {
+  min-width: 112px;
+  white-space: nowrap;
+}
+.single-recognition-button:disabled { transform: none; }
 </style>
