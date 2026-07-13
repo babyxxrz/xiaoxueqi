@@ -1478,13 +1478,6 @@ def apply_owner_gesture(gesture: str) -> dict:
 
     update_vehicle_state(state)
 
-    event_id = int(
-        dynamic_result.get("event_id") or 0
-    ) if dynamic_result else 0
-
-    if triggered and dynamic_phase == "idle":
-        event_id = _oc_next_event_id()
-
     return {
         "gesture": gesture,
         "gesture_name": gesture_map[gesture],
@@ -6491,36 +6484,39 @@ _OC_DYNAMIC_HOLD = {
     "gesture": "",
     "gesture_name": "",
     "confidence": 0.0,
+    "event_id": 0,
     "until": 0.0,
 }
-_OC_DYNAMIC_HOLD_SECONDS = 1.45
-_OC_DYNAMIC_LOCK_SECONDS = 0.45
+# V5：缩短结果锁定和复位等待，避免识别完一个动作后长时间无响应。
+_OC_DYNAMIC_HOLD_SECONDS = 0.90
+_OC_DYNAMIC_LOCK_SECONDS = 0.20
 
 # 摄像头预览属于镜像交互：
 # 用户实际向右移动，在摄像头原始坐标中表现为向左。
 _OC_CAMERA_MIRROR_DIRECTIONS = True
 
-# 动态动作只触发一次。完成后必须先静止复位或移出画面，
-# 才允许识别下一次动态动作。
+# 动态动作确认后只触发一次，但复位条件不再过度严格。
 _OC_DYNAMIC_REARM_REQUIRED = False
 _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
-_OC_DYNAMIC_REARM_STILL_SECONDS = 0.72
+_OC_DYNAMIC_REARM_STILL_SECONDS = 0.24
 _OC_DYNAMIC_EVENT_SEQUENCE = 0
 _OC_LAST_DYNAMIC_EVENT_ID = 0
 
-# 静态手势确认与锁存：
-# open_palm 延迟确认，给左右滑和挥手留出轨迹采集时间；
-# 同一静态姿势持续保持时只触发一次。
+# 静态手势确认与锁存。
+# 2~3 帧即可确认，兼顾稳定性和灵敏度。
 _OC_STABLE_TRACK = {
     "gesture": "",
     "count": 0,
 }
-_OC_STATIC_STABLE_FRAMES = 3
+_OC_STATIC_STABLE_FRAMES = 2
 _OC_STATIC_REQUIRED_FRAMES = {
-    "open_palm": 6,
-    "fist": 3,
-    "thumb_up": 3,
-    "thumb_down": 3,
+    "open_palm": 3,
+    "fist": 2,
+    "one": 2,
+    "two": 2,
+    "thumb_up": 2,
+    "thumb_down": 2,
+    "ok": 2,
 }
 _OC_STATIC_LATCH_GESTURE = ""
 
@@ -6536,7 +6532,7 @@ _OC_FUNCTION_ORDER = [
     "navigation",
 ]
 
-_OC_GESTURE_MAPPING_VERSION = "owner_gesture_v4_mirror_commit_state"
+_OC_GESTURE_MAPPING_VERSION = "owner_gesture_v5_responsive_balanced"
 _OC_GESTURE_MAPPING = [
     {
         "gesture": "open_palm",
@@ -6550,6 +6546,20 @@ _OC_GESTURE_MAPPING = [
         "gesture_name": "握拳",
         "action": "confirm",
         "description": "确认/执行",
+        "type": "static",
+    },
+    {
+        "gesture": "one",
+        "gesture_name": "单指",
+        "action": "none",
+        "description": "单指姿势已识别；继续画圈可调节音量",
+        "type": "static",
+    },
+    {
+        "gesture": "two",
+        "gesture_name": "双指",
+        "action": "none",
+        "description": "双指姿势已识别",
         "type": "static",
     },
     {
@@ -6649,8 +6659,8 @@ def _oc_get_hands():
                 static_image_mode=False,
                 max_num_hands=1,
                 model_complexity=0,
-                min_detection_confidence=0.55,
-                min_tracking_confidence=0.50,
+                min_detection_confidence=0.45,
+                min_tracking_confidence=0.40,
             )
 
     return _OC_HANDS
@@ -6658,6 +6668,23 @@ def _oc_get_hands():
 
 def _oc_dist(a, b) -> float:
     return _oc_math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+
+def _oc_angle(a, b, c) -> float:
+    """返回以 b 为顶点的二维夹角，单位为度。"""
+    v1x = float(a.x - b.x)
+    v1y = float(a.y - b.y)
+    v2x = float(c.x - b.x)
+    v2y = float(c.y - b.y)
+    norm1 = _oc_math.sqrt(v1x * v1x + v1y * v1y)
+    norm2 = _oc_math.sqrt(v2x * v2x + v2y * v2y)
+
+    if norm1 <= 1e-8 or norm2 <= 1e-8:
+        return 0.0
+
+    cosine = (v1x * v2x + v1y * v2y) / (norm1 * norm2)
+    cosine = max(-1.0, min(1.0, cosine))
+    return _oc_math.degrees(_oc_math.acos(cosine))
 
 
 def _oc_to_landmark_dicts(hand_landmarks, width: int, height: int) -> list[dict]:
@@ -6676,23 +6703,40 @@ def _oc_to_landmark_dicts(hand_landmarks, width: int, height: int) -> list[dict]
     return items
 
 
-def _oc_finger_extended(lms, tip: int, pip: int, mcp: int, wrist: int = 0) -> bool:
+def _oc_finger_extended(
+    lms,
+    tip: int,
+    pip: int,
+    mcp: int,
+    wrist: int = 0,
+) -> bool:
     """
-    摄像头场景下的手指伸展判定。
-    兼顾 y 方向和相对掌心距离，避免轻微弯曲造成误判。
+    使用关节夹角 + 径向距离判断手指是否伸直。
+
+    V4 主要依赖 y 坐标，手稍微旋转后单指/双指就容易失效；
+    V5 改成方向无关的几何判断。
     """
     tip_lm = lms[tip]
     pip_lm = lms[pip]
     mcp_lm = lms[mcp]
     wrist_lm = lms[wrist]
 
-    y_extended = tip_lm.y < pip_lm.y - 0.025
-    distance_extended = _oc_dist(tip_lm, wrist_lm) > _oc_dist(pip_lm, wrist_lm) * 1.05
+    pip_angle = _oc_angle(mcp_lm, pip_lm, tip_lm)
+    tip_to_wrist = _oc_dist(tip_lm, wrist_lm)
+    pip_to_wrist = _oc_dist(pip_lm, wrist_lm)
+    tip_to_mcp = _oc_dist(tip_lm, mcp_lm)
+    pip_to_mcp = max(_oc_dist(pip_lm, mcp_lm), 1e-6)
 
-    # 如果手指横向伸出，y 条件可能不明显，这里用 tip 到 mcp 距离兜底。
-    long_enough = _oc_dist(tip_lm, mcp_lm) > 0.11
+    straight_enough = pip_angle >= 148.0
+    reaches_outward = tip_to_wrist >= pip_to_wrist * 1.015
+    segment_ratio_ok = tip_to_mcp >= pip_to_mcp * 1.45
 
-    return bool((y_extended and distance_extended) or (distance_extended and long_enough and tip_lm.y < mcp_lm.y + 0.02))
+    return bool(
+        straight_enough
+        and reaches_outward
+        and segment_ratio_ok
+    )
+
 
 
 def _oc_reset_tracking(
@@ -6719,6 +6763,7 @@ def _oc_reset_tracking(
             "gesture": "",
             "gesture_name": "",
             "confidence": 0.0,
+            "event_id": 0,
             "until": 0.0,
         })
 
@@ -6896,21 +6941,14 @@ def _oc_open_ratio(history: list[dict]) -> float:
 
 
 def _oc_detect_swipe() -> tuple[str | None, dict]:
-    """
-    单向滑动检测。
-
-    关键变化：
-    - 阈值由 0.22 降到约 0.13；
-    - 使用轨迹效率和方向一致性抑制挥手误判；
-    - 支持“移动后短暂停顿”作为滑动结束信号。
-    """
-    history = _oc_recent_history(1.15)
+    """灵敏但方向对称的单向滑动检测。"""
+    history = _oc_recent_history(0.90)
     debug = {
         "kind": "swipe",
         "frame_count": len(history),
     }
 
-    if len(history) < 4:
+    if len(history) < 3:
         return None, debug
 
     xs = [float(item["x"]) for item in history]
@@ -6919,7 +6957,6 @@ def _oc_detect_swipe() -> tuple[str | None, dict]:
 
     dx = xs[-1] - xs[0]
     dy = ys[-1] - ys[0]
-    path_length = _oc_path_length(xs, ys)
     horizontal_path = sum(
         abs(xs[index] - xs[index - 1])
         for index in range(1, len(xs))
@@ -6928,27 +6965,23 @@ def _oc_detect_swipe() -> tuple[str | None, dict]:
     efficiency = abs(dx) / max(horizontal_path, 1e-6)
     sign_changes = _oc_direction_change_count(
         xs,
-        min_delta=0.010,
+        min_delta=0.007,
     )
     open_ratio = _oc_open_ratio(history)
 
     recent_deltas = [
         abs(xs[index] - xs[index - 1])
-        for index in range(
-            max(1, len(xs) - 2),
-            len(xs),
-        )
+        for index in range(max(1, len(xs) - 2), len(xs))
     ]
     terminal_slow = (
         bool(recent_deltas)
-        and sum(recent_deltas) / len(recent_deltas) < 0.018
+        and sum(recent_deltas) / len(recent_deltas) <= 0.028
     )
 
     debug.update({
         "dx": round(dx, 4),
         "dy": round(dy, 4),
         "duration": round(duration, 4),
-        "path_length": round(path_length, 4),
         "horizontal_path": round(horizontal_path, 4),
         "efficiency": round(efficiency, 4),
         "sign_changes": sign_changes,
@@ -6956,21 +6989,21 @@ def _oc_detect_swipe() -> tuple[str | None, dict]:
         "terminal_slow": terminal_slow,
     })
 
-    if abs(dx) < 0.13:
+    if abs(dx) < 0.085:
         return None, debug
-    if abs(dy) > 0.15:
+    if abs(dy) > 0.22:
         return None, debug
-    if open_ratio < 0.55:
+    if open_ratio < 0.34:
         return None, debug
-    if efficiency < 0.68:
+    if efficiency < 0.50:
         return None, debug
     if sign_changes > 1:
         return None, debug
-    if duration < 0.22:
+    if duration < 0.10:
         return None, debug
 
-    # 较短位移要求动作末端有停顿；大幅滑动可直接确认。
-    if abs(dx) < 0.19 and not terminal_slow:
+    # 短滑动要求动作末端稍微减速；明显位移直接确认。
+    if abs(dx) < 0.135 and not terminal_slow:
         return None, debug
 
     return (
@@ -6979,27 +7012,20 @@ def _oc_detect_swipe() -> tuple[str | None, dict]:
     )
 
 
-def _oc_detect_wave() -> tuple[bool, dict]:
-    """
-    挥手要求至少一次明确往返。
 
-    与滑动的区别：
-    - 横向路径明显大于净位移；
-    - 至少一次方向反转；
-    - 最终位置接近起点或轨迹效率较低。
-    """
-    history = _oc_recent_history(1.95)
+def _oc_detect_wave() -> tuple[bool, dict]:
+    """一次清晰往返即可识别挥手。"""
+    history = _oc_recent_history(1.55)
     debug = {
         "kind": "wave",
         "frame_count": len(history),
     }
 
-    if len(history) < 5:
+    if len(history) < 4:
         return False, debug
 
     xs = [float(item["x"]) for item in history]
     ys = [float(item["y"]) for item in history]
-
     x_span = max(xs) - min(xs)
     y_span = max(ys) - min(ys)
     net_dx = xs[-1] - xs[0]
@@ -7010,7 +7036,7 @@ def _oc_detect_wave() -> tuple[bool, dict]:
     efficiency = abs(net_dx) / max(horizontal_path, 1e-6)
     sign_changes = _oc_direction_change_count(
         xs,
-        min_delta=0.012,
+        min_delta=0.008,
     )
     open_ratio = _oc_open_ratio(history)
 
@@ -7025,60 +7051,81 @@ def _oc_detect_wave() -> tuple[bool, dict]:
     })
 
     detected = (
-        x_span >= 0.12
-        and y_span <= 0.24
-        and horizontal_path >= 0.24
+        x_span >= 0.085
+        and y_span <= 0.30
+        and horizontal_path >= 0.17
         and sign_changes >= 1
-        and open_ratio >= 0.60
+        and open_ratio >= 0.42
         and (
-            abs(net_dx) <= 0.10
-            or efficiency <= 0.48
+            abs(net_dx) <= 0.13
+            or efficiency <= 0.62
         )
     )
-
     return detected, debug
+
 
 
 def _oc_detect_circle() -> tuple[str | None, dict]:
     """
-    单指画圈使用食指指尖轨迹，而不是掌心轨迹。
+    食指轨迹画圈检测。
+
+    允许单指识别在运动模糊时短暂变成双指/unknown，
+    避免只识别一个方向或画到一半丢失。
     """
-    history = _oc_recent_history(2.4)
-    one_items = [
+    history = _oc_recent_history(1.95)
+    candidate_items = [
         item
         for item in history
         if item.get("gesture") in {
             "one",
+            "two",
+            "unknown",
             "circle_clockwise",
             "circle_counterclockwise",
         }
     ]
+    one_like_count = sum(
+        1
+        for item in history
+        if item.get("gesture") in {"one", "two"}
+    )
+    one_like_ratio = (
+        one_like_count / len(history)
+        if history else 0.0
+    )
 
     debug = {
         "kind": "circle",
-        "frame_count": len(one_items),
+        "frame_count": len(candidate_items),
+        "one_like_ratio": round(one_like_ratio, 4),
     }
 
-    if len(one_items) < 6:
+    if len(candidate_items) < 5 or one_like_ratio < 0.32:
         return None, debug
 
-    xs = [float(item["index_x"]) for item in one_items]
-    ys = [float(item["index_y"]) for item in one_items]
-
+    xs = [float(item["index_x"]) for item in candidate_items]
+    ys = [float(item["index_y"]) for item in candidate_items]
     x_range = max(xs) - min(xs)
     y_range = max(ys) - min(ys)
+    path_length = _oc_path_length(xs, ys)
 
     debug.update({
         "x_range": round(x_range, 4),
         "y_range": round(y_range, 4),
+        "path_length": round(path_length, 4),
     })
 
-    if x_range < 0.09 or y_range < 0.09:
+    if x_range < 0.055 or y_range < 0.055:
+        return None, debug
+    if path_length < 0.25:
+        return None, debug
+
+    aspect = x_range / max(y_range, 1e-6)
+    if aspect < 0.30 or aspect > 3.20:
         return None, debug
 
     center_x = sum(xs) / len(xs)
     center_y = sum(ys) / len(ys)
-
     angles: list[float] = []
 
     for x, y in zip(xs, ys):
@@ -7086,7 +7133,7 @@ def _oc_detect_circle() -> tuple[str | None, dict]:
             (x - center_x) ** 2
             + (y - center_y) ** 2
         )
-        if radius < 0.028:
+        if radius < 0.018:
             continue
         angles.append(
             _oc_math.atan2(
@@ -7099,34 +7146,27 @@ def _oc_detect_circle() -> tuple[str | None, dict]:
         return None, debug
 
     total_angle = 0.0
-
     for index in range(1, len(angles)):
         delta = angles[index] - angles[index - 1]
-
         while delta > _oc_math.pi:
             delta -= 2 * _oc_math.pi
         while delta < -_oc_math.pi:
             delta += 2 * _oc_math.pi
-
-        if abs(delta) <= 1.55:
+        if abs(delta) <= 1.75:
             total_angle += delta
 
     start_end_distance = _oc_math.sqrt(
         (xs[-1] - xs[0]) ** 2
         + (ys[-1] - ys[0]) ** 2
     )
-
     debug.update({
         "total_angle": round(total_angle, 4),
-        "start_end_distance": round(
-            start_end_distance,
-            4,
-        ),
+        "start_end_distance": round(start_end_distance, 4),
     })
 
-    if abs(total_angle) < 4.15:
+    if abs(total_angle) < 3.15:
         return None, debug
-    if start_end_distance > 0.20:
+    if start_end_distance > 0.30:
         return None, debug
 
     return (
@@ -7139,19 +7179,19 @@ def _oc_detect_circle() -> tuple[str | None, dict]:
     )
 
 
+
 def _oc_motion_pending_debug() -> tuple[bool, dict]:
-    history = _oc_recent_history(0.95)
+    history = _oc_recent_history(0.68)
     debug = {
         "kind": "pending",
         "frame_count": len(history),
     }
 
-    if len(history) < 3:
+    if len(history) < 2:
         return False, debug
 
     xs = [float(item["x"]) for item in history]
     ys = [float(item["y"]) for item in history]
-
     x_span = max(xs) - min(xs)
     y_span = max(ys) - min(ys)
     path_length = _oc_path_length(xs, ys)
@@ -7165,13 +7205,13 @@ def _oc_motion_pending_debug() -> tuple[bool, dict]:
     })
 
     pending = (
-        open_ratio >= 0.50
-        and x_span >= 0.045
-        and path_length >= 0.065
-        and y_span <= 0.25
+        open_ratio >= 0.32
+        and x_span >= 0.025
+        and path_length >= 0.035
+        and y_span <= 0.30
     )
-
     return pending, debug
+
 
 
 
@@ -7218,10 +7258,7 @@ def _oc_try_rearm_dynamic(
     static_gesture: str,
 ) -> bool:
     """
-    动态动作完成后，手掌需要短暂静止，才重新允许下一次识别。
-
-    这样连续挥动过程中不会反复触发：
-    挥手 → 判定中 → 挥手 → 判定中。
+    动态动作完成后，只需短暂稳定或换姿势即可重新识别。
     """
     global _OC_DYNAMIC_REARM_REQUIRED
     global _OC_DYNAMIC_REARM_STILL_SINCE
@@ -7229,29 +7266,25 @@ def _oc_try_rearm_dynamic(
     if not _OC_DYNAMIC_REARM_REQUIRED:
         return True
 
-    history = _oc_recent_history(0.50)
-
-    if len(history) < 3:
+    history = _oc_recent_history(0.34)
+    if len(history) < 2:
         _OC_DYNAMIC_REARM_STILL_SINCE = 0.0
         return False
 
     xs = [float(item["x"]) for item in history]
     ys = [float(item["y"]) for item in history]
-
     x_span = max(xs) - min(xs)
     y_span = max(ys) - min(ys)
     now = _oc_time.time()
 
-    # 允许张开手掌或单指姿势在动作结束后静止复位。
-    valid_reset_pose = static_gesture in {
-        "open_palm",
-        "one",
-        "unknown",
+    valid_reset_pose = static_gesture not in {
+        "no_hand",
+        "motion_pending",
     }
     is_still = (
         valid_reset_pose
-        and x_span <= 0.025
-        and y_span <= 0.030
+        and x_span <= 0.055
+        and y_span <= 0.070
     )
 
     if not is_still:
@@ -7274,6 +7307,7 @@ def _oc_try_rearm_dynamic(
     _OC_STABLE_TRACK["gesture"] = ""
     _OC_STABLE_TRACK["count"] = 0
     return True
+
 
 
 def _oc_register_dynamic_event(
@@ -7567,6 +7601,15 @@ def _oc_resolve_camera_gesture(
             required_stable_frames=required_stable_frames,
         )
 
+    event_id = int(
+        dynamic_result.get("event_id") or 0
+    ) if dynamic_result else 0
+
+    # 静态手势在真正触发车辆控制时分配唯一事件编号；
+    # 动态手势沿用轨迹状态机生成的事件编号。
+    if confirmed and dynamic_phase == "idle":
+        event_id = _oc_next_event_id()
+
     return {
         "gesture": gesture,
         "gesture_name": gesture_name,
@@ -7590,7 +7633,7 @@ def _oc_resolve_camera_gesture(
         "dynamic_phase": dynamic_phase,
         "event_id": event_id,
         "display_committed": bool(
-            triggered or dynamic_phase == "event"
+            confirmed or dynamic_phase == "event"
         ),
         "camera_mirror_corrected": (
             _OC_CAMERA_MIRROR_DIRECTIONS
@@ -7633,12 +7676,12 @@ def _oc_confirm_gesture(
         "no_hand",
         "motion_pending",
         "waiting_next",
-        "one",
-        "two",
-        "ok",
     }:
         _OC_STABLE_TRACK["gesture"] = gesture
         _OC_STABLE_TRACK["count"] = 0
+        # 手消失或真正回到未知状态后，允许同一姿势再次触发。
+        if gesture in {"unknown", "no_hand", "waiting_next"}:
+            _OC_STATIC_LATCH_GESTURE = ""
         return False, 0, required_frames
 
     if dynamic:
@@ -7655,16 +7698,15 @@ def _oc_confirm_gesture(
         _OC_STABLE_TRACK["count"] = 1
 
     stable_count = int(_OC_STABLE_TRACK["count"])
-
     if stable_count < required_frames:
         return False, stable_count, required_frames
 
-    # 同一个姿势一直保持时只确认一次。
     if _OC_STATIC_LATCH_GESTURE == gesture:
         return False, stable_count, required_frames
 
     _OC_STATIC_LATCH_GESTURE = gesture
     return True, stable_count, required_frames
+
 
 
 
@@ -7680,7 +7722,9 @@ def _oc_next_function(direction: int) -> str:
     return _OC_FUNCTION_ORDER[index]
 
 
-def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
+def _oc_classify_static_hand(
+    hand_landmarks,
+) -> tuple[str, str, float, dict]:
     lms = hand_landmarks.landmark
 
     wrist = lms[0]
@@ -7701,33 +7745,43 @@ def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
         "ring": ring_extended,
         "pinky": pinky_extended,
     }
+    extended_count = sum(
+        1 for value in extended_map.values() if value
+    )
 
-    extended_count = sum(1 for value in extended_map.values() if value)
-
-    thumb_index_distance = _oc_dist(thumb_tip, index_tip)
-    thumb_to_wrist = _oc_dist(thumb_tip, wrist)
     palm_size = max(_oc_dist(wrist, lms[9]), 1e-6)
+    thumb_to_wrist = _oc_dist(thumb_tip, wrist)
+    thumb_index_distance = _oc_dist(thumb_tip, index_tip)
+    thumb_angle = _oc_angle(thumb_mcp, thumb_ip, thumb_tip)
+    thumb_dx = (thumb_tip.x - thumb_mcp.x) / palm_size
+    thumb_dy = (thumb_tip.y - thumb_mcp.y) / palm_size
+    thumb_straight = thumb_angle >= 132.0
+    thumb_far_enough = thumb_to_wrist >= palm_size * 0.62
+    thumb_vertical = abs(thumb_dy) >= max(
+        0.38,
+        abs(thumb_dx) * 0.62,
+    )
+    other_fingers_mostly_folded = extended_count <= 1
 
-    # 收紧 thumb_up / thumb_down：
-    # 只有拇指明显竖直向上/向下，且四指没有伸出，才判定为拇指手势。
-    thumb_far_enough = thumb_to_wrist > palm_size * 0.72
     thumb_up = (
-        extended_count == 0
+        other_fingers_mostly_folded
+        and thumb_straight
         and thumb_far_enough
-        and thumb_tip.y < wrist.y - 0.13
-        and thumb_tip.y < index_mcp.y - 0.06
-        and thumb_tip.y < thumb_ip.y - 0.025
+        and thumb_vertical
+        and thumb_dy <= -0.38
+        and thumb_tip.y < index_mcp.y + palm_size * 0.08
     )
     thumb_down = (
-        extended_count == 0
+        other_fingers_mostly_folded
+        and thumb_straight
         and thumb_far_enough
-        and thumb_tip.y > wrist.y + 0.13
-        and thumb_tip.y > index_mcp.y + 0.06
-        and thumb_tip.y > thumb_ip.y + 0.025
+        and thumb_vertical
+        and thumb_dy >= 0.36
+        and thumb_tip.y > index_mcp.y - palm_size * 0.02
     )
 
     ok_gesture = (
-        thumb_index_distance < 0.075
+        thumb_index_distance <= palm_size * 0.38
         and middle_extended
         and ring_extended
         and pinky_extended
@@ -7742,6 +7796,9 @@ def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
         "thumb_index_distance": round(thumb_index_distance, 4),
         "thumb_to_wrist": round(thumb_to_wrist, 4),
         "palm_size": round(palm_size, 4),
+        "thumb_angle": round(thumb_angle, 2),
+        "thumb_dx_normalized": round(thumb_dx, 4),
+        "thumb_dy_normalized": round(thumb_dy, 4),
         "thumb_up_condition": bool(thumb_up),
         "thumb_down_condition": bool(thumb_down),
     }
@@ -7750,28 +7807,28 @@ def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
         return "ok", "OK 手势", 0.86, features
 
     if thumb_up:
-        return "thumb_up", "拇指向上", 0.84, features
+        return "thumb_up", "拇指向上", 0.88, features
 
     if thumb_down:
-        return "thumb_down", "拇指向下", 0.84, features
+        return "thumb_down", "拇指向下", 0.88, features
 
     if extended_count >= 4:
-        return "open_palm", "手掌张开", 0.88, features
-
-    # 握拳优先于 one/two 之外的模糊状态，避免误判为 thumb_up。
-    if extended_count == 0:
-        return "fist", "握拳", 0.82, features
+        return "open_palm", "手掌张开", 0.90, features
 
     if index_extended and not middle_extended and not ring_extended and not pinky_extended:
-        return "one", "单指", 0.80, features
+        return "one", "单指", 0.86, features
 
     if index_extended and middle_extended and not ring_extended and not pinky_extended:
-        return "two", "双指", 0.80, features
+        return "two", "双指", 0.86, features
+
+    if extended_count == 0:
+        return "fist", "握拳", 0.85, features
 
     if extended_count >= 3:
-        return "open_palm", "手掌张开", 0.76, features
+        return "open_palm", "手掌张开", 0.78, features
 
     return "unknown", "未识别手势", 0.45, features
+
 
 
 def _oc_apply_vehicle_action(
@@ -7793,9 +7850,11 @@ def _oc_apply_vehicle_action(
 
     if not confirmed:
         if gesture == "one":
-            description = "保持单指并画圈以调节音量"
-        elif gesture in {"two", "ok"}:
-            description = "该静态手势不执行车辆控制"
+            description = "正在确认单指姿势；继续画圈可调节音量"
+        elif gesture == "two":
+            description = "正在确认双指姿势"
+        elif gesture == "ok":
+            description = "正在确认 OK 手势"
         elif gesture not in {"", "unknown", "no_hand"}:
             description = (
                 f"等待手势稳定确认 "
@@ -7823,6 +7882,12 @@ def _oc_apply_vehicle_action(
 
     action = action_map.get(gesture, "none")
     if action == "none":
+        if gesture == "one":
+            description = "单指姿势已识别；继续画圈可调节音量"
+        elif gesture == "two":
+            description = "双指姿势已识别"
+        elif gesture == "ok":
+            description = "OK 手势已识别"
         state["last_action"] = action
         state["last_description"] = description
         state["updated_at"] = now_text
@@ -7912,8 +7977,9 @@ def get_owner_gesture_mapping():
             "dynamic_result_hold_seconds": _OC_DYNAMIC_HOLD_SECONDS,
             "camera_mirror_direction_correction": _OC_CAMERA_MIRROR_DIRECTIONS,
             "dynamic_rearm_still_seconds": _OC_DYNAMIC_REARM_STILL_SECONDS,
-            "display_policy": "动作确认后才更新结果面板；确认后等待静止复位",
-            "swipe_policy": "镜像校正后输出用户实际方向；单向横移并停顿",
+            "static_required_frames": dict(_OC_STATIC_REQUIRED_FRAMES),
+            "display_policy": "手势稳定确认后更新结果面板；动态动作快速复位",
+            "swipe_policy": "镜像校正后输出用户实际方向；约9%画面宽度即可进入滑动判定",
             "wave_policy": "张开手掌至少完成一次横向往返；一次动作只触发一次",
         },
     }
@@ -8098,7 +8164,7 @@ def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
                 "supported_gestures": _OC_GESTURE_MAPPING,
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
-                "dynamic_policy": "V4：摄像头镜像方向校正；动作确认后单次触发并等待复位",
+                "dynamic_policy": "V5：方向无关静态分类、低阈值动态轨迹、快速复位",
             },
         }
 
@@ -8243,7 +8309,7 @@ def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)
                 "vehicle_state": vehicle_state,
                 "camera_mode": True,
                 "fast_mode": True,
-                "dynamic_policy": "V4 快速模式：内部采集不刷新结果面板；确认后输出一次并等待下一个动作",
+                "dynamic_policy": "V5 快速模式：2~3帧静态确认；左右滑、双向画圈和拇指手势灵敏度增强",
             },
         }
 

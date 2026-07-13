@@ -52,7 +52,7 @@
 
       <div class="result-card">
         <div class="gesture-result" :class="`panel-${panelState}`">
-          <span>已确认动作</span>
+          <span>已确认手势</span>
           <strong>{{ result.gesture_name || '等待下一个动作' }}</strong>
           <small>
             {{
@@ -129,11 +129,11 @@
       <div class="mapping-heading">
         <div>
           <span>任务要求映射</span>
-          <strong>至少 6 类车主手势 · 当前支持 9 条控制指令</strong>
+          <strong>9 条控制指令 + 单指/双指姿态识别</strong>
         </div>
         <small>
-          摄像头镜像方向已校正。动作完成并确认后才更新右侧面板；
-          显示结束后进入“等待下一个动作”。
+          V5 已降低确认帧数并放宽轨迹阈值；右侧仍只显示稳定确认结果，
+          不展示每一帧的抖动分类。
         </small>
       </div>
 
@@ -216,6 +216,8 @@ const functionLabels = {
 const gestureMappings = [
   { gesture: 'open_palm', gestureName: '手掌张开', description: '启动 / 唤醒系统', type: 'static' },
   { gesture: 'fist', gestureName: '握拳', description: '确认 / 执行', type: 'static' },
+  { gesture: 'one', gestureName: '单指', description: '单指姿势 / 画圈准备', type: 'static' },
+  { gesture: 'two', gestureName: '双指', description: '双指姿势识别', type: 'static' },
   { gesture: 'circle_clockwise', gestureName: '单指顺时针画圈', description: '调高音量', type: 'dynamic' },
   { gesture: 'circle_counterclockwise', gestureName: '单指逆时针画圈', description: '调低音量', type: 'dynamic' },
   { gesture: 'swipe_left', gestureName: '向左滑动', description: '切换到上一功能', type: 'dynamic' },
@@ -233,15 +235,15 @@ const currentFunctionText = computed(() =>
 
 const actionStatusText = computed(() =>
   panelState.value === 'confirmed'
-    ? '动作已确认并执行'
-    : '等待动作完成',
+    ? (result.triggered ? '动作已确认并执行' : '手势已确认')
+    : '等待手势稳定',
 )
 
 const panelStatusText = computed(() => {
   if (panelState.value === 'confirmed') {
-    return '结果稳定显示中'
+    return result.triggered ? '控制结果稳定显示中' : '识别结果稳定显示中'
   }
-  return '等待下一个完整动作'
+  return '等待下一个手势'
 })
 
 
@@ -309,7 +311,7 @@ async function runLoopStep() {
   await captureAndRecognize()
 
   if (loopRunning.value && cameraRunning.value) {
-    timerRef.value = window.setTimeout(runLoopStep, 85)
+    timerRef.value = window.setTimeout(runLoopStep, 25)
   }
 }
 
@@ -327,7 +329,7 @@ function stopLoop() {
 
 function canvasToBlob(canvas) {
   return new Promise((resolve) => {
-    canvas.toBlob(resolve, 'image/jpeg', 0.54)
+    canvas.toBlob(resolve, 'image/jpeg', 0.50)
   })
 }
 
@@ -361,7 +363,7 @@ async function captureAndRecognize() {
 
     const controller = new AbortController()
     abortControllerRef.value = controller
-    const timeoutId = window.setTimeout(() => controller.abort(), 5000)
+    const timeoutId = window.setTimeout(() => controller.abort(), 3500)
 
     const started = performance.now()
     let response
@@ -445,7 +447,7 @@ function scheduleWaitingState(eventId) {
     result.dynamic_gesture = ''
     result.dynamic_phase = 'waiting'
     result.motion_state = 'waiting'
-  }, 1800)
+  }, 1300)
 }
 
 function shouldCommitPayload(payload) {
@@ -480,7 +482,7 @@ function commitPayload(payload, latency) {
   result.action = payload.action || ''
   result.description = payload.description || ''
   result.latency_ms = latency
-  result.triggered = true
+  result.triggered = Boolean(payload.triggered)
   result.stable_count = Number(payload.stable_count || 0)
   result.required_stable_frames = Number(
     payload.required_stable_frames || 3,
