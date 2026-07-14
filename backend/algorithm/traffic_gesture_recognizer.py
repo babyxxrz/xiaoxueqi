@@ -1,4 +1,14 @@
-﻿from __future__ import annotations
+﻿"""
+交通手势识别模块（MediaPipe Pose + 分类器）
+
+基于 MediaPipe Pose 提取人体关键点，结合自定义分类器
+识别 8 种交警手势：直行、左转、右转、停止、慢行、
+                  靠边停车、左转待转、变道。
+
+技术路线：
+    RGB帧 → MediaPipe Pose → 33个关键点 → 特征提取 → 分类器 → 手势+交通指令
+"""
+from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
