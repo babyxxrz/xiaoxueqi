@@ -1,12 +1,20 @@
 ﻿"""
-沙盘视频流管理：
-老师 RTSP → ffmpeg → 本地 MediaMTX → HLS / WebRTC。
+沙盘视频流管理模块
+
+将老师 RTSP 流拉取后通过 ffmpeg 推送到本地 MediaMTX，
+对外提供 HLS / WebRTC 两种播放方式。
+
+架构：
+    老师 RTSP (10.126.59.120:8554) → ffmpeg (tcp) → 本地 MediaMTX (127.0.0.1:8554)
+                                                          ├── HLS:  http://127.0.0.1:8888/sandbox_{id}/index.m3u8
+                                                          └── WebRTC: http://127.0.0.1:8889/sandbox_{id}
 
 稳定性策略：
-1. 默认使用视频流复制，避免不必要的转码开销与兼容性问题。
-2. start_stream() 幂等。
-3. ffmpeg 意外退出后由守护线程自动重启。
-4. stop_stream() 会取消自动重启。
+1. 默认使用视频流复制（mode=copy），避免不必要的转码开销与兼容性问题。
+2. start_stream() 幂等 —— 重复调用不会创建重复进程。
+3. ffmpeg 意外退出后由守护线程（watchdog）自动重启，退避延迟递增。
+4. stop_stream() 会取消自动重启并终止进程。
+5. 支持转码模式（mode=transcode），可调整分辨率与帧率。
 """
 
 from __future__ import annotations
