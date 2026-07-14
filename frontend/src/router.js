@@ -1,6 +1,16 @@
 /**
- * 路由配置
- * 使用 hash 模式避免开发环境和静态部署刷新 404。
+ * 前端路由配置
+ *
+ * 路由表：
+ *   /           → 首页（需登录）
+ *   /login      → 登录页
+ *   /register   → 注册页
+ *   /forbidden  → 权限不足提示页
+ *   /admin      → 管理后台（需 admin 角色）
+ *
+ * 使用 hash 模式，避免静态部署时刷新出现 404。
+ * 路由守卫校验：未登录 → 跳转 /login；角色不足 → 跳转 /forbidden
+ */
  */
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuth } from './useAuth'

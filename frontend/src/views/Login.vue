@@ -1,3 +1,10 @@
+<!--
+  登录页面
+  支持两种登录方式：
+  1. 用户名/邮箱 + 密码登录（默认）
+  2. 邮箱验证码登录（切换标签页）
+  底部提供注册入口链接
+-->
 <template>
   <main class="auth-page">
     <section class="auth-card login-card-wide">
