@@ -1,6 +1,15 @@
 ﻿"""
 认证与权限管理模块
-提供用户注册、登录、Token 刷新、退出、权限中间件、邮箱验证码登录等功能。
+
+提供完整的用户身份认证与授权体系：
+1. 注册：用户名+邮箱+密码，含密码强度校验（大小写字母+数字，≥8位）
+2. 登录：用户名/邮箱 + 密码，支持"记住我"延长 refresh token 有效期
+3. 验证码登录：邮箱验证码免密登录（6位数字码，5分钟有效）
+4. Token 管理：JWT access token（15min）+ refresh token 旋转策略
+5. 权限中间件：get_current_user（登录校验）、require_admin（管理员校验）
+6. 邮件发送：SMTP SSL/TLS，支持 HTML 邮件模板
+
+技术栈：bcrypt + PyJWT + smtplib + SQLite
 """
 import os
 import random
