@@ -1,4 +1,12 @@
-﻿<template>
+﻿<!--
+  HLS 视频播放器组件
+  基于 hls.js 实现 HLS 流播放，支持：
+  - 自动重连与错误恢复
+  - 加载状态指示
+  - 自适应码率
+  用于沙盘多路监控视频的实时播放。
+-->
+<template>
   <div class="hls-video-wrapper">
     <video
       ref="videoRef"
