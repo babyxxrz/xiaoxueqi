@@ -1,4 +1,17 @@
-﻿from pathlib import Path
+﻿"""
+智能交通识别系统 - 后端API服务
+
+基于 FastAPI 构建的后端识别服务，提供以下核心能力：
+1. 车牌识别（HyperLPR3）：支持单图/视频/实时流
+2. 交通手势识别（MediaPipe Pose + 分类器）
+3. 车主手势识别（MediaPipe Hands + 分类器）
+4. 沙盘多路视频流管理与融合监控
+5. 告警事件管理与邮件通知
+6. 用户认证与权限管理（JWT + 验证码登录）
+
+技术栈：FastAPI + SQLite + ffmpeg + MediaMTX + YOLOv8 + HyperLPR3
+"""
+from pathlib import Path
 from collections import Counter
 from uuid import uuid4
 from datetime import datetime
