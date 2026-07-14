@@ -1,4 +1,12 @@
-﻿<template>
+﻿<!--
+  管理后台页面
+  仅管理员可访问，集成以下功能：
+  - 识别记录查询与管理
+  - 告警事件列表与统计
+  - 用户管理与权限分配
+  - 系统配置（告警阈值、LLM开关等）
+-->
+<template>
   <div class="admin-shell">
     <aside class="admin-sidebar">
       <div class="admin-brand">
