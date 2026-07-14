@@ -1,4 +1,14 @@
-﻿from __future__ import annotations
+﻿"""
+车牌识别模块（HyperLPR3）
+
+基于 HyperLPR3 实现的车牌检测与 OCR 识别引擎。
+支持：多车牌检测、车牌颜色分类（蓝/黄/绿/白/黑）、
+      HSV 颜色复核、去重、中文标注绘制。
+
+核心流程：
+    输入图像 → HyperLPR3 检测 → 结果归一化 → 颜色推断 → 去重 → 标注输出
+"""
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
